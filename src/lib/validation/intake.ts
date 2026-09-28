@@ -108,6 +108,29 @@ export const webhookPayloadSchema = z
 export const appointmentRequestSchema = intakeSchema;
 
 /**
+ * Payload accepted by the internal clinician summary endpoint.
+ *
+ * The only way to name a patient is the sealed token from src/lib/phi-token, and
+ * this carries it in a request *body* rather than a query string for the same
+ * reason that module exists: a token in a URL is a bearer credential in every
+ * access log, browser history entry and Referer header on the path, and this one
+ * decrypts to a record containing symptom text.
+ *
+ * `.strict()` like the rest, so a caller cannot attach a second field and have
+ * it quietly accepted. There is no `appointmentId` alternative: the appointment
+ * store is an in-memory `Map`, so an id resolves to nothing on any instance
+ * that did not handle the write, and a "lookup by id" that silently returns
+ * nothing is a worse failure than not offering one.
+ */
+export const intakeSummaryRequestSchema = z
+  .object({
+    token: z.string().trim().min(1, "Required").max(20_000, "Too long"),
+  })
+  .strict();
+
+export type IntakeSummaryRequest = z.infer<typeof intakeSummaryRequestSchema>;
+
+/**
  * Payload accepted by the audit write endpoint.
  *
  * Note that the caller supplies `actor`, which means a caller can attribute

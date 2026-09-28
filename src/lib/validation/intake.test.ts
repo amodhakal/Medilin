@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   intakeFromFormData,
   intakeSchema,
+  intakeSummaryRequestSchema,
   MEDICAL_DEPARTMENTS,
   webhookPayloadSchema,
 } from "./intake";
@@ -140,5 +141,33 @@ describe("webhookPayloadSchema", () => {
         info: "{}",
       }).success,
     ).toBe(true);
+  });
+});
+
+describe("intakeSummaryRequestSchema", () => {
+  test("accepts a sealed token", () => {
+    expect(
+      intakeSummaryRequestSchema.safeParse({ token: "abc123SEALEDtoken" }).success,
+    ).toBe(true);
+  });
+
+  test.each([
+    ["a missing token", {}],
+    ["a blank token", { token: "" }],
+    ["a whitespace-only token", { token: "   " }],
+    ["a non-string token", { token: 12345 }],
+    // There is no id-based alternative, so an id has to be refused rather than
+    // ignored: an accepted request that then looks up nothing is a 404 the
+    // caller cannot explain.
+    ["an appointment id", { token: "abc", appointmentId: "1" }],
+    ["a raw record", { token: "abc", record: { firstName: "Ada" } }],
+  ])("rejects %s", (_label, value) => {
+    expect(intakeSummaryRequestSchema.safeParse(value).success).toBe(false);
+  });
+
+  test("rejects a token long enough to be an attempt at something", () => {
+    expect(intakeSummaryRequestSchema.safeParse({ token: "x".repeat(20_001) }).success).toBe(
+      false,
+    );
   });
 });

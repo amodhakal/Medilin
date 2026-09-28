@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { Type } from "@google/genai";
 import {
   EMAIL_RESPONSE_SCHEMA,
+  INTAKE_SUMMARY_RESPONSE_SCHEMA,
   emailTranslationSchema,
   parseJsonResponse,
   translationResponseSchema,
+  triageSummarySchema,
 } from "./schema";
 
 describe("translationResponseSchema", () => {
@@ -120,6 +122,130 @@ describe("emailTranslationSchema", () => {
       subject: "hi",
       body: "x".repeat(20_001),
     });
+    expect(result.success).toBe(false);
+  });
+});
+
+/**
+ * The clinician triage summary (#68).
+ *
+ * Two separate contracts, and the distinction is the point. The Gemini `Schema`
+ * is what constrains the *decoder*, so the reply has the right shape. The zod
+ * schema is what the caller *trusts*, so the values have to survive being
+ * re-read by code that has not seen the prompt. Constrained decoding is a
+ * statement about shape, not about the model having been honest, and a clinical
+ * artefact is the worst possible place to confuse the two.
+ */
+describe("INTAKE_SUMMARY_RESPONSE_SCHEMA", () => {
+  test("requires the whole summary rather than whatever fits", () => {
+    // Every field is load-bearing for a clinician reading the result. A reply
+    // that omits `followUpQuestions` is not a summary with one part missing, it
+    // is a different artefact, and the caller should refuse it rather than
+    // render a summary that looks complete.
+    expect(INTAKE_SUMMARY_RESPONSE_SCHEMA.required?.sort()).toEqual([
+      "chiefComplaint",
+      "followUpQuestions",
+      "summary",
+      "symptoms",
+      "urgency",
+    ]);
+  });
+
+  test("models the two lists as arrays of strings", () => {
+    const properties = INTAKE_SUMMARY_RESPONSE_SCHEMA.properties ?? {};
+    expect(properties.symptoms.type).toBe(Type.ARRAY);
+    expect(properties.symptoms.items?.type).toBe(Type.STRING);
+    expect(properties.followUpQuestions.type).toBe(Type.ARRAY);
+    expect(properties.followUpQuestions.items?.type).toBe(Type.STRING);
+  });
+
+  test("constrains urgency to the three routing values", () => {
+    // An unconstrained string here is a model free to invent a fourth value,
+    // which is then rendered as an unknown word in front of a clinician.
+    expect(INTAKE_SUMMARY_RESPONSE_SCHEMA.properties?.urgency.enum).toEqual([
+      "routine",
+      "soon",
+      "urgent",
+    ]);
+  });
+
+  test("describes each field, and never asks for a diagnosis", () => {
+    const properties = INTAKE_SUMMARY_RESPONSE_SCHEMA.properties ?? {};
+    for (const property of Object.values(properties)) {
+      expect(property.description?.trim().length).toBeGreaterThan(0);
+      // A description is model-facing text and is where a diagnosis request
+      // would sneak in.
+      expect(property.description?.toLowerCase()).not.toContain("diagnos");
+    }
+  });
+});
+
+describe("triageSummarySchema", () => {
+  const valid = {
+    chiefComplaint: "Pain behind the left eye",
+    summary: "Reports sharp pain behind the left eye since Tuesday, worse in the mornings.",
+    symptoms: ["sharp pain", "worse in the mornings"],
+    urgency: "soon",
+    followUpQuestions: ["Has the vision in that eye changed?"],
+  };
+
+  test("accepts a well-formed summary", () => {
+    const result = triageSummarySchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  test("keeps a summary with no symptoms and no questions", () => {
+    // Both are optional in substance: a patient who wrote one sentence has no
+    // symptom list to give, and refusing the whole summary over an empty array
+    // would mean the endpoint returns nothing for the shortest submissions.
+    const result = triageSummarySchema.safeParse({
+      ...valid,
+      symptoms: [],
+      followUpQuestions: [],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test.each([
+    ["a blank chief complaint", { ...valid, chiefComplaint: "   " }],
+    ["a blank summary", { ...valid, summary: "" }],
+    ["a missing summary", { chiefComplaint: "x", urgency: "routine" }],
+    ["an unknown urgency", { ...valid, urgency: "emergency" }],
+    ["a capitalised urgency", { ...valid, urgency: "Soon" }],
+    ["symptoms that are not strings", { ...valid, symptoms: [{ name: "pain" }] }],
+    ["symptoms that are not a list", { ...valid, symptoms: "sharp pain" }],
+    ["questions that are not a list", { ...valid, followUpQuestions: "none" }],
+    ["an extra key", { ...valid, diagnosis: "acute glaucoma" }],
+  ])("rejects %s", (_label, value) => {
+    // The extra-key case is the one that matters most: a model that volunteers a
+    // diagnosis must have it dropped or refused, never stored next to a summary
+    // a clinician will read.
+    expect(triageSummarySchema.safeParse(value).success).toBe(false);
+  });
+
+  test("rejects an oversized field rather than truncating it", () => {
+    // A summary truncated to 2,000 characters can end mid-sentence in a way
+    // that reads as a complete thought. The caller is told the model returned
+    // something it cannot use.
+    const result = triageSummarySchema.safeParse({ ...valid, summary: "x".repeat(2001) });
+    expect(result.success).toBe(false);
+  });
+
+  test("rejects a list with more entries than a clinician would read", () => {
+    const result = triageSummarySchema.safeParse({
+      ...valid,
+      symptoms: Array.from({ length: 11 }, (_, i) => `symptom ${i}`),
+    });
+    expect(result.success).toBe(false);
+  });
+
+  test("trims the strings it keeps", () => {
+    const result = triageSummarySchema.parse({ ...valid, chiefComplaint: "  Pain  " });
+    expect(result.chiefComplaint).toBe("Pain");
+  });
+
+  test("rejects a list entry that is only whitespace", () => {
+    const result = triageSummarySchema.safeParse({ ...valid, symptoms: ["pain", "   "] });
     expect(result.success).toBe(false);
   });
 });
