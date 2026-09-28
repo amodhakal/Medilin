@@ -1,31 +1,13 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
-import { clientLog } from "@/lib/logger/client";
-
-/** How long a socket may take to reach `open` before the attempt is abandoned. */
-const CONNECT_TIMEOUT_MS = 10_000;
-
-/**
- * Upper bound on the delay we schedule a `pong` for.
- *
- * ElevenLabs sends `ping_ms` and we answer on a timer. That value arrives from
- * the network, so it is clamped: an unclamped 2^31 or negative delay is a
- * timer that never fires, or one that fires immediately, and both were
- * reachable by anything that could speak the protocol.
- */
-const PING_MAX_DELAY_MS = 10_000;
-
-/** The two agents in the simulated call. */
-type Agent = "A" | "B";
-
-interface TranscriptMessage {
-  id: number;
-  role: "patient" | "receptionist";
-  text: string;
-  timestamp: Date;
-}
+import { useMemo } from "react";
+import { useAgentRelay } from "@/hooks/useAgentRelay";
+import { AgentCard } from "@/components/spectate/AgentCard";
+import { CallControls } from "@/components/spectate/CallControls";
+import { ConnectionNotice, SessionBadge } from "@/components/spectate/SessionStatus";
+import { PatientProfile } from "@/components/spectate/PatientProfile";
+import { Transcript } from "@/components/spectate/Transcript";
 
 /**
  * The fields this page renders and forwards to the voice agent.
@@ -54,30 +36,14 @@ export interface SpectatePatient {
 }
 
 /**
- * Parse one frame off the vendor socket.
+ * The spectate page.
  *
- * `onmessage` used to call `JSON.parse(event.data)` bare. A malformed frame
- * throws inside an event handler, which the socket does not catch and React
- * does not see, so a single bad frame from the far end silently killed the
- * relay: no log line, no UI change, no further messages processed. Frames come
- * from the network, so a bad one is dropped and counted, not fatal.
+ * Now only composition. The two sockets, the transcript, the turn-taking, and
+ * every timer live in @/hooks/useAgentRelay, and the presentational pieces
+ * live in @/components/spectate. What is left here is the record this page was
+ * given and the decision about what to say to each agent, which belongs with
+ * the record it is derived from.
  */
-function parseFrame(raw: unknown): Record<string, unknown> | null {
-  if (typeof raw !== "string") return null;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null) return null;
-    return parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function clampDelay(ms: number): number {
-  if (!Number.isFinite(ms)) return 0;
-  return Math.min(Math.max(ms, 0), PING_MAX_DELAY_MS);
-}
-
 export default function SpectateClient({
   patient,
   patientAgentId,
@@ -87,411 +53,61 @@ export default function SpectateClient({
   patientAgentId: string;
   receptionistAgentId: string;
 }) {
-  const [isConnected, setIsConnected] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [patientSpeaking, setPatientSpeaking] = useState(false);
-  const [receptionistSpeaking, setReceptionistSpeaking] = useState(false);
-  const [currentPatientText, setCurrentPatientText] = useState("");
-  const [currentReceptionistText, setCurrentReceptionistText] = useState("");
-  const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
-  const [isEnded, setIsEnded] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [disconnectNotice, setDisconnectNotice] = useState<string | null>(null);
-
-  const wsARef = useRef<WebSocket | null>(null);
-  const wsBRef = useRef<WebSocket | null>(null);
-  const transcriptIdRef = useRef(0);
-  const waitingForBResponseRef = useRef(false);
-  const waitingForAResponseRef = useRef(false);
-
-  /**
-   * Every live timer this page owns.
-   *
-   * The 2500ms relay, the 500ms `contextual_update` sends, and the `pong`
-   * timers were all bare `setTimeout` calls whose handles were dropped on the
-   * floor. Each queued callback closes over a `setState` and sometimes over a
-   * `ws.send` for a socket that is closing, so navigating away mid-call left a
-   * trail of them firing for the next few seconds. The relay one is the worst
-   * of the set: it reads the two "waiting" refs, which are not reset, so an
-   * unmounted page could still decide to push a transcript line into a socket
-   * that the next page has nothing to do with. A Set because more than one can
-   * be outstanding at a time and a single handle would only ever clear one.
-   */
-  const timersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
-
-  /**
-   * Whether the component is still mounted.
-   *
-   * A `WebSocket`'s `open` and `error` events are queued, so `connectAgent`'s
-   * promise can settle after the user has already hit "Exit". Both paths touch
-   * state, and the socket that opened in that window would have no reference
-   * left to close it, so it would live until the browser's own timeout.
-   */
-  const mountedRef = useRef(true);
-
-  /**
-   * Set while this page is closing the sockets on purpose.
-   *
-   * `close` fires `onclose` whether the peer or we ended it, and the handler
-   * cannot tell them apart from the event alone. Without this, unmounting or
-   * pressing "Stop" reported a dropped connection on the way out.
-   */
-  const intentionalCloseRef = useRef(false);
-
-  useEffect(() => {
-    const container = document.getElementById("transcript-container");
-    if (container) {
-      container.scrollTop = container.scrollHeight;
-    }
-  }, [transcript]);
-
-  /**
-   * Run `fn` after `delayMs`, tracked so it can be cancelled.
-   *
-   * `fn` is skipped entirely once the component is gone rather than allowed to
-   * run and call `setState` on a dead tree.
-   */
-  const schedule = useCallback((fn: () => void, delayMs: number) => {
-    const handle = setTimeout(() => {
-      timersRef.current.delete(handle);
-      if (mountedRef.current) fn();
-    }, delayMs);
-    timersRef.current.add(handle);
-    return handle;
-  }, []);
-
-  const cancelTimers = useCallback(() => {
-    for (const handle of timersRef.current) clearTimeout(handle);
-    timersRef.current.clear();
-  }, []);
-
-  const sendMessageToAgent = useCallback((message: string, agent: Agent) => {
-    const ws = agent === "A" ? wsARef.current : wsBRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "user_message",
-          text: message,
-        })
-      );
-    }
-  }, []);
-
-  /**
-   * Close both sockets, and mark the close as ours.
-   *
-   * The refs are cleared before the closes so a handler that re-enters cannot
-   * find a socket that is already going away.
-   */
-  const closeSockets = useCallback(() => {
-    intentionalCloseRef.current = true;
-    const sockets = [wsARef.current, wsBRef.current];
-    wsARef.current = null;
-    wsBRef.current = null;
-    for (const ws of sockets) ws?.close();
-  }, []);
-
-  const connectAgent = useCallback(
-    (agentId: string, agent: Agent): Promise<WebSocket> => {
-      return new Promise((resolve, reject) => {
-        const ws = new WebSocket(
-          `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${agentId}`
-        );
-
-        // `settled` is the promise's own state; `opened` is the socket's. They
-        // are not the same question, and conflating them is what made the
-        // `catch` in startConversation unreachable: `resolve(ws)` used to run
-        // synchronously at the end of the function body, before `open` had
-        // ever fired, so by the time an error arrived the promise was already
-        // fulfilled and the rejection had nowhere to go.
-        let settled = false;
-        let opened = false;
-
-        const openTimer = setTimeout(() => {
-          timersRef.current.delete(openTimer);
-          clientLog("warn", "spectate.agent_open_timeout", { resource: `agent_${agent}` });
-          ws.close();
-          fail(new Error(`agent ${agent} did not open within ${CONNECT_TIMEOUT_MS}ms`));
-        }, CONNECT_TIMEOUT_MS);
-        timersRef.current.add(openTimer);
-
-        function clearOpenTimer() {
-          clearTimeout(openTimer);
-          timersRef.current.delete(openTimer);
-        }
-
-        function fail(reason: Error) {
-          if (settled) return;
-          settled = true;
-          clearOpenTimer();
-          if (!mountedRef.current) {
-            // The page went away while this socket was connecting. Nothing to
-            // connect for, and the socket would be orphaned with no reference
-            // left to close it.
-            ws.close();
-          }
-          reject(reason);
-        }
-
-        ws.onopen = () => {
-          opened = true;
-          settled = true;
-          clearOpenTimer();
-
-          if (!mountedRef.current) {
-            ws.close();
-            reject(new Error("spectate page unmounted before the socket opened"));
-            return;
-          }
-
-          clientLog("info", "spectate.agent_connected", { resource: `agent_${agent}` });
-          const initData: Record<string, unknown> = {
-            type: "conversation_initiation_client_data",
-          };
-
-          if (agent === "A") {
-            initData.dynamic_variables = {
-              patient_info: JSON.stringify(patient),
-            };
-          }
-
-          ws.send(JSON.stringify(initData));
-          resolve(ws);
-        };
-
-        ws.onmessage = (event) => {
-          const data = parseFrame(event.data);
-          if (!data) {
-            // Counted rather than logged in full: a frame is vendor
-            // controlled, and the failure mode worth knowing about is how
-            // often it happens.
-            clientLog("warn", "spectate.unparseable_frame", { resource: `agent_${agent}` });
-            return;
-          }
-
-          switch (data.type) {
-            case "conversation_initiation_client_data":
-              if (agent === "A") {
-                const p = patient;
-                const spectateText = `You are ${p.firstName} ${p.lastName}, a patient calling a hospital. Your details: email: ${p.email}, phone: ${p.phone}, DOB: ${p.dob}, insurance: ${p.insurance}, department: ${p.medical_department}, preferred language: ${p.language}. Additional info: ${p.additionalInfo}. Start the conversation by greeting and explaining why you're calling.`;
-                schedule(() => {
-                  ws.send(
-                    JSON.stringify({
-                      type: "contextual_update",
-                      text: spectateText,
-                    })
-                  );
-                }, 500);
-              } else if (agent === "B") {
-                schedule(() => {
-                  ws.send(
-                    JSON.stringify({
-                      type: "contextual_update",
-                      text: `You are a hospital receptionist answering calls. Help patients book appointments. When they provide their email and preferred language, call the book_appointment tool. Be professional and helpful.`,
-                    })
-                  );
-                }, 500);
-              }
-              break;
-
-            case "agent_response": {
-              const responseEvent = data.agent_response_event as
-                | { agent_response?: unknown }
-                | undefined;
-              const response = responseEvent?.agent_response;
-              if (typeof response === "string" && response.length > 0) {
-                const role = agent === "A" ? "patient" : "receptionist";
-                setTranscript((prev) => [
-                  ...prev,
-                  {
-                    id: transcriptIdRef.current++,
-                    role,
-                    text: response,
-                    timestamp: new Date(),
-                  },
-                ]);
-
-                if (agent === "A") {
-                  setCurrentPatientText(response);
-                  setPatientSpeaking(true);
-                  waitingForAResponseRef.current = false;
-
-                  schedule(() => {
-                    setCurrentPatientText("");
-                    setPatientSpeaking(false);
-
-                    if (!waitingForBResponseRef.current) {
-                      waitingForBResponseRef.current = true;
-                      sendMessageToAgent(response, "B");
-                    }
-                  }, 2500);
-                } else {
-                  setCurrentReceptionistText(response);
-                  setReceptionistSpeaking(true);
-                  waitingForBResponseRef.current = false;
-
-                  schedule(() => {
-                    setCurrentReceptionistText("");
-                    setReceptionistSpeaking(false);
-
-                    if (!waitingForAResponseRef.current) {
-                      waitingForAResponseRef.current = true;
-                      sendMessageToAgent(response, "A");
-                    }
-                  }, 2500);
-                }
-              }
-              break;
-            }
-
-            case "ping": {
-              const pingEvent = data.ping_event as { event_id?: unknown; ping_ms?: unknown } | undefined;
-              const eventId = pingEvent?.event_id;
-              if (typeof eventId !== "string") break;
-              schedule(() => {
-                ws.send(
-                  JSON.stringify({
-                    type: "pong",
-                    event_id: eventId,
-                  })
-                );
-              }, clampDelay(typeof pingEvent?.ping_ms === "number" ? pingEvent.ping_ms : 0));
-              break;
-            }
-
-            default:
-              break;
-          }
-        };
-
-        ws.onerror = () => {
-          // A `WebSocket` error event carries no detail worth reporting in any
-          // engine, and it is not an `Error`, so there is nothing honest to put
-          // in the log field. What matters is which side of `open` it landed
-          // on: before, it is a failed connect and belongs to this promise;
-          // after, `onclose` is what reports it.
-          if (opened) {
-            clientLog("warn", "spectate.agent_socket_error", { resource: `agent_${agent}` });
-            return;
-          }
-          clientLog("error", "spectate.websocket_error", { resource: `agent_${agent}` });
-          fail(new Error(`agent ${agent} socket error`));
-        };
-
-        ws.onclose = (event) => {
-          if (!opened) {
-            fail(
-              new Error(`agent ${agent} closed before opening (code ${event.code})`)
-            );
-            return;
-          }
-
-          if (agent === "A") {
-            setPatientSpeaking(false);
-          } else {
-            setReceptionistSpeaking(false);
-          }
-
-          if (intentionalCloseRef.current) return;
-
-          // Previously invisible. The promise had already resolved, so the
-          // `catch` in startConversation could not see it, and the header went
-          // on saying "Live Session Active" over a socket that was gone.
-          // Reconnect is #50; until then the page says what happened.
-          clientLog("warn", "spectate.agent_disconnected", {
-            resource: `agent_${agent}`,
-            statusCode: event.code,
-          });
-          if (mountedRef.current) {
-            setIsConnected(false);
-            setDisconnectNotice(
-              agent === "A"
-                ? "The patient agent's connection dropped."
-                : "The receptionist agent's connection dropped."
-            );
-          }
-        };
-      });
-    },
-    [patient, schedule, sendMessageToAgent]
+  // Memoised so the relay's effect dependencies are stable. The strings are
+  // built here rather than inside the hook so that everything derived from the
+  // record is assembled in one place, and the machine only ever sees text.
+  const patientOpeningContext = useMemo(
+    () =>
+      `You are ${patient.firstName} ${patient.lastName}, a patient calling a hospital. ` +
+      `Your details: email: ${patient.email}, phone: ${patient.phone}, DOB: ${patient.dob}, ` +
+      `insurance: ${patient.insurance}, department: ${patient.medical_department}, ` +
+      `preferred language: ${patient.language}. ` +
+      `Additional info: ${patient.additionalInfo}. ` +
+      `Start the conversation by greeting and explaining why you're calling.`,
+    [
+      patient.firstName,
+      patient.lastName,
+      patient.email,
+      patient.phone,
+      patient.dob,
+      patient.insurance,
+      patient.medical_department,
+      patient.language,
+      patient.additionalInfo,
+    ]
   );
 
-  const startConversation = useCallback(async () => {
-    try {
-      setIsConnecting(true);
-      setDisconnectNotice(null);
-      intentionalCloseRef.current = false;
+  const receptionistOpeningContext =
+    "You are a hospital receptionist answering calls. Help patients book appointments. " +
+    "When they provide their email and preferred language, call the book_appointment tool. " +
+    "Be professional and helpful.";
 
-      const wsA = await connectAgent(patientAgentId, "A");
-      wsARef.current = wsA;
+  const patientDynamicVariables = useMemo(
+    () => ({ patient_info: JSON.stringify(patient) }),
+    [patient]
+  );
 
-      const wsB = await connectAgent(receptionistAgentId, "B");
-      wsBRef.current = wsB;
+  const { state, start, stop } = useAgentRelay({
+    patientAgentId,
+    receptionistAgentId,
+    patientOpeningContext,
+    receptionistOpeningContext,
+    patientDynamicVariables,
+  });
 
-      if (!mountedRef.current) {
-        closeSockets();
-        return;
-      }
-
-      setIsConnected(true);
-      setIsConnecting(false);
-    } catch (err) {
-      clientLog("error", "spectate.start_failed", {
-        errorMessage: err instanceof Error ? err.message : String(err),
-      });
-      // One socket can be up while the other failed. Closing both matters:
-      // the half-open one would sit there holding a session the page no
-      // longer believes in.
-      closeSockets();
-      if (!mountedRef.current) return;
-      setError("Could not reach the voice agents. Check your connection and try again.");
-      setIsConnecting(false);
-    }
-  }, [closeSockets, connectAgent, patientAgentId, receptionistAgentId]);
-
-  const stopConversation = useCallback(() => {
-    cancelTimers();
-    closeSockets();
-    setIsConnected(false);
-    setIsEnded(true);
-    setDisconnectNotice(null);
-    setPatientSpeaking(false);
-    setReceptionistSpeaking(false);
-    setCurrentPatientText("");
-    setCurrentReceptionistText("");
-  }, [cancelTimers, closeSockets]);
-
-  /**
-   * Tear everything down on unmount.
-   *
-   * There was no cleanup at all: navigating away from a live call left both
-   * sockets open, every queued timer running, and a relay that was still
-   * pushing transcript lines at a conversation nobody was watching.
-   *
-   * `mountedRef` is re-armed here rather than initialised once, because
-   * StrictMode mounts, unmounts, and remounts in development, and an effect
-   * that is not re-runnable is a lie in that mode.
-   */
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      cancelTimers();
-      closeSockets();
-    };
-  }, [cancelTimers, closeSockets]);
+  const { phase, error, notice, transcript, speaking, currentText, socket } = state;
 
   if (error) {
     return (
       <div className="min-h-screen bg-[#090d16] flex items-center justify-center text-red-400 p-6">
         <div className="bg-slate-900 border border-slate-800 p-8 rounded-2xl text-center max-w-md shadow-2xl">
-          <h2 className="text-xl font-bold mb-2 text-white">Connection Error</h2>
+          <h2 className="text-xl font-bold mb-2 text-white">Could not start the call</h2>
           <p className="text-sm text-slate-400 mb-6">{error}</p>
           <Link
             href="/"
             className="inline-block bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold px-6 py-2.5 rounded-xl text-sm transition-colors"
           >
-            Return Home
+            Back to the start
           </Link>
         </div>
       </div>
@@ -505,14 +121,15 @@ export default function SpectateClient({
       <div className="absolute bottom-0 right-1/4 w-[600px] h-[600px] bg-blue-600/10 rounded-full blur-[160px] pointer-events-none" />
 
       <div className="max-w-7xl mx-auto w-full z-10 flex-1 flex flex-col">
-        {/* Top bar */}
-        <header className="flex items-center justify-between mb-8 pb-6 border-b border-slate-800/80">
-          <div>
+        <header className="flex items-center justify-between gap-4 mb-8 pb-6 border-b border-slate-800/80">
+          <div className="min-w-0">
             <div className="flex items-center gap-3">
               <Link href="/" className="text-xs text-cyan-400 hover:text-cyan-300 font-medium">
                 &larr; Exit
               </Link>
-              <span className="text-slate-600">/</span>
+              <span className="text-slate-600" aria-hidden="true">
+                /
+              </span>
               <span className="text-xs uppercase tracking-widest text-slate-400 font-semibold">
                 Live Spectator Mode
               </span>
@@ -522,282 +139,54 @@ export default function SpectateClient({
             </h1>
           </div>
 
-          <div className="flex items-center gap-3">
-            <span
-              className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs font-semibold ${
-                isConnected
-                  ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                  : isEnded
-                  ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
-                  : "bg-slate-800 text-slate-400 border border-slate-700"
-              }`}
-            >
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  isConnected
-                    ? "bg-emerald-400 animate-pulse"
-                    : isEnded
-                    ? "bg-amber-400"
-                    : "bg-slate-500"
-                }`}
-              />
-              {disconnectNotice
-                ? "Connection Lost"
-                : isConnected
-                ? "Live Session Active"
-                : isEnded
-                ? "Call Completed"
-                : "Ready to Connect"}
-            </span>
-          </div>
+          <SessionBadge phase={phase} />
         </header>
 
-        {disconnectNotice && (
-          <div
-            role="status"
-            className="mb-6 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-5 py-4 text-sm text-amber-200 flex flex-wrap items-center justify-between gap-3"
-          >
-            <span>{disconnectNotice} Stop the call to start a new one.</span>
-            <button
-              type="button"
-              onClick={stopConversation}
-              className="rounded-lg bg-amber-400/90 hover:bg-amber-300 text-slate-950 text-xs font-semibold px-4 py-2 transition-colors cursor-pointer"
-            >
-              End call
-            </button>
-          </div>
+        {phase === "degraded" && notice && (
+          <ConnectionNotice notice={notice} onDismiss={stop} socket={socket} />
         )}
 
-        {/* Patient Details Preview */}
-        {patient && (
-          <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 mb-8 backdrop-blur-md shadow-lg">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-xs uppercase tracking-wider font-semibold text-cyan-400">
-                Patient Consultation Profile
-              </h2>
-              <span className="text-xs text-slate-400 bg-slate-800 px-3 py-1 rounded-full">
-                Dept: <strong className="text-slate-200">{patient.medical_department}</strong>
-              </span>
-            </div>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
-              <div>
-                <span className="text-slate-500 block text-xs">Patient Name</span>
-                <span className="font-medium text-slate-200">
-                  {patient.firstName} {patient.lastName}
-                </span>
-              </div>
-              <div>
-                <span className="text-slate-500 block text-xs">Email</span>
-                <span className="font-medium text-slate-200 truncate block">
-                  {patient.email}
-                </span>
-              </div>
-              <div>
-                <span className="text-slate-500 block text-xs">Phone</span>
-                <span className="font-medium text-slate-200">{patient.phone}</span>
-              </div>
-              <div>
-                <span className="text-slate-500 block text-xs">Language</span>
-                <span className="font-medium text-cyan-300 uppercase">{patient.language}</span>
-              </div>
-            </div>
-          </div>
-        )}
+        <PatientProfile patient={patient} />
 
-        {/* Two Agent Cards Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
-          {/* Patient Agent Card */}
-          <div
-            className={`rounded-2xl p-6 transition-all duration-300 backdrop-blur-xl border ${
-              patientSpeaking
-                ? "bg-cyan-950/30 border-cyan-500/60 shadow-xl shadow-cyan-500/10"
-                : "bg-slate-900/60 border-slate-800"
-            }`}
-          >
-            <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-3">
-                <div className="w-12 h-12 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-2xl shadow-inner">
-                  🤖
-                </div>
-                <div>
-                  <h3 className="font-bold text-lg text-white">Patient Caller Agent</h3>
-                  <p className="text-xs text-slate-400">Autonomous ElevenLabs Agent</p>
-                </div>
-              </div>
-              {patientSpeaking && (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-cyan-500/20 text-cyan-300 text-xs font-medium animate-pulse">
-                  Speaking
-                </span>
-              )}
-            </div>
-
-            <div className="min-h-[100px] bg-slate-950/50 rounded-xl p-4 border border-slate-800/80 flex flex-col justify-center">
-              {currentPatientText ? (
-                <p className="text-cyan-100 text-base leading-relaxed">{currentPatientText}</p>
-              ) : (
-                <p className="text-slate-600 italic text-sm text-center">
-                  {isConnected ? "Listening & preparing speech..." : "Waiting to connect..."}
-                </p>
-              )}
-            </div>
-
-            {patientSpeaking && (
-              <div className="mt-5 flex items-center justify-center gap-1.5 h-8">
-                {[...Array(8)].map((_, i) => (
-                  <div
-                    key={i}
-                    className="w-1.5 bg-cyan-400 rounded-full wave-bar"
-                    style={{
-                      height: `${[25, 45, 30, 50, 35][i]}px`,
-                      animationDelay: `${i * 0.1}s`,
-                    }}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Hospital Receptionist Agent Card */}
-          <div
-            className={`rounded-2xl p-6 transition-all duration-300 backdrop-blur-xl border ${
-              receptionistSpeaking
-                ? "bg-blue-950/30 border-blue-500/60 shadow-xl shadow-blue-500/10"
-                : "bg-slate-900/60 border-slate-800"
-            }`}
-          >
-            <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-3">
-                <div className="w-12 h-12 rounded-xl bg-blue-500/10 border border-blue-500/30 flex items-center justify-center text-2xl shadow-inner">
-                  🏥
-                </div>
-                <div>
-                  <h3 className="font-bold text-lg text-white">Hospital Receptionist</h3>
-                  <p className="text-xs text-slate-400">Booking Agent with Tool Access</p>
-                </div>
-              </div>
-              {receptionistSpeaking && (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-500/20 text-blue-300 text-xs font-medium animate-pulse">
-                  Speaking
-                </span>
-              )}
-            </div>
-
-            <div className="min-h-[100px] bg-slate-950/50 rounded-xl p-4 border border-slate-800/80 flex flex-col justify-center">
-              {currentReceptionistText ? (
-                <p className="text-blue-100 text-base leading-relaxed">{currentReceptionistText}</p>
-              ) : (
-                <p className="text-slate-600 italic text-sm text-center">
-                  {isConnected ? "Ready to respond..." : "Waiting to connect..."}
-                </p>
-              )}
-            </div>
-
-            {receptionistSpeaking && (
-              <div className="mt-5 flex items-center justify-center gap-1.5 h-8">
-                {[...Array(8)].map((_, i) => (
-                  <div
-                    key={i}
-                    className="w-1.5 bg-blue-400 rounded-full wave-bar"
-                    style={{
-                      height: `${[25, 45, 30, 50, 35][i]}px`,
-                      animationDelay: `${i * 0.1}s`,
-                    }}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
+          <AgentCard
+            side="patient"
+            title="Patient Caller Agent"
+            subtitle="Autonomous ElevenLabs Agent"
+            status={socket.patient}
+            speaking={speaking.patient}
+            currentText={currentText.patient}
+            idleHint={phase === "idle" ? "Waiting to connect" : "Listening"}
+          />
+          <AgentCard
+            side="receptionist"
+            title="Hospital Receptionist"
+            subtitle="Booking Agent with Tool Access"
+            status={socket.receptionist}
+            speaking={speaking.receptionist}
+            currentText={currentText.receptionist}
+            idleHint={phase === "idle" ? "Waiting to connect" : "Ready to respond"}
+          />
         </div>
 
-        {/* Transcript Section */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-6 backdrop-blur-xl mb-8 flex-1 flex flex-col">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
-              Real-time Conversation Transcript
-            </h2>
-            <span className="text-xs text-slate-500">
-              {transcript.length} messages exchanged
-            </span>
-          </div>
+        <Transcript entries={transcript} />
 
-          <div
-            className="space-y-4 max-h-72 overflow-y-auto pr-2"
-            id="transcript-container"
-          >
-            {transcript.length === 0 ? (
-              <div className="text-center py-12 text-slate-600 italic text-sm">
-                Transcript entries will appear here once the conversation starts...
-              </div>
-            ) : (
-              transcript.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`p-4 rounded-xl border transition-all ${
-                    msg.role === "receptionist"
-                      ? "bg-blue-950/20 border-blue-500/30 text-blue-100 ml-4 sm:ml-12"
-                      : "bg-cyan-950/20 border-cyan-500/30 text-cyan-100 mr-4 sm:mr-12"
-                  }`}
-                >
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="text-xs font-bold tracking-wide uppercase">
-                      {msg.role === "receptionist" ? "🏥 Hospital Receptionist" : "🤖 Patient Caller Agent"}
-                    </span>
-                    <span className="text-[10px] text-slate-500">
-                      {msg.timestamp.toLocaleTimeString()}
-                    </span>
-                  </div>
-                  <p className="text-sm leading-relaxed">{msg.text}</p>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-
-        {/* Action Controls */}
         <div className="flex justify-center pb-6">
-          {!isConnected && !isEnded ? (
-            <button
-              onClick={startConversation}
-              disabled={isConnecting}
-              className="bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-bold px-10 py-4 rounded-2xl shadow-xl shadow-cyan-500/25 disabled:opacity-50 transition-all duration-300 cursor-pointer text-base flex items-center gap-3"
-            >
-              {!patient ? (
-                "Loading Patient Data..."
-              ) : isConnecting ? (
-                <>
-                  <svg className="animate-spin h-5 w-5 text-white" viewBox="0 0 24 24" fill="none">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                  </svg>
-                  Establishing Secure WebSockets...
-                </>
-              ) : (
-                <>
-                  <span className="text-xl">🎙️</span> Start Autonomous Voice Conversation
-                </>
-              )}
-            </button>
-          ) : isConnected || disconnectNotice ? (
-            <button
-              onClick={stopConversation}
-              className="bg-red-600 hover:bg-red-500 text-white font-bold px-10 py-4 rounded-2xl shadow-xl shadow-red-600/25 transition-all duration-300 cursor-pointer text-base flex items-center gap-2"
-            >
-              <span>🛑</span> Stop Conversation
-            </button>
-          ) : null}
+          <CallControls phase={phase} onStart={start} onStop={stop} />
         </div>
 
-        {isEnded && (
+        {phase === "stopped" && (
           <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 text-center backdrop-blur-xl">
-            <h3 className="text-lg font-bold text-white mb-1">Conversation Complete</h3>
+            <h3 className="text-lg font-bold text-white mb-1">Call ended</h3>
             <p className="text-xs text-slate-400 mb-4">
-              The appointment has been successfully booked and confirmation sent.
+              {transcript.length} {transcript.length === 1 ? "line" : "lines"} were exchanged.
+              Reload the page to run it again.
             </p>
             <Link
               href="/"
               className="inline-block bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold px-6 py-2.5 rounded-xl transition-colors"
             >
-              Start New Consultation
+              Start a new consultation
             </Link>
           </div>
         )}
