@@ -59,6 +59,9 @@ const serverEnvSchema = z.object({
   // Must be an http(s) Postgres HTTP endpoint, not a postgres:// socket URL.
   // See src/lib/storage.ts.
   DATABASE_URL: z.string().min(1).optional(),
+  // Gates error monitoring. Absent it, src/lib/logger/sentry stays inert: the
+  // SDK is never loaded and nothing is sent anywhere. See that module for the
+  // redaction that has to hold before anything is.
   SENTRY_DSN: z.string().min(1).optional(),
   CRON_SECRET: z.string().min(1).optional(),
   TWILIO_ACCOUNT_SID: z.string().min(1).optional(),

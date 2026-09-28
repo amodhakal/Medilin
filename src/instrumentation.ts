@@ -14,4 +14,11 @@ export async function register() {
 
   const { assertServerEnv } = await import("@/lib/env");
   assertServerEnv();
+
+  // Error monitoring, opt-in on SENTRY_DSN. Runs after the assertion so a
+  // missing required variable still fails the boot rather than being reported
+  // to a third party as a crash. Returns false and loads nothing when the DSN
+  // is absent, which is the normal state for a contributor and for CI.
+  const { initErrorMonitoring } = await import("@/lib/logger/sentry");
+  await initErrorMonitoring();
 }
