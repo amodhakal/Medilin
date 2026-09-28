@@ -3,18 +3,23 @@ import { NextResponse } from "next/server";
 /**
  * Fixed-window rate limiting.
  *
- * /api/intake triggers a paid Gemini call and a Resend email per request, and
- * both translation helpers retry up to ten times on failure. There was no
- * limit, so a single client could exhaust the API budget in a loop.
+ * The booking endpoint triggers a paid Gemini call and a Resend email per
+ * request. There was no limit, so a single client could exhaust the API budget
+ * in a loop.
  *
  * A fixed window is chosen over a sliding one deliberately: it needs no
  * per-request ordering, so the semantics are easy to reason about, and the
  * counter is a single increment. The cost is a boundary burst of up to 2x the
  * limit, which is acceptable for abuse control.
  *
+ * Both booking URLs are throttled against ONE budget, deliberately. The
+ * stricter of the two is the one that reflects what a booking costs, and two
+ * counters would have made it free to bypass by using the other URL.
+ *
  * The store is an interface. The in-memory implementation is correct for a
  * single process and useless across serverless instances, so production needs
- * the shared implementation; see getRateLimitStore.
+ * the shared implementation; see getRateLimitStore. Until that lands, the
+ * limit here is friction rather than a quota.
  */
 
 export interface RateLimitStore {

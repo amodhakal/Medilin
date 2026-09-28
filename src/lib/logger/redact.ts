@@ -42,6 +42,7 @@ const ALLOWED_KEYS = new Set([
   "confirmed",
   "durationMs",
   "count",
+  "attempt",
   "limit",
   "remaining",
   "retryAfterMs",

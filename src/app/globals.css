@@ -1,12 +1,189 @@
 @import "tailwindcss";
 
+/*
+ * The palette.
+ *
+ * Four roles, chosen as a set and checked rather than picked and hoped over.
+ * Every text colour here clears WCAG AA (4.5:1) against the surface it is
+ * actually used on, which is the part that is easy to get wrong: this file
+ * used to set labels and secondary text in slate-500, which is 4.34:1 on the
+ * slate-100 a card sits on, and links in cyan-600, which is 3.68:1 on white.
+ * Both passed a glance and failed a measurement.
+ *
+ * Declared through @theme so Tailwind generates the utilities from them, which
+ * is the only way the value in the stylesheet and the value in the markup can
+ * be the same value.
+ */
+@theme {
+  /* Surfaces. A faintly cool paper rather than a warm one: this is a clinic,
+     and the interface should not look like a bakery. */
+  --color-paper: #f6f8f8;
+  --color-surface: #ffffff;
+  --color-surface-sunken: #eef2f2;
+
+  /* Text. Three steps, all AA on paper and on surface. */
+  --color-ink: #0f172a; /* 17.4:1  headings, body */
+  --color-ink-soft: #334155; /* 10.3:1  field labels */
+  --color-ink-muted: #475569; /* 7.6:1 on white, 6.9:1 on surface-sunken */
+
+  /*
+   * Structure. Non-text, so 3:1 is the bar rather than 4.5:1 -- and the
+   * "strong" step has to clear it, which the border colour this replaced did
+   * not: slate-400 on white is 2.56:1, which is fine for a hairline and not
+   * fine for the edge of a control.
+   */
+  --color-rule: #cbd5e1;
+  --color-rule-strong: #64748b;
+
+  /*
+   * One accent, deep teal, used for the primary action and for links.
+   * White on it is 7.7:1 and it on white is 7.7:1, so the button passes in
+   * both directions and a link can be the same colour as a button without
+   * changing contrast.
+   */
+  --color-accent: #0b5c63;
+  --color-accent-strong: #094a50;
+  --color-accent-soft: #d7ebec;
+
+  /* Problems. The text colour is not the border colour: a red border is a
+     shape and a red sentence is a message, and the one that has to be legible
+     gets the darker value. */
+  --color-danger: #b91c1c;
+  --color-danger-ink: #991b1b;
+  --color-danger-soft: #fef2f2;
+  --color-danger-rule: #ef4444;
+
+  /* The prototype notice. The loudest thing on the page on purpose. */
+  --color-notice-ink: #92400e;
+  --color-notice-soft: #fffbeb;
+  --color-notice-rule: #fcd34d;
+
+  --color-focus: #0b5c63;
+}
+
 @layer base {
   body {
-    background-color: #f8fafc;
-    color: #0f172a;
+    background-color: var(--color-paper);
+    color: var(--color-ink);
     font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
     overflow-x: hidden;
   }
+
+  /*
+   * A visible keyboard focus ring on everything focusable.
+   *
+   * There was none outside the form inputs. The links on this app -- back to
+   * the language list, the language cards themselves, the error summary
+   * entries -- are `<a>` and `<button>` elements with no `:focus` style at all,
+   * so a keyboard user tabbed through the page with no idea where they were.
+   * `:where` keeps this at zero specificity so a component that genuinely needs
+   * a different focus treatment can still win, and `:focus-visible` keeps it
+   * out of the way of pointer users, who do not need a ring.
+   */
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+
+  /*
+   * Skip to the form.
+   *
+   * The language page's whole interactive content is one form, so without this
+   * a keyboard user tabs through the language cards and the footer on every
+   * page before reaching anything. Off screen until focused, then pinned to the
+   * top in the inline-start corner, which is the top-left for English and the
+   * top-right for Arabic.
+   */
+  .skip-link {
+    position: fixed;
+    inset-block-start: 0;
+    inset-inline-start: 0;
+    z-index: 100;
+    transform: translateY(-120%);
+    background-color: var(--color-surface);
+    color: var(--color-accent);
+    border: 2px solid var(--color-accent);
+    border-start-end-radius: 0.75rem;
+    border-end-end-radius: 0.75rem;
+    padding: 0.75rem 1.25rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+  }
+
+  .skip-link:focus {
+    transform: translateY(0.75rem);
+  }
+
+  /*
+   * Tap targets.
+   *
+   * A button written as a sentence in a paragraph is a link-shaped thing with a
+   * 16-pixel target, which is under the 24-pixel minimum and a long way under
+   * the 44 that a hand on a phone needs. `.tap-target` gives it the height
+   * without changing how it reads.
+   */
+  .tap-target {
+    display: inline-flex;
+    align-items: center;
+    min-block-size: 1.75rem;
+    padding-inline: 0.25rem;
+  }
+}
+
+/*
+ * Toasts.
+ *
+ * react-toastify's own stylesheet is imported first, in the root layout, so
+ * these rules take effect at equal specificity. They exist to make a toast
+ * look like the rest of the app and, more importantly, to make it look like a
+ * message rather than a floating rectangle: a coloured rule down the inline
+ * start edge, no gradient, no bounce.
+ */
+.Toastify__toast {
+  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
+  font-size: 0.875rem;
+  line-height: 1.4;
+  color: var(--color-ink);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-rule);
+  border-radius: 0.75rem;
+  padding: 0.875rem 1.125rem;
+  box-shadow: 0 12px 32px -16px rgb(15 23 42 / 0.45);
+}
+
+.Toastify__toast--success {
+  border-inline-start: 4px solid var(--color-accent);
+}
+
+.Toastify__toast--error {
+  border-inline-start: 4px solid var(--color-danger);
+}
+
+.Toastify__toast--warning {
+  border-inline-start: 4px solid var(--color-notice-ink);
+}
+
+.Toastify__close-button {
+  color: var(--color-ink-muted);
+}
+
+.Toastify__close-button:hover {
+  color: var(--color-ink);
+}
+
+/*
+ * Reading direction.
+ *
+ * Every direction-dependent declaration in this file is a logical property --
+ * `inset-inline-start`, `border-inline-start`, not `left` -- so a
+ * right-to-left language needs no separate stylesheet. The one thing a logical
+ * property cannot express is a glyph that points: an arrow means "forward" in a
+ * left-to-right script and "backward" in a right-to-left one, so
+ * `.flow-arrow` mirrors it under `[dir="rtl"]` instead.
+ */
+[dir="rtl"] .flow-arrow {
+  display: inline-block;
+  transform: scaleX(-1);
 }
 
 @keyframes soundWave {
@@ -22,13 +199,123 @@
   animation: soundWave 1.2s infinite ease-in-out;
 }
 
+/*
+ * Less motion.
+ *
+ * Two things in this app move on their own: the sound bars on the spectate
+ * page, which are decorative, and the toast enter, which is not. Both are
+ * behind `prefers-reduced-motion: no-preference`, so a request for reduced
+ * motion removes them rather than shortening them. The `soundWave` keyframe
+ * stays defined: it is what the bars animate with when motion is welcome, and
+ * removing it would mean the spectate page lost its only visual indication that
+ * someone is speaking.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .wave-bar {
+    animation: none;
+  }
+
+  .skip-link {
+    transition: none;
+  }
+}
+
+/*
+ * High contrast.
+ *
+ * `prefers-contrast: more` is a request for less decoration, not for a
+ * different palette: it is honoured by removing the low-contrast text steps,
+ * strengthening the borders that carry meaning, and dropping the shadows that
+ * were only ever standing in for a border.
+ */
+@media (prefers-contrast: more) {
+  body {
+    background-color: var(--color-surface);
+  }
+
+  .Toastify__toast {
+    border-width: 2px;
+    border-color: var(--color-ink);
+    box-shadow: none;
+  }
+}
+
+/*
+ * Windows high contrast, where the operating system replaces the palette.
+ *
+ * Anything that was carrying meaning with a background colour has to carry it
+ * with a border here, and the focus ring has to survive: `outline` is one of
+ * the properties forced-colors mode keeps.
+ */
+@media (forced-colors: active) {
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid CanvasText;
+  }
+
+  .Toastify__toast,
+  .skip-link {
+    border: 1px solid CanvasText;
+  }
+}
+
+/*
+ * Low bandwidth.
+ *
+ * `data-bandwidth="low"` is set on the document element by
+ * @/i18n/display-preferences, from the browser's own Save-Data and effective
+ * type hints, or by the patient, who can see the cost of this app better than
+ * the browser can guess it.
+ *
+ * What it turns off is what is expensive to render rather than expensive to
+ * download, because that is what can be turned off from a stylesheet:
+ *
+ *   - The web font. Substituted with the platform's own UI font, which is
+ *     already on the machine. This does not cancel the download: the two
+ *     woff2 preloads are in the document head and a stylesheet cannot unlink
+ *     them. That is the honest limit of a CSS-only mode, and removing
+ *     next/font from the root layout is what would actually save the ~20 kB.
+ *   - Shadows and backdrop filters, which are the expensive part of a card on a
+ *     low-end GPU.
+ *   - Every transition and animation, including the ones a reduced-motion
+ *     request would leave alone because it is not motion-sensitive.
+ */
+html[data-bandwidth="low"] {
+  --font-geist-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-geist-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html[data-bandwidth="low"] body {
+  background-color: var(--color-surface);
+}
+
+html[data-bandwidth="low"] * {
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+
+html[data-bandwidth="low"] *,
+html[data-bandwidth="low"] *::before,
+html[data-bandwidth="low"] *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
 /* Custom Scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: #f1f5f9;
+  background: #eef2f2;
 }
 ::-webkit-scrollbar-thumb {
   background: #cbd5e1;

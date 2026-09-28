@@ -1,6 +1,4 @@
-import { GoogleGenAI, ThinkingLevel } from "@google/genai";
-import { getServerEnv } from "@/lib/env";
-import { logInfo, logWarn } from "@/lib/logger";
+import { getLlmClient } from "@/lib/gemini";
 import {
   appointmentRecordSchema,
   type AppointmentRecord,
@@ -8,31 +6,10 @@ import {
   type SupportedLanguage,
 } from "@/lib/validation/intake";
 import { buildIntakeTranslationPrompt } from "@/lib/llm/prompt";
-
-/**
- * Constructed lazily.
- *
- * Previously this ran at module scope, so importing the module built a client
- * with an `undefined` key and logged "API key should be set" during `next build`
- * and on every cold start, deferring the real failure to the first API call.
- */
-function getClient(): GoogleGenAI {
-  return new GoogleGenAI({ apiKey: getServerEnv().GEMINI_KEY });
-}
-
-const MAX_RETRIES = 10;
-const BASE_DELAY_MS = 1000;
-const MAX_DELAY_MS = 30000;
-
-async function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function calculateDelayWithJitter(attempt: number): number {
-  const exponentialDelay = BASE_DELAY_MS * Math.pow(2, attempt);
-  const jitter = Math.random() * exponentialDelay;
-  return Math.min(jitter, MAX_DELAY_MS);
-}
+import {
+  TRANSLATABLE_FIELD_NAMES,
+  translationResponseSchema,
+} from "@/lib/llm/schema";
 
 /**
  * The only fields the model is allowed to change.
@@ -41,8 +18,13 @@ function calculateDelayWithJitter(attempt: number): number {
  * contact detail that was typed into a form, and none of it needs
  * translating. Constraining the model to these two is what prevents a
  * response from rewriting the rest of the record.
+ *
+ * The list moved to ./llm/schema so that the prompt, the response schema, and
+ * the merge below all derive from one declaration. It used to be spelled out in
+ * this file and again inside the schema builder, which is a way for the schema
+ * to constrain a field the merge does not read.
  */
-const TRANSLATABLE_FIELDS = ["additionalInfo", "medical_department"] as const;
+const TRANSLATABLE_FIELDS = TRANSLATABLE_FIELD_NAMES;
 
 type TranslatableField = (typeof TRANSLATABLE_FIELDS)[number];
 
@@ -60,66 +42,20 @@ export async function translateToEnglish(
   }
 
   const base: AppointmentRecord = data;
-  if (Object.keys(fieldsToTranslate).length === 0) {
+  const requested = Object.keys(fieldsToTranslate) as TranslatableField[];
+  if (requested.length === 0) {
     return base;
   }
 
-  const prompt = buildIntakeTranslationPrompt(fieldsToTranslate, sourceLanguage);
+  // Nothing to configure and nothing to parse: the client owns the model, the
+  // JSON mode, and the retry budget. This function is now the part that is
+  // specific to intake translation -- which fields, and what to do with a reply.
+  const translated = await getLlmClient().generateJson({
+    prompt: buildIntakeTranslationPrompt(fieldsToTranslate, sourceLanguage),
+    responseSchema: translationResponseSchema(requested),
+  });
 
-  let lastError: Error | null = null;
-
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      const response = await getClient().models.generateContent({
-        model: "gemini-3-flash-preview",
-        config: {
-          thinkingConfig: {
-            thinkingLevel: ThinkingLevel.HIGH,
-          },
-        },
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }],
-          },
-        ],
-      });
-
-      const content = response.text?.trim() || "{}";
-
-      let parsed: unknown;
-      try {
-        const jsonMatch =
-          content.match(/```json\n?([\s\S]*?)\n?```/) ||
-          content.match(/(\{[\s\S]*\})/);
-        parsed = JSON.parse(jsonMatch ? jsonMatch[1] : content);
-      } catch {
-        parsed = JSON.parse(content);
-      }
-
-      return applyTranslation(base, parsed);
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-      // The message is redacted and truncated by the logger: a Gemini SDK
-      // error can echo the request payload, which here is the symptom text
-      // that was sent for translation.
-      logWarn("llm.attempt_failed", {
-        cause: lastError,
-        attempt: attempt + 1,
-        limit: MAX_RETRIES,
-      });
-
-      if (attempt < MAX_RETRIES - 1) {
-        const delay = calculateDelayWithJitter(attempt);
-        logInfo("llm.retry_scheduled", { durationMs: delay, attempt: attempt + 1 });
-        await sleep(delay);
-      }
-    }
-  }
-
-  throw new Error(
-    `Translation failed after ${MAX_RETRIES} attempts: ${lastError?.message}`,
-  );
+  return applyTranslation(base, translated);
 }
 
 /**
@@ -129,6 +65,10 @@ export async function translateToEnglish(
  * the response is a non-empty string. Every other key the model returns is
  * discarded, so a response carrying `{"email": "attacker@example.test"}` is
  * ignored rather than merged.
+ *
+ * JSON mode makes the response carry only the two keys, but it does not make
+ * the values correct and it does not make the model honest, so this stays.
+ * Schema-constrained decoding is a statement about shape, not about intent.
  */
 export function applyTranslation(
   base: AppointmentRecord,

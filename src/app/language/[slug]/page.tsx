@@ -1,318 +1,98 @@
-"use client";
+import type { Metadata } from "next";
+import { notFound } from "next/navigation";
+import { ToastContainer } from "react-toastify";
 
-import { use } from "react";
-import { toast } from "react-toastify";
-import { submitIntakeForm } from "@/app/actions";
-import Link from "next/link";
+import { LIVE_LANGUAGE_SLUGS, resolveBookableLanguage } from "@/i18n/registry";
+import { languageMetadata } from "@/i18n/metadata";
+import IntakeForm from "./IntakeForm";
 
-interface PageProps {
-  params: Promise<{ slug: string }>;
+/**
+ * /language/[slug]
+ *
+ * A server component, so the slug can be resolved before any of the form is
+ * sent to the browser.
+ *
+ * This used to be a client component that resolved the slug with
+ * `slug as Language || "english"`: an unchecked cast, so every string in the
+ * world typechecked, and a fallback, so every string in the world rendered a
+ * working English form. Nothing told a patient that the language they clicked
+ * did not exist, and a stale or mistyped link looked identical to a real one.
+ *
+ * Now the registry is the only thing that can name a language, an unrecognised
+ * slug is a 404 with a page that says so, and the known slugs are prerendered.
+ */
+export function generateStaticParams(): Array<{ slug: string }> {
+  // Bookable languages only. A pending language is announced on the picker and
+  // has no page, so prerendering a route for it would be a page that exists
+  // only to say it does not.
+  return LIVE_LANGUAGE_SLUGS.map((slug) => ({ slug }));
 }
 
-type Language = "english" | "spanish" | "portuguese";
+/**
+ * Per-language document metadata.
+ *
+ * The title, description, canonical URL, hreflang set, and Open Graph locale
+ * all come from the registry, so a language cannot be added to the picker
+ * without also getting a title. The alternates point at every language, which
+ * is what tells a search engine these are translations of one form rather than
+ * four unrelated pages.
+ */
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ slug: string }>;
+}): Promise<Metadata> {
+  const { slug } = await params;
 
-const translations: Record<Language, Record<string, string>> = {
-  english: {
-    title: "Patient Intake Form",
-    subtitle: "Complete your details to initiate AI receptionist consultation",
-    firstName: "First Name",
-    lastName: "Last Name",
-    email: "Email Address",
-    dob: "Date of Birth",
-    insurance: "Do you have insurance?",
-    phone: "Doctor's Phone Number",
-    appointmentDateTime: "Appointment Date & Time",
-    whoToVisit: "Medical Department",
-    additionalInfo: "Additional Information / Symptoms",
-    submit: "Initiate Voice Consultation",
-    yes: "Yes",
-    no: "No",
-    selectOption: "-- Select Department --",
-    doctor: "General Practitioner",
-    eyeDoctor: "Ophthalmology (Eye)",
-    dentist: "Dental Care",
-    pediatrician: "Pediatrics",
-    psychiatrist: "Psychiatry & Mental Health",
-    other: "Specialist Consultation",
-    toastProcessing: "Processing intake & spinning up AI Agent...",
-    back: "Back to Languages",
-  },
-  spanish: {
-    title: "Formulario de Admisión",
-    subtitle: "Complete sus datos para iniciar la consulta con el recepcionista de IA",
-    firstName: "Nombre",
-    lastName: "Apellido",
-    email: "Correo Electrónico",
-    dob: "Fecha de Nacimiento",
-    insurance: "¿Tiene seguro médico?",
-    phone: "Número de Teléfono del Doctor",
-    appointmentDateTime: "Fecha y Hora de la Cita",
-    whoToVisit: "Departamento Médico",
-    additionalInfo: "Información Adicional / Síntomas",
-    submit: "Iniciar Consulta por Voz",
-    yes: "Sí",
-    no: "No",
-    selectOption: "-- Seleccionar Departamento --",
-    doctor: "Médico General",
-    eyeDoctor: "Oftalmología",
-    dentist: "Odontología",
-    pediatrician: "Pediatría",
-    psychiatrist: "Psiquiatría y Salud Mental",
-    other: "Consulta Especializada",
-    toastProcessing: "Procesando admisión y conectando Agente IA...",
-    back: "Volver a Idiomas",
-  },
-  portuguese: {
-    title: "Formulário de Admissão",
-    subtitle: "Preencha seus dados para iniciar a consulta com o recepcionista de IA",
-    firstName: "Nome",
-    lastName: "Sobrenome",
-    email: "Endereço de E-mail",
-    dob: "Data de Nascimento",
-    insurance: "Você possui seguro médico?",
-    phone: "Telefone do Médico",
-    appointmentDateTime: "Data e Hora da Consulta",
-    whoToVisit: "Departamento Médico",
-    additionalInfo: "Informações Adicionais / Sintomas",
-    submit: "Iniciar Consulta por Voz",
-    yes: "Sim",
-    no: "Não",
-    selectOption: "-- Selecionar Departamento --",
-    doctor: "Clínico Geral",
-    eyeDoctor: "Oftalmologia",
-    dentist: "Odontologia",
-    pediatrician: "Pediatria",
-    psychiatrist: "Psiquiatria e Saúde Mental",
-    other: "Consulta Especializada",
-    toastProcessing: "Processando admissão e iniciando Agente de Voz...",
-    back: "Voltar para Idiomas",
-  },
-};
+  const metadata = languageMetadata(slug);
+  if (!metadata) {
+    notFound();
+  }
 
-export default function LanguagePage({ params }: PageProps) {
-  const { slug } = use(params);
-  const lang = (slug as Language) || "english";
-  const t = translations[lang] || translations.english;
+  return metadata;
+}
 
-  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const formData = new FormData(e.currentTarget);
-    formData.append("language", lang);
-    const result = await submitIntakeForm(formData);
+export default async function LanguagePage({
+  params,
+}: {
+  params: Promise<{ slug: string }>;
+}) {
+  const { slug } = await params;
 
-    // The previous version showed a success toast unconditionally and then
-    // redirected only if a spectateUrl happened to be present, so a rejected
-    // submission looked identical to a booking until the page silently did
-    // nothing.
-    if (!result.ok) {
-      toast.error(result.error);
-      return;
-    }
-
-    toast.success(t.toastProcessing);
-    window.location.href = result.spectateUrl;
-  };
+  const bookable = resolveBookableLanguage(slug);
+  if (!bookable) {
+    notFound();
+  }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col items-center justify-center p-6">
-      <div className="w-full max-w-xl my-8">
-        <Link
-          href="/"
-          className="inline-flex items-center gap-2 text-xs text-cyan-600 hover:text-cyan-700 mb-6 font-semibold transition-colors"
-        >
-          &larr; {t.back}
-        </Link>
-
-        <div className="bg-white border border-slate-200 rounded-3xl p-8 shadow-xl">
-          <div className="mb-8 text-center">
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mb-2">
-              {t.title}
-            </h1>
-            <p className="text-sm text-slate-500">{t.subtitle}</p>
-          </div>
-
-          <form onSubmit={handleSubmit} className="space-y-5">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label
-                  htmlFor="firstName"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
-                  {t.firstName}
-                </label>
-                <input
-                  type="text"
-                  id="firstName"
-                  name="firstName"
-                  required
-                  placeholder="John"
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="lastName"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
-                  {t.lastName}
-                </label>
-                <input
-                  type="text"
-                  id="lastName"
-                  name="lastName"
-                  required
-                  placeholder="Doe"
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label
-                htmlFor="email"
-                className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-              >
-                {t.email}
-              </label>
-              <input
-                type="email"
-                id="email"
-                name="email"
-                required
-                placeholder="john.doe@example.com"
-                className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
-              />
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label
-                  htmlFor="dob"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
-                  {t.dob}
-                </label>
-                <input
-                  type="date"
-                  id="dob"
-                  name="dob"
-                  required
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="phone"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
-                  {t.phone}
-                </label>
-                <input
-                  type="tel"
-                  id="phone"
-                  name="phone"
-                  required
-                  placeholder="+1 (555) 019-2834"
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-2">
-                {t.insurance}
-              </label>
-              <div className="flex gap-6 bg-slate-50 border border-slate-300 rounded-xl p-3.5">
-                <label className="flex items-center cursor-pointer text-sm font-medium text-slate-800">
-                  <input
-                    type="radio"
-                    name="insurance"
-                    value="yes"
-                    required
-                    className="mr-2 accent-cyan-600 w-4 h-4"
-                  />
-                  {t.yes}
-                </label>
-                <label className="flex items-center cursor-pointer text-sm font-medium text-slate-800">
-                  <input
-                    type="radio"
-                    name="insurance"
-                    value="no"
-                    className="mr-2 accent-cyan-600 w-4 h-4"
-                  />
-                  {t.no}
-                </label>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label
-                  htmlFor="appointmentDateTime"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
-                  {t.appointmentDateTime}
-                </label>
-                <input
-                  type="datetime-local"
-                  id="appointmentDateTime"
-                  name="appointmentDateTime"
-                  required
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="medical_department"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
-                  {t.whoToVisit}
-                </label>
-                <select
-                  id="medical_department"
-                  name="medical_department"
-                  required
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
-                >
-                  <option value="">{t.selectOption}</option>
-                  <option value="Doctor">{t.doctor}</option>
-                  <option value="Eye Doctor">{t.eyeDoctor}</option>
-                  <option value="Dentist">{t.dentist}</option>
-                  <option value="Pediatrician">{t.pediatrician}</option>
-                  <option value="Psychiatrist">{t.psychiatrist}</option>
-                  <option value="Other">{t.other}</option>
-                </select>
-              </div>
-            </div>
-
-            <div>
-              <label
-                htmlFor="additionalInfo"
-                className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-              >
-                {t.additionalInfo}
-              </label>
-              <textarea
-                id="additionalInfo"
-                name="additionalInfo"
-                rows={3}
-                placeholder="Briefly describe your symptoms or reason for visit..."
-                className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all resize-none"
-              />
-            </div>
-
-            <button
-              type="submit"
-              className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-semibold py-4 rounded-xl shadow-md transition-all duration-200 cursor-pointer text-center text-sm tracking-wide"
-            >
-              {t.submit}
-            </button>
-          </form>
-        </div>
+    <>
+      <IntakeForm slug={bookable.slug} language={bookable.language} />
+      {/*
+        The toast container lives here rather than in the root layout, because
+        this is the only page that raises toasts and because it is the only
+        place that knows the reading direction. react-toastify mirrors its own
+        layout when told the container is RTL, which a global container in the
+        root layout -- where `<html lang>` is fixed to English and the language
+        is not known -- could not do.
+      */}
+      {/* `rtl` mirrors react-toastify's own layout. The wrapper is for
+          `dir`: the library has no prop for it, and without it the logical
+          properties in the toast rules -- the coloured rule down the inline
+          start edge -- would resolve against the document's direction, which
+          is English, on a page in Arabic. */}
+      <div dir={bookable.language.direction}>
+        <ToastContainer
+          position="top-center"
+          draggable={false}
+          closeOnClick={false}
+          pauseOnFocusLoss
+          closeButton
+          autoClose={8000}
+          newestOnTop
+          role="alert"
+          rtl={bookable.language.direction === "rtl"}
+        />
       </div>
-    </div>
+    </>
   );
 }

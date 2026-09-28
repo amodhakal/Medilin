@@ -1,16 +1,72 @@
 "use server";
 
-import { headers } from "next/headers";
 import {
   intakeFromFormData,
   intakeSchema,
   type IntakeFormData,
 } from "@/lib/validation/intake";
 import { parseWith, type FieldIssue } from "@/lib/validation/parse";
+import { logError } from "@/lib/logger";
+import { bookAppointment } from "@/app/api/_lib/book-appointment";
+import { ConfirmationDeliveryError } from "@/app/api/_lib/deliver-confirmation";
 
+/**
+ * The intake server action.
+ *
+ * This used to `fetch` the application's own `/api/intake`:
+ *
+ *   const host = headers().get("host") || "localhost:3000";
+ *   const protocol = process.env.NODE_ENV === "production" ? "https" : "http";
+ *   await fetch(`${protocol}://${host}/api/intake`, { ... })
+ *
+ * Two functions in one process, talking over HTTP to each other, to reach
+ * logic that could have been a function call. Everything wrong with that
+ * arrangement is a consequence of the arrangement and not of any one bug in it:
+ *
+ *   - The destination is built from the `Host` header, which the client
+ *     controls. A request arriving with `Host: attacker.test` makes the server
+ *     POST the patient's name, date of birth, phone number and symptom text to
+ *     an address of the caller's choosing, with the internal request body
+ *     intact. Hardening that means deciding which hosts are trustworthy, and
+ *     every answer is either a list to keep current or a configuration flag
+ *     that is wrong in one environment or the other.
+ *   - The protocol is inferred from `NODE_ENV`, which is a build-time constant
+ *     standing in for a deployment fact. Behind a TLS-terminating proxy, in a
+ *     preview deployment, or on any host that is not the one the flag describes,
+ *     it is simply the wrong scheme.
+ *   - It costs a second function invocation, a second serialization, and a
+ *     second round trip's latency to do work that was already in this process.
+ *   - And it is untestable: the action cannot be exercised without a running
+ *     server on the other end, which is why the two bugs in the response
+ *     handling below survived as long as they did.
+ *
+ * So the fetch is deleted rather than hardened. The booking pipeline is a
+ * function, the action calls it, and there is no URL to get wrong.
+ *
+ * Closes #21, #43.
+ *
+ * The spectate URL comes back root-relative, because the action has no
+ * trustworthy absolute origin to build one from -- that was the `Host` header.
+ * A relative URL is what the caller wants anyway: it is assigned to
+ * `window.location.href`, which resolves it against the origin the browser
+ * already trusts, so it is also correct behind a proxy or a tunnel.
+ */
+
+/**
+ * `spectateUrl` on a failure means the appointment EXISTS and only the
+ * confirmation email did not go out. That is a partial success, and it is the
+ * one case where the caller must still show the patient their link: dropping
+ * it strands someone who has a real booking and no way to reach it.
+ */
 export type SubmitIntakeResult =
   | { ok: true; spectateUrl: string; appointmentId: string }
-  | { ok: false; error: string; issues: FieldIssue[] };
+  | {
+      ok: false;
+      error: string;
+      issues: FieldIssue[];
+      spectateUrl?: string;
+      appointmentId?: string;
+    };
 
 export async function submitIntakeForm(formData: FormData): Promise<SubmitIntakeResult> {
   // Validate before spending anything. The form's `required` attributes are
@@ -27,37 +83,46 @@ export async function submitIntakeForm(formData: FormData): Promise<SubmitIntake
 
   const data: IntakeFormData = parsed.data;
 
-  const headersList = await headers();
-  const host = headersList.get("host") || "localhost:3000";
-  const protocol = process.env.NODE_ENV === "production" ? "https" : "http";
+  try {
+    const result = await bookAppointment(data, "");
 
-  const response = await fetch(`${protocol}://${host}/api/intake`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
+    return {
+      ok: true,
+      spectateUrl: result.spectateUrl,
+      appointmentId: result.appointmentId,
+    };
+  } catch (error) {
+    // Logged here because this path no longer goes through the route handler,
+    // which is where failures used to be recorded. The message is redacted and
+    // truncated by the logger, so a vendor error echoing the request payload
+    // cannot carry symptom text into a log drain.
+    logError("intake.failed", error);
 
-  const body = (await response.json().catch(() => null)) as {
-    success?: boolean;
-    spectateUrl?: string;
-    appointmentId?: string;
-    error?: string;
-    issues?: FieldIssue[];
-  } | null;
+    if (error instanceof ConfirmationDeliveryError) {
+      // The appointment exists. The confirmation does not. Saying "we could not
+      // book that appointment" would be a different lie, and a patient who
+      // resubmits on the strength of it books twice.
+      return {
+        ok: false,
+        error:
+          "Your appointment was created, but we could not send the confirmation email. Please contact the clinic.",
+        issues: [],
+        // The booking is real, so the link travels with the warning. Absent
+        // only if a future caller throws before the record is stored, in which
+        // case there is nothing to link to and the warning stands alone.
+        spectateUrl: error.booking?.spectateUrl,
+        appointmentId: error.booking?.appointmentId,
+      };
+    }
 
-  // The old code returned response.json() and reported success by truthiness.
-  // A 500 with an error body was indistinguishable from a booking.
-  if (!response.ok || !body?.success || !body.spectateUrl || !body.appointmentId) {
+    // Deliberately not the error. A failure here is a translation failure, and
+    // a Gemini SDK error message can echo the request payload, which for this
+    // app is the symptom text the patient typed. The person in front of the
+    // form is told only that it did not work.
     return {
       ok: false,
-      error: body?.error ?? `Request failed with status ${response.status}`,
-      issues: body?.issues ?? [],
+      error: "We could not book that appointment. Please try again.",
+      issues: [],
     };
   }
-
-  return {
-    ok: true,
-    spectateUrl: body.spectateUrl,
-    appointmentId: body.appointmentId,
-  };
 }
