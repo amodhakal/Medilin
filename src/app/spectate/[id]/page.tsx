@@ -1,5 +1,5 @@
 import { getPatientAgentId, getReceptionistAgentId } from "@/config";
-import { openRecord } from "@/lib/phi-token";
+import { resolveRecord } from "@/lib/phi-token";
 import { notFound } from "next/navigation";
 import SpectateClient, { type SpectatePatient } from "./SpectateClient";
 
@@ -10,11 +10,16 @@ import SpectateClient, { type SpectatePatient } from "./SpectateClient";
  * are read here rather than in the client bundle where they previously sat as
  * literals anyone could read off the shipped JavaScript.
  *
- * The route segment is an encrypted token, not an identifier. The page used
- * to read the record out of a `?patientInfo=` query parameter in the browser,
- * which meant the plaintext record was in the URL, in browser history, in the
- * Referer header of anything the page loaded, and in every access log between
- * the browser and this server. Decrypting here keeps it out of all of those.
+ * The route segment is a token, not a record. The page used to read the record
+ * out of a `?patientInfo=` query parameter in the browser, which meant the
+ * plaintext record was in the URL, in browser history, in the Referer header of
+ * anything the page loaded, and in every access log between the browser and
+ * this server. Resolving it here keeps it out of all of those.
+ *
+ * `resolveRecord` is awaited because a token can now be a short reference to a
+ * stored record rather than the record sealed into the URL, and reading one back
+ * is a query. The sealed format still resolves here, so a link that was already
+ * sent to someone keeps working.
  *
  * It also retires three bugs that came with reading the URL in the client:
  * a double decodeURIComponent that threw a URIError on a stray `%`, a
@@ -29,7 +34,7 @@ export default async function SpectatePage({
 }) {
   const { id } = await params;
 
-  const plaintext = openRecord(id);
+  const plaintext = await resolveRecord(id);
   if (!plaintext) {
     // Not a valid link: truncated, tampered, sealed under a different key, or
     // from an older version. The four cases are deliberately not
