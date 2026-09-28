@@ -275,6 +275,44 @@ export class PostgresAppointmentStore implements AppointmentStore {
   }
 
   /**
+   * One page of the same window, at an offset.
+   *
+   * `ORDER BY created_at ASC, id ASC` and not just `created_at`, and the reason
+   * is `listPage` in ./store: an order that is not total makes offset paging
+   * skip and repeat rows, so a clinic paging through a day's list sees a patient
+   * twice and another one disappear. The id tiebreak is cheap and the index
+   * above already covers `(status, created_at)`.
+   *
+   * Both bounds are clamped here rather than trusted from the caller. `LIMIT -1`
+   * is an error in Postgres and `OFFSET -1` will not parse, so an unclamped
+   * value from a query string is a 500 on the dashboard instead of an empty
+   * page -- and the in-memory store clamps identically, so the two do not
+   * disagree about what a nonsense page means.
+   */
+  async listPage(
+    statuses: readonly Appointment["status"][],
+    limit: number,
+    offset: number,
+  ): Promise<Appointment[]> {
+    await this.ready();
+
+    const rows = await this.sql.query<AppointmentRow>(
+      `SELECT ${COLUMNS}
+         FROM appointments
+        WHERE status = ANY($1::text[])
+        ORDER BY created_at ASC, id ASC
+        LIMIT $2 OFFSET $3`,
+      [
+        `{${statuses.join(",")}}`,
+        clampCount(limit),
+        clampCount(offset),
+      ],
+    );
+
+    return rows.map(toAppointment);
+  }
+
+  /**
    * `INSERT ... ON CONFLICT DO NOTHING`, and the returned row is the whole answer.
    *
    * An upsert with `DO UPDATE` would be wrong here even though it looks like the
@@ -459,6 +497,19 @@ function toEnvelope(value: unknown): EncryptedEnvelope {
 
 const COLUMNS =
   "id, patient_info, status, conversation_ended, created_at, updated_at";
+
+/**
+ * A page window as a non-negative whole number of rows.
+ *
+ * Duplicated from ./memory-store rather than imported, because that module is
+ * the in-memory implementation and importing its internals into this one would
+ * make the durable store depend on the store it exists to replace. The two must
+ * agree, which is a comment's job and a test's.
+ */
+function clampCount(value: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.trunc(value));
+}
 
 const GRANT_COLUMNS =
   "jti, appointment_id, actions, expires_at, withdrawn_at";

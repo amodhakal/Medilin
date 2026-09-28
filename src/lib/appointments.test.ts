@@ -10,6 +10,8 @@ import {
 import { openActionToken } from "./action-token";
 import { resetSqlClient } from "@/lib/storage";
 import {
+  CLINIC_MAX_OFFSET,
+  CLINIC_PAGE_SIZE,
   InMemoryAppointmentStore,
   PostgresAppointmentStore,
   cancelAppointment,
@@ -19,6 +21,7 @@ import {
   getAppointmentStore,
   isDurableAppointmentStore,
   issuePatientActions,
+  listClinicSchedule,
   listReminderCandidates,
   rescheduleAppointment,
   setAppointmentStore,
@@ -822,5 +825,255 @@ describe("claimReminder", () => {
 
     expect(await claimReminder(first.id)).toBe(true);
     expect(await claimReminder(second.id)).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The clinic dashboard (#63)
+ * ---------------------------------------------------------------------------
+ *
+ * The only reader in this application that shows a clinician everything the
+ * record holds. `/track` is the opposite: a link anyone might forward, rendering
+ * four fields. Both exist now, and the tests below are as much about the
+ * difference as about the feature -- the boundary between those two surfaces is
+ * the security property of this feature, and it is a property of the code
+ * rather than of a policy document.
+ *
+ * What is asserted here and not here: these are the store questions (which
+ * records, how many, in what order) and the trail. The projection into the shape
+ * a clinician reads is ./clinic/schedule-view.test.ts, and the route that gates
+ * it is src/app/dashboard/route.test.ts.
+ */
+
+describe("listClinicSchedule", () => {
+  /**
+   * n appointments, written straight to the store a minute apart.
+   *
+   * Straight to the store rather than through `createAppointment`, because the
+   * clock would decide the order under test: two records created inside the same
+   * millisecond have no defined booking order, and a test whose expected order
+   * depends on how fast the machine runs is a test that fails on a busy one.
+   */
+  async function booked(count: number) {
+    const store = new InMemoryAppointmentStore();
+    setAppointmentStore(store);
+
+    const ids: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const createdAt = new Date(Date.UTC(2026, 8, 1, 9, index));
+      const id = `a${String(index).padStart(2, "0")}`;
+      await store.create({
+        id,
+        patientInfo: record(),
+        createdAt,
+        updatedAt: createdAt,
+        conversationEnded: false,
+        status: "scheduled",
+      });
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  test("never offers a cancelled or completed appointment", async () => {
+    // The clinic is a working list. An appointment on it that the patient
+    // cancelled on Sunday is not work, and a dashboard that shows it next to the
+    // live ones is a dashboard nobody trusts.
+    freshAudit();
+    const live = await createAppointment(record());
+    const cancelled = await createAppointment(record());
+    const completed = await createAppointment(record());
+    await updateAppointment(cancelled.id, { status: "cancelled" });
+    await updateAppointment(completed.id, { status: "completed" });
+
+    const page = await listClinicSchedule(AUDIT_ACTORS.internalApi);
+
+    expect(page.appointments.map((entry) => entry.id)).toEqual([live.id]);
+  });
+
+  test("shows a bounded page rather than the whole clinic", async () => {
+    // The requirement of #63 and the reason `listPage` exists. A dashboard that
+    // loads everything is a page that decrypts every patient record in the
+    // building to render the twenty a clinician is looking at.
+    freshAudit();
+    await booked(CLINIC_PAGE_SIZE + 15);
+
+    const page = await listClinicSchedule(AUDIT_ACTORS.internalApi);
+
+    expect(page.appointments).toHaveLength(CLINIC_PAGE_SIZE);
+    expect(page.truncated).toBe(true);
+    expect(page.nextOffset).toBe(CLINIC_PAGE_SIZE);
+  });
+
+  test("says so when the page is the whole clinic", async () => {
+    freshAudit();
+    await booked(3);
+
+    const page = await listClinicSchedule(AUDIT_ACTORS.internalApi);
+
+    expect(page.appointments).toHaveLength(3);
+    expect(page.truncated).toBe(false);
+    expect(page.nextOffset).toBeNull();
+  });
+
+  test("pages without repeating or skipping a record", async () => {
+    // The whole point of the total order in `listPage`. Page two has to start
+    // where page one stopped, or a clinician reading a day's list sees a patient
+    // twice and another one disappear.
+    freshAudit();
+    const ids = await booked(5);
+
+    const first = await listClinicSchedule(AUDIT_ACTORS.internalApi, { limit: 2 });
+    const second = await listClinicSchedule(AUDIT_ACTORS.internalApi, {
+      limit: 2,
+      offset: first.nextOffset!,
+    });
+    const third = await listClinicSchedule(AUDIT_ACTORS.internalApi, {
+      limit: 2,
+      offset: second.nextOffset!,
+    });
+
+    const seen = [first, second, third].flatMap((page) => page.appointments.map((a) => a.id));
+    expect(seen).toEqual(ids);
+  });
+
+  test("clamps a limit above the page size, so the query string cannot ask for everything", async () => {
+    freshAudit();
+    await booked(CLINIC_PAGE_SIZE + 5);
+
+    const page = await listClinicSchedule(AUDIT_ACTORS.internalApi, { limit: 10_000 });
+
+    expect(page.appointments).toHaveLength(CLINIC_PAGE_SIZE);
+    expect(page.limit).toBe(CLINIC_PAGE_SIZE);
+  });
+
+  test("stops paging at the ceiling, and admits the list goes on", async () => {
+    // A deep offset in Postgres is a scan that discards everything before it, and
+    // this application is not going to grow an index to make a dashboard's
+    // thousandth page fast. The ceiling is reported rather than absorbed: a
+    // dashboard that silently ends at record 200 looks exactly like a clinic
+    // whose last booking was this morning.
+    freshAudit();
+    await booked(3);
+
+    const page = await listClinicSchedule(AUDIT_ACTORS.internalApi, {
+      offset: CLINIC_MAX_OFFSET + 5_000,
+    });
+
+    expect(page.offset + page.limit).toBeLessThanOrEqual(CLINIC_MAX_OFFSET);
+    expect(page.truncated).toBe(true);
+  });
+
+  test("the last page it will serve offers no next page, rather than looping", async () => {
+    // A Next link to an offset this function clamps back to the current page is a
+    // pager that shows the same twenty patients for ever. The clinic is told the
+    // list goes on; it is not sent round again.
+    freshAudit();
+    await booked(3);
+
+    const page = await listClinicSchedule(AUDIT_ACTORS.internalApi, {
+      offset: CLINIC_MAX_OFFSET - CLINIC_PAGE_SIZE,
+    });
+
+    expect(page.nextOffset).toBeNull();
+    expect(page.truncated).toBe(true);
+  });
+
+  test("never points at a page it would refuse to serve", async () => {
+    freshAudit();
+    await booked(3);
+
+    for (const offset of [0, 40, CLINIC_MAX_OFFSET - CLINIC_PAGE_SIZE, CLINIC_MAX_OFFSET]) {
+      const page = await listClinicSchedule(AUDIT_ACTORS.internalApi, { offset });
+      if (page.nextOffset === null) continue;
+
+      const next = await listClinicSchedule(AUDIT_ACTORS.internalApi, {
+        offset: page.nextOffset,
+      });
+      expect(next.offset).toBe(page.nextOffset);
+    }
+  });
+
+  test("reads the records, because the time a clinician needs is encrypted at rest", async () => {
+    freshAudit();
+    const created = await createAppointment(record({ appointmentDateTime: "2026-10-02T14:00" }));
+
+    const page = await listClinicSchedule(AUDIT_ACTORS.internalApi);
+
+    expect(page.appointments[0].patientInfo.appointmentDateTime).toBe("2026-10-02T14:00");
+    expect(page.appointments[0].id).toBe(created.id);
+  });
+
+  test("records every record it opened, as a dashboard read of its own", async () => {
+    freshAudit();
+    await booked(3);
+
+    await listClinicSchedule(AUDIT_ACTORS.internalApi);
+
+    const entries = await readAuditLog();
+    const reads = entries.filter((entry) => entry.action === "CLINIC_SCHEDULE_READ");
+    // One per record, because "who read this patient's record" is a question with
+    // one record in it -- and filing twenty of them as the webhook's
+    // `internal_api` reads would answer it with no.
+    expect(reads).toHaveLength(3);
+    expect(reads.every((entry) => entry.actor === AUDIT_ACTORS.internalApi)).toBe(true);
+    expect(reads.every((entry) => entry.details?.reason === "clinician_dashboard")).toBe(true);
+    expect(reads.every((entry) => entry.resource.startsWith("appointment:"))).toBe(true);
+  });
+
+  test("the trail says the surface and not a person, because there is no person to name", async () => {
+    // This application has no clinician accounts. The actor is whoever holds the
+    // shared secret, which is a role and not an identity, and the audit entry
+    // added for the dashboard does not pretend otherwise: the details are the
+    // closed set's two fields, and neither of them could hold a name.
+    freshAudit();
+    const appointment = await createAppointment(record({ firstName: "REDACTED" }));
+
+    await listClinicSchedule(AUDIT_ACTORS.internalApi);
+
+    const reads = (await readAuditLog()).filter((e) => e.action === "CLINIC_SCHEDULE_READ");
+    expect(reads[0].actor).toBe(AUDIT_ACTORS.internalApi);
+    expect(reads[0].resource).toBe(`appointment:${appointment.id}`);
+    expect(reads[0].details).toEqual({ reason: "clinician_dashboard", status: "scheduled" });
+    expect(JSON.stringify(reads)).not.toContain("REDACTED");
+  });
+
+  test("hands back no records at all when the trail cannot be written", async () => {
+    // The same fail-closed posture as `getAppointment`, and it matters more here:
+    // a dashboard is a bulk read, so the failure being guarded is a bulk
+    // disclosure. A caller that caught the error and re-read without auditing
+    // would have every record in the building.
+    freshAudit();
+    await booked(3);
+    setAuditLogStore({
+      async append() {
+        throw new Error("the audit store is down");
+      },
+      async read() {
+        return [];
+      },
+      async verify() {
+        return false;
+      },
+    });
+
+    await expect(listClinicSchedule(AUDIT_ACTORS.internalApi)).rejects.toThrow(
+      /audit store is down/,
+    );
+  });
+
+  test("a page past the end is empty, and reads nothing", async () => {
+    freshAudit();
+    await booked(1);
+
+    const page = await listClinicSchedule(AUDIT_ACTORS.internalApi, { offset: 500 });
+
+    expect(page.appointments).toEqual([]);
+    // An empty page is not an access. Recording one would put a read of a
+    // patient's record in the trail for a request that never opened one, which is
+    // the same sin as logging a refused attempt as a change.
+    const reads = (await readAuditLog()).filter((e) => e.action === "CLINIC_SCHEDULE_READ");
+    expect(reads).toEqual([]);
   });
 });

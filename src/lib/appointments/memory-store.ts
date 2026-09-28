@@ -143,8 +143,33 @@ export class InMemoryAppointmentStore implements AppointmentStore {
     // whole rather than an arbitrary selection.
     return [...this.appointments.values()]
       .filter((appointment) => wanted.has(appointment.status))
-      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .sort(byBookingOrder)
       .slice(0, Math.max(0, limit))
+      .map(clone);
+  }
+
+  /**
+   * One page of the same window, in the same order.
+   *
+   * See `listPage` in ./store for why the order carries an id tiebreak and why
+   * neither this nor the durable store may sort on the appointment time. The
+   * offset is clamped rather than allowed to reach `slice`, because a negative
+   * one is a negative index, and `slice(-1, 19)` is the newest record.
+   */
+  async listPage(
+    statuses: readonly Appointment["status"][],
+    limit: number,
+    offset: number,
+  ): Promise<Appointment[]> {
+    const wanted = new Set(statuses);
+    const start = clampCount(offset);
+    const size = clampCount(limit);
+    if (size === 0) return [];
+
+    return [...this.appointments.values()]
+      .filter((appointment) => wanted.has(appointment.status))
+      .sort(byBookingOrder)
+      .slice(start, start + size)
       .map(clone);
   }
 
@@ -167,6 +192,34 @@ export class InMemoryAppointmentStore implements AppointmentStore {
     for (const keys of this.claims.values()) total += keys.size;
     return total;
   }
+}
+
+/**
+ * Booking order: when the request was made, with the id as the tiebreak.
+ *
+ * Total, which is the property that makes offset paging correct -- see
+ * `listPage` in ./store. `localeCompare` rather than `<` because the ids are
+ * strings, and a comparison that disagrees with Postgres's `ORDER BY id` on
+ * anything outside ASCII would give the two implementations different pages for
+ * the same question.
+ */
+function byBookingOrder(a: Appointment, b: Appointment): number {
+  const byTime = a.createdAt.getTime() - b.createdAt.getTime();
+  if (byTime !== 0) return byTime;
+  return a.id.localeCompare(b.id);
+}
+
+/**
+ * A page window as a non-negative whole number of rows.
+ *
+ * A caller cannot be trusted with an index, and `NaN` reaching `slice` would
+ * quietly produce an empty page rather than the error that would be more
+ * honest -- so the invalid value is normalised to zero here, in the store,
+ * rather than at each call site that forgets.
+ */
+function clampCount(value: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.trunc(value));
 }
 
 /**

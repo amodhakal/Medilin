@@ -799,6 +799,83 @@ describe("PHI at rest", () => {
     });
   });
 
+  describe("listPage", () => {
+    // The clinic dashboard's query (#63). The in-memory version in
+    // ./memory-store.test says what the rules are; these assert the durable one
+    // expresses them in SQL rather than in a comment, and in particular that the
+    // order it pages in is the same total order the other one pages in.
+    test("binds the limit and the offset, and orders by a total key", async () => {
+      const { sql, statements } = fakeDatabase({
+        SELECT: handles.get([row(), row({ id: "a2" })]),
+      });
+
+      const listed = await new PostgresAppointmentStore(sql).listPage(
+        ["scheduled", "confirmed"],
+        20,
+        40,
+      );
+
+      expect(listed.map((entry) => entry.id)).toEqual(["a1", "a2"]);
+
+      const select = statements.find((s) => s.sql.includes("status = ANY"))!;
+      expect(select.params).toEqual(["{scheduled,confirmed}", 20, 40]);
+      expect(select.sql).toContain("ORDER BY created_at ASC, id ASC");
+      expect(select.sql).toContain("LIMIT $2");
+      expect(select.sql).toContain("OFFSET $3");
+    });
+
+    test("the offset is a bound parameter, not text in the statement", async () => {
+      const { sql, statements } = fakeDatabase({ SELECT: handles.get([]) });
+
+      await new PostgresAppointmentStore(sql).listPage(["scheduled"], 10, 20);
+
+      const select = statements.find((s) => s.sql.includes("status = ANY"))!;
+      expect(select.sql).not.toContain("OFFSET 20");
+      expect(select.params[2]).toBe(20);
+    });
+
+    test("clamps a negative window rather than passing it to Postgres", async () => {
+      // `LIMIT -1` is an error and `OFFSET -1` is a syntax error, so an
+      // unclamped value is a 500 on the dashboard rather than an empty page.
+      const { sql, statements } = fakeDatabase({ SELECT: handles.get([]) });
+
+      await new PostgresAppointmentStore(sql).listPage(["scheduled"], -1, -5);
+
+      const select = statements.find((s) => s.sql.includes("status = ANY"))!;
+      expect(select.params.slice(1)).toEqual([0, 0]);
+    });
+
+    test("has no predicate against the appointment time, for the same reason as listByStatus", async () => {
+      // The clinic wants the next appointments, and there is no column that can
+      // answer that. See `listPage` in ./store: the time is ciphertext.
+      const { sql, statements } = fakeDatabase({ SELECT: handles.get([]) });
+
+      await new PostgresAppointmentStore(sql).listPage(["scheduled"], 10, 0);
+
+      const select = statements.find((s) => s.sql.includes("status = ANY"))!.sql;
+      expect(select).not.toContain("appointment_date_time");
+      expect(select).not.toMatch(/patient_info\s*[<>=]/);
+    });
+
+    test("throws rather than skipping a row that does not parse", async () => {
+      // A page that quietly dropped a broken row would tell a clinician a
+      // patient is not booked when they are.
+      const { sql } = fakeDatabase({
+        SELECT: handles.get([row(), row({ id: "a2", status: "CANCELLED" })]),
+      });
+
+      await expect(
+        new PostgresAppointmentStore(sql).listPage(["scheduled"], 10, 0),
+      ).rejects.toThrow(/status is not one of/);
+    });
+
+    test("an offset past the end is an empty page", async () => {
+      const { sql } = fakeDatabase({ SELECT: handles.get([]) });
+
+      expect(await new PostgresAppointmentStore(sql).listPage(["scheduled"], 20, 900)).toEqual([]);
+    });
+  });
+
   describe("claimOnce", () => {
     test("reports the winner and the loser by whether a row came back", async () => {
       // The whole of the exactly-once property: one insert, and the answer is

@@ -442,6 +442,90 @@ describe("InMemoryAppointmentStore", () => {
     });
   });
 
+  // The clinic dashboard's query (#63). Same window as `listByStatus` and the
+  // same reason it cannot be by appointment time -- the time is encrypted -- but
+  // with a page on it, because a clinic has more appointments than fit on one
+  // screen and a method that returns the whole list is a method that eventually
+  // will return the whole list.
+  describe("listPage", () => {
+    /** A minute apart, so `createdAt` order is unambiguous. */
+    function at(minute: number) {
+      return new Date(Date.UTC(2026, 8, 1, 10, minute));
+    }
+
+    async function seeded() {
+      const store = new InMemoryAppointmentStore();
+      // Inserted out of order on purpose: the method's job is to order, not to
+      // report whatever the Map happened to iterate.
+      await store.create(appointment("third", { createdAt: at(3) }));
+      await store.create(appointment("first", { createdAt: at(1) }));
+      await store.create(appointment("second", { createdAt: at(2) }));
+      await store.create(appointment("cancelled", { createdAt: at(0), status: "cancelled" }));
+      return store;
+    }
+
+    test("returns the window at an offset, oldest booking first", async () => {
+      const store = await seeded();
+
+      expect((await store.listPage(REMINDABLE_STATUSES, 2, 0)).map((a) => a.id)).toEqual([
+        "first",
+        "second",
+      ]);
+      expect((await store.listPage(REMINDABLE_STATUSES, 2, 2)).map((a) => a.id)).toEqual([
+        "third",
+      ]);
+    });
+
+    test("excludes a cancelled appointment, which is the whole point", async () => {
+      const store = await seeded();
+
+      // `cancelled` was booked first of all, so a status leak would be the very
+      // first row a clinic saw.
+      expect((await store.listPage(REMINDABLE_STATUSES, 10, 0))[0]!.id).toBe("first");
+    });
+
+    test("breaks a tie on created_at, so one page boundary is one row", async () => {
+      // Offset paging over an order that is not total is a pagination scheme
+      // that skips and repeats rows: two appointments created in the same
+      // millisecond have no defined order, so the second page can start with a
+      // row the first page already showed.
+      const store = new InMemoryAppointmentStore();
+      const same = at(5);
+      await store.create(appointment("b", { createdAt: same }));
+      await store.create(appointment("a", { createdAt: same }));
+
+      expect((await store.listPage(REMINDABLE_STATUSES, 1, 0)).map((a) => a.id)).toEqual(["a"]);
+      expect((await store.listPage(REMINDABLE_STATUSES, 1, 1)).map((a) => a.id)).toEqual(["b"]);
+    });
+
+    test("an offset past the end is an empty page, not an error", async () => {
+      const store = await seeded();
+
+      expect(await store.listPage(REMINDABLE_STATUSES, 20, 99)).toEqual([]);
+    });
+
+    test("clamps a negative or fractional page rather than returning everything", async () => {
+      const store = await seeded();
+
+      expect(await store.listPage(REMINDABLE_STATUSES, -5, 0)).toEqual([]);
+      // A negative offset must not be a negative array index, which in
+      // JavaScript is counted from the end of the list.
+      expect((await store.listPage(REMINDABLE_STATUSES, 1, -1)).map((a) => a.id)).toEqual([
+        "first",
+      ]);
+    });
+
+    test("hands out copies", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1", { patientInfo: record({ firstName: "Ada" }) }));
+
+      const [first] = await store.listPage(REMINDABLE_STATUSES, 10, 0);
+      first!.patientInfo.firstName = "Mallory";
+
+      expect((await store.get("a1"))!.patientInfo.firstName).toBe("Ada");
+    });
+  });
+
   describe("claimOnce", () => {
     test("the first caller wins and the second does not", async () => {
       const store = new InMemoryAppointmentStore();
