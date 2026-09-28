@@ -5,8 +5,18 @@ import { getClinicName } from "@/config";
 import { intakeSchema } from "@/lib/validation/intake";
 import { parseJsonBody } from "@/lib/validation/parse";
 import { internalHeaders } from "@/lib/auth/internal";
+import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
+
+const INTAKE_LIMIT = 5;
+const RATE_LIMIT_WINDOW_MS = 60_000;
 
 export async function POST(request: NextRequest) {
+  // Each accepted request costs a Gemini call and a Resend email, and the
+  // translation helpers retry up to ten times on failure, so an unthrottled
+  // client can burn the whole budget in a loop.
+  const limited = await enforceRateLimit(callerKey(request, "intake"), INTAKE_LIMIT, RATE_LIMIT_WINDOW_MS);
+  if (limited) return limited;
+
   try {
     const parsed = await parseJsonBody(request, intakeSchema);
     if (!parsed.ok) return parsed.response;

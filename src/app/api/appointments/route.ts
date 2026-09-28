@@ -2,8 +2,19 @@ import { NextRequest, NextResponse } from "next/server";
 import { createAppointment, getAppointment } from "@/lib/appointments";
 import { appointmentRequestSchema } from "@/lib/validation/intake";
 import { parseJsonBody } from "@/lib/validation/parse";
+import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
+
+const APPOINTMENTS_LIMIT = 20;
+const RATE_LIMIT_WINDOW_MS = 60_000;
 
 export async function POST(request: NextRequest) {
+  const limited = await enforceRateLimit(
+    callerKey(request, "appointments"),
+    APPOINTMENTS_LIMIT,
+    RATE_LIMIT_WINDOW_MS,
+  );
+  if (limited) return limited;
+
   const parsed = await parseJsonBody(request, appointmentRequestSchema);
   if (!parsed.ok) return parsed.response;
 
