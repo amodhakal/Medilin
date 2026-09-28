@@ -27,8 +27,14 @@ import { logWarn } from "@/lib/logger";
 
 export type TwilioMessageChannel = "sms" | "whatsapp";
 
-/** E.164: a country code, then up to 14 more digits, and nothing else. */
-const E164 = /^\+[1-9]\d{6,14}$/;
+/**
+ * E.164: a country code, then up to 14 more digits, and nothing else.
+ *
+ * Exported because ./voice has to hold a number to the same standard and
+ * "roughly a phone number" is not a standard. A message sent to a mistyped
+ * number and a call placed to one are the same disclosure with a dial tone.
+ */
+export const E164 = /^\+[1-9]\d{6,14}$/;
 
 const TWILIO_API_BASE = "https://api.twilio.com/2010-04-01";
 
