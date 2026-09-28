@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { InMemoryAppointmentStore } from "./memory-store";
-import type { ActionGrant, Appointment } from "./store";
+import { REMINDABLE_STATUSES, type ActionGrant, type Appointment } from "./store";
 import type { AppointmentRecord } from "../validation/intake";
 
 // Obviously fake. This repository is public.
@@ -374,6 +374,119 @@ describe("InMemoryAppointmentStore", () => {
       expect((await store.getActionGrant("cap-1"))!.withdrawnAt).toEqual(
         new Date("2026-09-02T10:00:00.000Z"),
       );
+    });
+  });
+
+  // The reminder job's two needs (#67): the candidate records, and a way to say
+  // "already done" that two overlapping runs cannot both say no to.
+  describe("listByStatus", () => {
+    test("returns only the statuses asked for", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1", { status: "scheduled" }));
+      await store.create(appointment("a2", { status: "confirmed" }));
+      await store.create(appointment("a3", { status: "cancelled" }));
+      await store.create(appointment("a4", { status: "completed" }));
+
+      const listed = await store.listByStatus(REMINDABLE_STATUSES, 100);
+
+      expect(listed.map((entry) => entry.id)).toEqual(["a1", "a2"]);
+    });
+
+    test("excludes a cancelled appointment, which is the whole point", async () => {
+      // Telling somebody to turn up for something they cancelled is worse than
+      // telling them nothing.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1", { status: "cancelled" }));
+
+      expect(await store.listByStatus(REMINDABLE_STATUSES, 100)).toEqual([]);
+    });
+
+    test("orders oldest first, and a truncated result is a prefix", async () => {
+      // Not ordered by appointment time -- that is encrypted and incomparable
+      // here -- but ordered at all, so a capped result is the beginning of the
+      // list rather than whatever the Map happened to iterate.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("new", { createdAt: new Date("2026-09-03T00:00:00Z") }));
+      await store.create(appointment("old", { createdAt: new Date("2026-09-01T00:00:00Z") }));
+      await store.create(appointment("mid", { createdAt: new Date("2026-09-02T00:00:00Z") }));
+
+      expect((await store.listByStatus(REMINDABLE_STATUSES, 100)).map((a) => a.id)).toEqual([
+        "old",
+        "mid",
+        "new",
+      ]);
+      expect((await store.listByStatus(REMINDABLE_STATUSES, 2)).map((a) => a.id)).toEqual([
+        "old",
+        "mid",
+      ]);
+    });
+
+    test("a limit of zero returns nothing rather than everything", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      expect(await store.listByStatus(REMINDABLE_STATUSES, 0)).toEqual([]);
+      expect(await store.listByStatus(REMINDABLE_STATUSES, -5)).toEqual([]);
+    });
+
+    test("hands out copies", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1", { status: "scheduled" }));
+
+      const [first] = await store.listByStatus(REMINDABLE_STATUSES, 10);
+      first!.status = "cancelled";
+      first!.patientInfo.firstName = "Mallory";
+
+      expect((await store.get("a1"))!.status).toBe("scheduled");
+      expect((await store.get("a1"))!.patientInfo.firstName).toBe("REDACTED");
+    });
+  });
+
+  describe("claimOnce", () => {
+    test("the first caller wins and the second does not", async () => {
+      const store = new InMemoryAppointmentStore();
+
+      expect(await store.claimOnce("reminder", "a1:2026-09-02")).toBe(true);
+      expect(await store.claimOnce("reminder", "a1:2026-09-02")).toBe(false);
+    });
+
+    test("concurrent claims of one key: exactly one wins", async () => {
+      // Two cron invocations overlapping a window boundary -- a retry, a redeploy
+      // mid-run, a platform double-fire -- would both read "not yet sent" and both
+      // send. The claim is the thing that stops it.
+      const store = new InMemoryAppointmentStore();
+
+      const outcomes = await Promise.all(
+        Array.from({ length: 16 }, () => store.claimOnce("reminder", "a1:2026-09-02")),
+      );
+
+      expect(outcomes.filter(Boolean)).toHaveLength(1);
+    });
+
+    test("different keys are different claims", async () => {
+      const store = new InMemoryAppointmentStore();
+
+      expect(await store.claimOnce("reminder", "a1:2026-09-02")).toBe(true);
+      expect(await store.claimOnce("reminder", "a2:2026-09-02")).toBe(true);
+      expect(await store.claimOnce("reminder", "a1:2026-09-03")).toBe(true);
+    });
+
+    test("the same key under another scope is another claim", async () => {
+      // Scoping is what stops two unrelated jobs from competing for one namespace.
+      const store = new InMemoryAppointmentStore();
+
+      expect(await store.claimOnce("reminder", "shared")).toBe(true);
+      expect(await store.claimOnce("something-else", "shared")).toBe(true);
+    });
+
+    test("a claim is never released", async () => {
+      // A reminder that failed should not be retried by the same window. A caller
+      // that wants a different answer asks with a different key.
+      const store = new InMemoryAppointmentStore();
+      await store.claimOnce("reminder", "a1:2026-09-02");
+
+      expect(await store.claimOnce("reminder", "a1:2026-09-02")).toBe(false);
+      expect(store.claimCount).toBe(1);
     });
   });
 });

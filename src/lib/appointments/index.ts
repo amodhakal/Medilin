@@ -9,6 +9,7 @@ import { InMemoryAppointmentStore } from "./memory-store";
 import { PostgresAppointmentStore } from "./postgres-store";
 import {
   assertValidAppointmentPatch,
+  REMINDABLE_STATUSES,
   type Appointment,
   type AppointmentPatch,
   type AppointmentStore,
@@ -219,6 +220,7 @@ export async function cancelAppointment(
 export {
   APPOINTMENT_STATUSES,
   PATIENT_ACTIONS,
+  REMINDABLE_STATUSES,
   isAppointmentStatus,
   isPatientAction,
   type ActionGrant,
@@ -483,4 +485,83 @@ export async function rescheduleAppointment(
     },
     AUDIT_ACTORS.patientLink,
   );
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Scheduled reminders (#67)
+ * ---------------------------------------------------------------------------
+ *
+ * Two functions, and neither of them sends anything. The sending is a job's
+ * business and lives in ../reminders; what belongs here is the two questions the
+ * job asks the store, asked the same way every time so that the audit trail and
+ * the exactly-once ledger cannot disagree about what was read and what was
+ * claimed.
+ */
+
+/** How many appointments one run will consider. See `listByStatus`. */
+export const REMINDER_SCAN_LIMIT = 500;
+
+export interface ReminderCandidates {
+  /** Every appointment in a state a reminder is for. Opened records. */
+  appointments: Appointment[];
+  /**
+   * True when the store had more than this, so the run is knowingly partial.
+   *
+   * Reported rather than silently absorbed. A capped scan that looks like a
+   * complete one produces a job that quietly stops reminding anybody past the
+   * cap, and the only symptom is silence.
+   */
+  truncated: boolean;
+}
+
+/**
+ * The appointments a reminder run should consider, and whether it saw them all.
+ *
+ * Cancelled and completed appointments are excluded by the store, in SQL, rather
+ * than filtered out here: a patient who cancelled must not be told to turn up,
+ * and that decision belongs somewhere it can be read once rather than in a job
+ * that re-derives it on every run.
+ *
+ * The limit is fetched one over the cap so that `truncated` is a fact rather than
+ * an inference. That is one extra row decrypted to answer a question that
+ * matters.
+ */
+export async function listReminderCandidates(
+  limit: number = REMINDER_SCAN_LIMIT,
+): Promise<ReminderCandidates> {
+  const appointments = await getAppointmentStore().listByStatus(REMINDABLE_STATUSES, limit + 1);
+
+  return { appointments: appointments.slice(0, limit), truncated: appointments.length > limit };
+}
+
+/**
+ * Claim the right to send one appointment's reminder, for good.
+ *
+ * The key is the appointment id and nothing else. That is the whole design, and
+ * it is the opposite of what it looks like it should be: the window is
+ * deliberately **not** part of the key.
+ *
+ * With a 48-hour look-ahead on a daily schedule, consecutive runs overlap by
+ * almost a day. An appointment at 15:00 today is inside today's window and
+ * tomorrow's, so two runs will both decide to remind about it -- and a claim key
+ * of `<id>:<window name>` would give those two runs two different keys and let both
+ * through. The overlap is created on purpose (it is what makes a missed run
+ * recoverable), so the defence has to live in something the window does not
+ * participate in. One claim per appointment, ever, is also the thing a patient
+ * would describe as correct: exactly one reminder.
+ *
+ * The consequence, stated rather than left to be discovered: a rescheduled
+ * appointment does not get a second reminder. That is acceptable because a
+ * reschedule already emails the patient the new time, so they have been told; and
+ * re-arming the reminder by keying on `updatedAt` would mean any future write to
+ * an appointment silently re-notifies the patient, which is a worse property to
+ * own than the one being given up here.
+ *
+ * Call it *after* deciding to send and *before* calling the mailer. The other
+ * order sends twice on a crash between them; this order skips once on a crash
+ * between them, which is the direction to err in for a courtesy email.
+ */
+export async function claimReminder(appointmentId: string): Promise<boolean> {
+  return getAppointmentStore().claimOnce("reminder", appointmentId);
 }

@@ -119,6 +119,54 @@ export class InMemoryAppointmentStore implements AppointmentStore {
   get grantCount(): number {
     return this.grants.size;
   }
+
+  /**
+   * Keys already claimed, by scope.
+   *
+   * A `Map`, so exactly as per-instance as everything else in this class: a
+   * reminder claimed on one serverless instance is unknown to the next, and the
+   * next run will send it again. That is #17 rather than a new bug, and it is
+   * stated here because a reminder job on the in-memory store is a job that
+   * quietly double-sends, which is the failure `claimOnce` exists to prevent.
+   */
+  private readonly claims = new Map<string, Set<string>>();
+
+  async listByStatus(
+    statuses: readonly Appointment["status"][],
+    limit: number,
+  ): Promise<Appointment[]> {
+    const wanted = new Set(statuses);
+
+    // Sorted by creation, not by appointment time: the time is encrypted and
+    // cannot be compared here, and the caller sorts it after opening the records.
+    // Sorting on `createdAt` at least makes a truncated result a prefix of the
+    // whole rather than an arbitrary selection.
+    return [...this.appointments.values()]
+      .filter((appointment) => wanted.has(appointment.status))
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .slice(0, Math.max(0, limit))
+      .map(clone);
+  }
+
+  async claimOnce(scope: string, key: string): Promise<boolean> {
+    const taken = this.claims.get(scope);
+    if (!taken) {
+      this.claims.set(scope, new Set([key]));
+      return true;
+    }
+
+    if (taken.has(key)) return false;
+
+    taken.add(key);
+    return true;
+  }
+
+  /** Test seam. Not part of `AppointmentStore`. */
+  get claimCount(): number {
+    let total = 0;
+    for (const keys of this.claims.values()) total += keys.size;
+    return total;
+  }
 }
 
 /**

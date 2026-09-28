@@ -19,6 +19,11 @@ import type { AppointmentRecord } from "@/lib/validation/intake";
  * they have the same durability requirement. A capability kept anywhere else
  * -- a cookie, an in-process `Set`, a signed token alone -- is a capability that
  * a cold start silently invalidates, which is the bug #17 was.
+ *
+ * Two more arrived with #67, for the reminder job: `listByStatus` and
+ * `claimOnce`. Both are here for the same reason, and both have comments on them
+ * that are longer than their signatures, because the shape of `listByStatus` is
+ * the result of the record being encrypted rather than of how reminders work.
  */
 
 /**
@@ -43,6 +48,17 @@ export function isAppointmentStatus(value: unknown): value is AppointmentStatus 
     (APPOINTMENT_STATUSES as readonly string[]).includes(value)
   );
 }
+
+/**
+ * The statuses a reminder job cares about, and the only reason
+ * `listByStatus` takes a list.
+ *
+ * `cancelled` and `completed` are not in it and never should be: telling somebody
+ * to turn up for an appointment they cancelled three days ago is worse than
+ * telling them nothing, and it is not a judgement the reminder job gets to make
+ * per record. It is made once, here, where it can be read.
+ */
+export const REMINDABLE_STATUSES: readonly AppointmentStatus[] = ["scheduled", "confirmed"];
 
 export interface Appointment {
   id: string;
@@ -233,4 +249,67 @@ export interface AppointmentStore {
    * capability that has been spent should still be reportable as spent.
    */
   withdrawActionGrants(appointmentId: string, now: Date): Promise<number>;
+
+  /**
+   * Appointments in any of `statuses`, oldest first, up to `limit`.
+   *
+   * For the reminder job (#67), and the reason it is shaped this way is the most
+   * interesting thing in this interface.
+   *
+   * The obvious method is "everything due in the next day", and it cannot be
+   * written. The time an appointment is for lives inside `patientInfo`, which is
+   * envelope-encrypted on the way into the database and unreadable to SQL. So
+   * there is no column to range-filter on: any such query would either decrypt
+   * records in the database, which is not something a database can do, or match
+   * against ciphertext, which is not a date comparison.
+   *
+   * So the store filters on what *is* queryable -- the status, which is why the
+   * method takes a list rather than a date range -- and the job filters on the
+   * time after opening the records. That is O(n) envelope decrypts per run, which
+   * is fine at clinic volumes and is the wrong shape at scale.
+   *
+   * The fix at scale is a separate, non-encrypted scheduling column written
+   * alongside the record -- `starts_at timestamptz` -- and this method becoming a
+   * range scan on it. That trades a plaintext appointment time in the table for a
+   * query that does not have to open every record, which is a real trade and not
+   * one to make silently. It is left as the named next step rather than taken
+   * here, because this repository's position is that `patient_info` is ciphertext
+   * and a second plaintext copy of a patient's schedule would undo that.
+   *
+   * Bounded, because a store method that can return every appointment is a store
+   * method that eventually will.
+   */
+  listByStatus(statuses: readonly AppointmentStatus[], limit: number): Promise<Appointment[]>;
+
+  /**
+   * Claim a one-shot key, and report whether this caller won it.
+   *
+   * The primitive behind "do not send this twice", and it is a claim rather than
+   * a read followed by a write for the reason `spendActionGrant` is: two cron
+   * invocations overlapping a window boundary -- which is what a retry, a redeploy
+   * mid-run, or a platform double-fire all look like -- would both read "not yet
+   * sent" and both send. The claim is decided in one atomic step, so exactly one
+   * of them proceeds.
+   *
+   * A key is scoped by `scope`, so a reminder and anything else that needs
+   * exactly-once are not competing for one namespace. `key` is the caller's
+   * identity for the thing being claimed; the same key under a different scope is
+   * a different claim.
+   *
+   * Claims are never released. A reminder that failed should not be retried by the
+   * same window, and a caller that wants a different answer asks with a different
+   * key.
+   */
+  claimOnce(scope: ClaimScope, key: string): Promise<boolean>;
 }
+
+/**
+ * What an exactly-once claim is for.
+ *
+ * A closed set, so a typo in a scope string is a type error rather than a claim
+ * in a namespace nobody has ever read. It is small because a scope that nobody
+ * enumerated is a scope nobody will ever audit.
+ */
+export const CLAIM_SCOPES = ["reminder"] as const;
+
+export type ClaimScope = (typeof CLAIM_SCOPES)[number];

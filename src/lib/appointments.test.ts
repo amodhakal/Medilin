@@ -13,11 +13,13 @@ import {
   InMemoryAppointmentStore,
   PostgresAppointmentStore,
   cancelAppointment,
+  claimReminder,
   createAppointment,
   getAppointment,
   getAppointmentStore,
   isDurableAppointmentStore,
   issuePatientActions,
+  listReminderCandidates,
   rescheduleAppointment,
   setAppointmentStore,
   spendPatientAction,
@@ -741,5 +743,84 @@ describe("the trail of a patient action", () => {
     // misspelling would be a type error rather than a trail that cannot be
     // verified against the closed set `assertAuditDetails` enforces.
     expect(AUDIT_REASONS).toContain("patient_link");
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The reminder job's two questions (#67)
+ * ---------------------------------------------------------------------------
+ *
+ * `runReminderPass` in ./reminders.test is the job; this is what it asks the
+ * store, and the assertions here are about the two properties the whole design
+ * rests on -- cancelled appointments never appear as candidates, and a claim is
+ * exactly one.
+ */
+
+describe("listReminderCandidates", () => {
+  test("never offers a cancelled or completed appointment", async () => {
+    freshAudit();
+    await createAppointment(record());
+    const cancelled = await createAppointment(record());
+    const completed = await createAppointment(record());
+    await updateAppointment(cancelled.id, { status: "cancelled" });
+    await updateAppointment(completed.id, { status: "completed" });
+
+    const { appointments } = await listReminderCandidates();
+
+    expect(appointments).toHaveLength(1);
+    expect(appointments[0].status).toBe("scheduled");
+  });
+
+  test("says so when there were more than one run will look at", async () => {
+    // A capped scan that looks like a complete one produces a job that quietly
+    // stops reminding anybody past the cap, and the only symptom is silence.
+    freshAudit();
+    const store = new InMemoryAppointmentStore();
+    setAppointmentStore(store);
+    for (let index = 0; index < 5; index += 1) {
+      await createAppointment(record());
+    }
+
+    const complete = await listReminderCandidates(10);
+    expect(complete.truncated).toBe(false);
+    expect(complete.appointments).toHaveLength(5);
+
+    const capped = await listReminderCandidates(3);
+    expect(capped.truncated).toBe(true);
+    expect(capped.appointments).toHaveLength(3);
+  });
+
+  test("reads the records, so the caller can see a time that is encrypted at rest", async () => {
+    freshAudit();
+    const created = await createAppointment(record({ appointmentDateTime: "2026-10-02T14:00" }));
+
+    const { appointments } = await listReminderCandidates();
+
+    // The store cannot filter on this in SQL, which is why the job decrypts.
+    expect(appointments[0].patientInfo.appointmentDateTime).toBe("2026-10-02T14:00");
+    expect(appointments[0].id).toBe(created.id);
+  });
+});
+
+describe("claimReminder", () => {
+  test("is won once per appointment, whoever asks", async () => {
+    // The claim does not include the window, and that is deliberate: with a window
+    // wider than the schedule, two consecutive runs overlap and both will decide
+    // to remind. One claim per appointment is what makes that overlap safe.
+    freshAudit();
+    const created = await createAppointment(record());
+
+    expect(await claimReminder(created.id)).toBe(true);
+    expect(await claimReminder(created.id)).toBe(false);
+  });
+
+  test("is per appointment, so a clinic full of patients still gets a full round", async () => {
+    freshAudit();
+    const first = await createAppointment(record());
+    const second = await createAppointment(record());
+
+    expect(await claimReminder(first.id)).toBe(true);
+    expect(await claimReminder(second.id)).toBe(true);
   });
 });

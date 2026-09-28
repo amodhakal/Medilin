@@ -2,7 +2,7 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { SqlError, type SqlClient } from "@/lib/storage";
 import { encryptPHI, type EncryptedEnvelope } from "@/lib/encryption";
 import { PostgresAppointmentStore, toActionGrant } from "./postgres-store";
-import type { ActionGrant, Appointment } from "./store";
+import { REMINDABLE_STATUSES, type ActionGrant, type Appointment } from "./store";
 import type { AppointmentRecord } from "../validation/intake";
 
 /**
@@ -683,8 +683,7 @@ describe("PHI at rest", () => {
   // A grant row that does not parse must not be handed to a caller as one that
   // permits something. `toActionGrant` is the only place a stored capability
   // becomes a live one.
-  describe("toActionGrant", () => {
-    test("rebuilds a grant from a row", () => {
+  describe("toActionGrant", () => {    test("rebuilds a grant from a row", () => {
       expect(toActionGrant(grantRow())).toEqual(grant());
     });
 
@@ -715,6 +714,146 @@ describe("PHI at rest", () => {
       // The whole point of this table: a capability that comes back wrong is a
       // capability that authorises something the issuing side never agreed to.
       expect(() => toActionGrant(grantRow(overrides))).toThrow(message);
+    });
+  });
+
+  // The reminder job's two needs (#67). The interesting assertion here is one
+  // about a statement that is *absent*: there is no query by appointment time, and
+  // `listByStatus` explains why it cannot be written.
+  describe("listByStatus", () => {
+    test("filters by status, orders oldest first, and is bounded", async () => {
+      const { sql, statements } = fakeDatabase({
+        SELECT: handles.get([row(), row({ id: "a2" })]),
+      });
+
+      const listed = await new PostgresAppointmentStore(sql).listByStatus(
+        ["scheduled", "confirmed"],
+        500,
+      );
+
+      expect(listed.map((entry) => entry.id)).toEqual(["a1", "a2"]);
+
+      const select = statements.find((s) => s.sql.includes("status = ANY"))!;
+      expect(select.params).toEqual(["{scheduled,confirmed}", 500]);
+      expect(select.sql).toContain("ORDER BY created_at ASC");
+      expect(select.sql).toContain("LIMIT $2");
+    });
+
+    test("binds the statuses as an array, and the statement never varies", async () => {
+      const { sql, statements } = fakeDatabase({ SELECT: handles.get([]) });
+
+      const store = new PostgresAppointmentStore(sql);
+      await store.listByStatus(["scheduled"], 10);
+      await store.listByStatus(["'; DROP TABLE appointments; --" as never], 10);
+
+      const selects = statements.filter((s) => s.sql.includes("status = ANY"));
+      expect(selects).toHaveLength(2);
+      // A hostile status could only ever become an element of a bound array.
+      expect(selects[0].sql).toBe(selects[1].sql);
+      expect(selects[1].sql).not.toContain("DROP TABLE");
+      expect(selects[1].params[0]).toBe("{'; DROP TABLE appointments; --}");
+    });
+
+    test("clamps a negative limit rather than passing it to Postgres", async () => {
+      const { sql, statements } = fakeDatabase({ SELECT: handles.get([]) });
+
+      await new PostgresAppointmentStore(sql).listByStatus(REMINDABLE_STATUSES, -1);
+
+      expect(statements.find((s) => s.sql.includes("status = ANY"))!.params[1]).toBe(0);
+    });
+
+    test("throws rather than skipping a row that does not parse", async () => {
+      // A job that quietly dropped a malformed row would report a reminder as sent
+      // to a patient who was never told.
+      const { sql } = fakeDatabase({
+        SELECT: handles.get([row(), row({ id: "a2", status: "CANCELLED" })]),
+      });
+
+      await expect(
+        new PostgresAppointmentStore(sql).listByStatus(REMINDABLE_STATUSES, 10),
+      ).rejects.toThrow(/status is not one of/);
+    });
+
+    test("has no predicate against the appointment time, because there cannot be one", async () => {
+      // An assertion about a constraint rather than a behaviour. The time is inside
+      // `patient_info`, which is ciphertext, so a range predicate against it
+      // cannot be written -- and a statement that looked like it filtered and did
+      // not would be worse than not having the method at all.
+      const { sql, statements } = fakeDatabase({ SELECT: handles.get([]) });
+
+      await new PostgresAppointmentStore(sql).listByStatus(REMINDABLE_STATUSES, 10);
+
+      const select = statements.find((s) => s.sql.includes("status = ANY"))!.sql;
+      expect(select).not.toContain("appointment_date_time");
+      expect(select).not.toMatch(/patient_info\s*[<>=]/);
+    });
+
+    test("declares the index its own query needs", async () => {
+      const { sql, statements } = fakeDatabase({ SELECT: handles.get([]) });
+
+      await new PostgresAppointmentStore(sql).listByStatus(REMINDABLE_STATUSES, 10);
+
+      expect(
+        statements.some((s) => s.sql.includes("appointments_status_created_idx")),
+      ).toBe(true);
+    });
+  });
+
+  describe("claimOnce", () => {
+    test("reports the winner and the loser by whether a row came back", async () => {
+      // The whole of the exactly-once property: one insert, and the answer is
+      // whether this caller is the one that put the row there.
+      let first = true;
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_claims": () => {
+          const rows = first ? [{ scope: "reminder" }] : [];
+          first = false;
+          return rows;
+        },
+      });
+      const store = new PostgresAppointmentStore(sql);
+
+      expect(await store.claimOnce("reminder", "a1:2026-09-02")).toBe(true);
+      expect(await store.claimOnce("reminder", "a1:2026-09-02")).toBe(false);
+
+      const insert = statements.find((s) => s.sql.includes("INSERT INTO appointment_claims"))!;
+      expect(insert.sql).toContain("ON CONFLICT (scope, key) DO NOTHING");
+      expect(insert.sql).toContain("RETURNING scope");
+      expect(insert.params).toEqual(["reminder", "a1:2026-09-02"]);
+    });
+
+    test("never updates on conflict, so the loser cannot also proceed", async () => {
+      // `DO UPDATE` would report success to the second caller as well, and the
+      // second caller is the one that would then send the reminder twice.
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_claims": handles.create([{ scope: "reminder" }]),
+      });
+
+      await new PostgresAppointmentStore(sql).claimOnce("reminder", "a1:2026-09-02");
+
+      expect(statements.find((s) => s.sql.includes("INSERT INTO appointment_claims"))!.sql).not.toContain("DO UPDATE");
+    });
+
+    test("binds both values, whatever they look like", async () => {
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_claims": handles.create([{ scope: "reminder" }]),
+      });
+
+      await new PostgresAppointmentStore(sql).claimOnce("reminder", "a1'); DROP TABLE x; --");
+
+      const insert = statements.find((s) => s.sql.includes("INSERT INTO appointment_claims"))!;
+      expect(insert.sql).not.toContain("DROP TABLE");
+      expect(insert.params).toEqual(["reminder", "a1'); DROP TABLE x; --"]);
+    });
+
+    test("declares the scope as a constraint, not only as a type", async () => {
+      const { sql, statements } = fakeDatabase({});
+
+      await new PostgresAppointmentStore(sql).claimOnce("reminder", "k").catch(() => undefined);
+
+      expect(
+        statements.some((s) => s.sql.includes("CHECK (scope IN ('reminder'))")),
+      ).toBe(true);
     });
   });
 });

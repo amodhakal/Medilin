@@ -245,6 +245,63 @@ export class PostgresAppointmentStore implements AppointmentStore {
   }
 
   /**
+   * By status, oldest first, bounded.
+   *
+   * Deliberately not by appointment time, and the reason is in the interface: the
+   * time is inside `patient_info`, which is ciphertext, so there is no column a
+   * range predicate could be written against. Everything cancelled or completed is
+   * excluded here rather than in the reminder job, so the job does not get to
+   * decide per record whether a cancellation counts.
+   *
+   * `$1::text[]` rather than N placeholders, so one statement serves any number of
+   * statuses and there is no string to build out of a caller's list.
+   */
+  async listByStatus(
+    statuses: readonly Appointment["status"][],
+    limit: number,
+  ): Promise<Appointment[]> {
+    await this.ready();
+
+    const rows = await this.sql.query<AppointmentRow>(
+      `SELECT ${COLUMNS}
+         FROM appointments
+        WHERE status = ANY($1::text[])
+        ORDER BY created_at ASC
+        LIMIT $2`,
+      [`{${statuses.join(",")}}`, Math.max(0, limit)],
+    );
+
+    return rows.map(toAppointment);
+  }
+
+  /**
+   * `INSERT ... ON CONFLICT DO NOTHING`, and the returned row is the whole answer.
+   *
+   * An upsert with `DO UPDATE` would be wrong here even though it looks like the
+   * friendlier option: it would report success to the second caller as well, and
+   * the second caller is the one that would then send the reminder twice. What
+   * this has to express is "exactly one of these concurrent callers may proceed",
+   * and `DO NOTHING` combined with `RETURNING` is how Postgres says it.
+   *
+   * The composite primary key on `(scope, key)` is what makes the conflict
+   * detectable at all; a surrogate id with a unique index would work too, but then
+   * the uniqueness is not visible in the table's shape.
+   */
+  async claimOnce(scope: string, key: string): Promise<boolean> {
+    await this.ready();
+
+    const rows = await this.sql.query<{ scope: string }>(
+      `INSERT INTO appointment_claims (scope, key, claimed_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (scope, key) DO NOTHING
+       RETURNING scope`,
+      [scope, key],
+    );
+
+    return rows.length === 1;
+  }
+
+  /**
    * Create the table if it is not there yet, once per process.
    *
    * The promise is dropped on failure rather than cached, so a database that was
@@ -311,6 +368,39 @@ export class PostgresAppointmentStore implements AppointmentStore {
       CREATE INDEX IF NOT EXISTS appointment_action_grants_live_idx
         ON appointment_action_grants (appointment_id)
         WHERE withdrawn_at IS NULL
+    `);
+
+    // The exactly-once ledger behind the reminder job (#67). Two columns and a
+    // timestamp, and nothing else -- a claim records that something happened
+    // once, deliberately not what or to whom, because this table lives in the
+    // same database as envelope-encrypted records and does not get to be the
+    // plaintext one.
+    await this.sql.query(`
+      CREATE TABLE IF NOT EXISTS appointment_claims (
+        scope      text NOT NULL,
+        key        text NOT NULL,
+        claimed_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (scope, key),
+        CONSTRAINT appointment_claims_scope_check
+          CHECK (scope IN ('reminder'))
+      )
+    `);
+
+    // The reminder job's own query is `WHERE status = ANY(...)`, so this is the
+    // index it would otherwise do without. The primary key is on `created_at` by
+    // name here rather than on an index this application never writes to.
+    await this.sql.query(`
+      CREATE INDEX IF NOT EXISTS appointments_status_created_idx
+        ON appointments (status, created_at)
+    `);
+
+    // Claims are never released, so the table only ever grows. A clinic booking
+    // one reminder a day produces one row a day, which is nothing -- but the
+    // statement below exists so that "nothing" is a decision somebody made rather
+    // than an accident waiting to be noticed at volume.
+    await this.sql.query(`
+      COMMENT ON TABLE appointment_claims IS
+        'Exactly-once ledger for scheduled jobs. Rows are never released; a retention policy would be DELETE FROM appointment_claims WHERE claimed_at < now() - interval ''180 days'', run deliberately.'
     `);
   }
 }
