@@ -4,7 +4,9 @@ import {
   appointmentRecordSchema,
   type AppointmentRecord,
   type IntakeFormData,
+  type SupportedLanguage,
 } from "@/lib/validation/intake";
+import { buildIntakeTranslationPrompt } from "@/lib/llm/prompt";
 
 /**
  * Constructed lazily.
@@ -43,13 +45,9 @@ const TRANSLATABLE_FIELDS = ["additionalInfo", "medical_department"] as const;
 
 type TranslatableField = (typeof TRANSLATABLE_FIELDS)[number];
 
-function isTranslatableField(key: string): key is TranslatableField {
-  return (TRANSLATABLE_FIELDS as readonly string[]).includes(key);
-}
-
 export async function translateToEnglish(
   data: IntakeFormData,
-  sourceLanguage: string,
+  sourceLanguage: SupportedLanguage,
 ): Promise<AppointmentRecord> {
   const fieldsToTranslate: Partial<Record<TranslatableField, string>> = {};
 
@@ -65,12 +63,7 @@ export async function translateToEnglish(
     return base;
   }
 
-  const prompt = `You are a medical intake form translator. Translate the following text fields from ${sourceLanguage} to English. Only translate the values, not the field names or other data.
-
-Fields to translate:
-${JSON.stringify(fieldsToTranslate, null, 2)}
-
-Return ONLY a valid JSON object with the same structure, but with values translated to English. Do not include any explanation or additional text.`;
+  const prompt = buildIntakeTranslationPrompt(fieldsToTranslate, sourceLanguage);
 
   let lastError: Error | null = null;
 
