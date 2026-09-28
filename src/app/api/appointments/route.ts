@@ -3,6 +3,7 @@ import { createAppointment, getAppointment } from "@/lib/appointments";
 import { appointmentRequestSchema } from "@/lib/validation/intake";
 import { parseJsonBody } from "@/lib/validation/parse";
 import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
+import { logInfo } from "@/lib/logger";
 
 const APPOINTMENTS_LIMIT = 20;
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -21,20 +22,15 @@ export async function POST(request: NextRequest) {
   const patientInfo = parsed.data;
   const appointment = createAppointment(patientInfo);
 
-  const { email, language, ...doctorInfo } = patientInfo;
+  const { email, language } = patientInfo;
 
   const baseUrl = request.nextUrl.origin;
   const encodedPatientInfo = encodeURIComponent(JSON.stringify(patientInfo));
   const spectateUrl = `${baseUrl}/spectate/${appointment.id}?patientInfo=${encodedPatientInfo}`;
 
-  console.log("\n========================================");
-  console.log("NEW APPOINTMENT REQUEST");
-  console.log("========================================");
-  console.log("Patient Info (for doctor):", JSON.stringify(doctorInfo, null, 2));
-  console.log("Email:", email || "Not provided");
-  console.log("Language:", language || "Not provided");
-  console.log("\nSpectate URL:", spectateUrl);
-  console.log("========================================\n");
+  // Was a decorative banner printing the whole patient record serialised with
+  // indentation, the email address, and the spectate URL, on every request.
+  logInfo("appointment.created", { appointmentId: appointment.id, language });
 
   return NextResponse.json({
     id: appointment.id,
@@ -42,7 +38,7 @@ export async function POST(request: NextRequest) {
     patientInfo: patientInfo,
     email: email,
     language: language,
-    message: "Appointment created. Check console for spectate URL.",
+    message: "Appointment created.",
   });
 }
 

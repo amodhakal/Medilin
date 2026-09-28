@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
+import { clientLog } from "@/lib/logger/client";
 import type { AppointmentRecord } from "@/lib/validation/intake";
 
 
@@ -50,18 +51,20 @@ export default function SpectateClient({
 
   useEffect(() => {
     searchParams.then((p) => {
-      console.log("Raw patientInfo query param:", p.patientInfo);
+      // Was logging the raw query param, then the decoded string, then the
+      // parsed object, so a patient's full record appeared three times in
+      // devtools. Devtools are the most widely-read log sink there is, and
+      // anything captured by an error-reporting SDK is forwarded off-device.
       if (p.patientInfo) {
         const decoded = decodeURIComponent(p.patientInfo);
-        console.log("Decoded patientInfo:", decoded);
         setPatientInfo(decoded);
         try {
-          const parsed = JSON.parse(decoded);
-          console.log("Parsed patientInfoObj:", parsed);
-          setPatientInfoObj(parsed);
+          setPatientInfoObj(JSON.parse(decoded));
           setMounted(true);
         } catch (e) {
-          console.error("Failed to parse patient info:", e);
+          clientLog("error", "spectate.patient_info_parse_failed", {
+            errorMessage: e instanceof Error ? e.message : String(e),
+          });
           setMounted(true);
         }
       } else {
@@ -98,7 +101,7 @@ export default function SpectateClient({
         );
 
         ws.onopen = () => {
-          console.log(`Connected to Agent ${agent}`);
+          clientLog("info", "spectate.agent_connected", { resource: `agent_${agent}` });
           const initData: Record<string, unknown> = {
             type: "conversation_initiation_client_data",
           };
@@ -203,7 +206,10 @@ export default function SpectateClient({
         };
 
         ws.onerror = (err) => {
-          console.error(`WebSocket error for Agent ${agent}:`, err);
+          clientLog("error", "spectate.websocket_error", {
+            resource: `agent_${agent}`,
+            errorMessage: err instanceof Error ? err.message : String(err),
+          });
           reject(err);
         };
 
@@ -234,7 +240,9 @@ export default function SpectateClient({
       setIsConnected(true);
       setIsConnecting(false);
     } catch (err) {
-      console.error("Failed to start conversation:", err);
+      clientLog("error", "spectate.start_failed", {
+        errorMessage: err instanceof Error ? err.message : String(err),
+      });
       setError("Failed to connect to agents. Check console for details.");
       setIsConnecting(false);
     }

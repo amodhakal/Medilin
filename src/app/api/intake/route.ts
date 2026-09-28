@@ -6,6 +6,7 @@ import { intakeSchema } from "@/lib/validation/intake";
 import { parseJsonBody } from "@/lib/validation/parse";
 import { internalHeaders } from "@/lib/auth/internal";
 import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
+import { logError, logInfo } from "@/lib/logger";
 
 const INTAKE_LIMIT = 5;
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -23,10 +24,10 @@ export async function POST(request: NextRequest) {
 
     const data = parsed.data;
     const sourceLanguage = data.language;
-    console.log("Processing intake form from:", sourceLanguage, data);
+    logInfo("intake.received", { language: sourceLanguage });
 
     const translatedData = await translateToEnglish(data, sourceLanguage);
-    console.log("Converted into English:", translatedData);
+    logInfo("intake.translated", { language: sourceLanguage });
 
     const appointment = createAppointment(translatedData);
 
@@ -36,7 +37,11 @@ export async function POST(request: NextRequest) {
     );
     const spectateUrl = `${baseUrl}/spectate/${appointment.id}?patientInfo=${encodedPatientInfo}`;
 
-    console.log("Spectate URL:", spectateUrl);
+    // The spectate URL is deliberately not logged. It carries the appointment
+    // id and, for now, the whole record; logging it puts a joinable patient
+    // identifier into a log store. The record stops being in the URL in the
+    // next commit on this branch.
+    logInfo("intake.session_url_created", { appointmentId: appointment.id });
 
     const mockHospitalResponse = {
       patientInfo: translatedData,
@@ -48,7 +53,7 @@ export async function POST(request: NextRequest) {
       referenceNumber: `HOSP-${appointment.id}`,
     };
 
-    console.log("Hospital response:", mockHospitalResponse);
+    logInfo("intake.booking_simulated", { appointmentId: appointment.id });
 
     const webhookUrl = `${request.nextUrl.origin}/api/webhook`;
     await fetch(webhookUrl, {
@@ -67,7 +72,7 @@ export async function POST(request: NextRequest) {
       spectateUrl: spectateUrl,
     });
   } catch (error) {
-    console.error("Translation error:", error);
+    logError("intake.failed", error);
     return NextResponse.json(
       { success: false, error: "Failed to process form" },
       { status: 500 },
