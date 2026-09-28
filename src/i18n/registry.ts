@@ -54,6 +54,10 @@ const ENGLISH = {
   other: "Specialist Consultation",
   toastProcessing: "Processing intake & spinning up AI Agent...",
   back: "Back to Languages",
+  notFoundTitle: "That language is not available",
+  notFoundBody:
+    "This address does not match a language we offer. Pick one of the languages below to start.",
+  pickLanguage: "Choose a language",
 } as const;
 
 /** Exported so a test can hold every language to the English key set. */
@@ -120,6 +124,10 @@ const DEFINITIONS = {
       other: "Consulta Especializada",
       toastProcessing: "Procesando admisión y conectando Agente IA...",
       back: "Volver a Idiomas",
+      notFoundTitle: "Ese idioma no está disponible",
+      notFoundBody:
+        "Esta dirección no corresponde a ningún idioma que ofrezcamos. Elige uno de los idiomas siguientes para comenzar.",
+      pickLanguage: "Elegir un idioma",
     },
   },
   portuguese: {
@@ -152,6 +160,10 @@ const DEFINITIONS = {
       other: "Consulta Especializada",
       toastProcessing: "Processando admissão e iniciando Agente de Voz...",
       back: "Voltar para Idiomas",
+      notFoundTitle: "Esse idioma não está disponível",
+      notFoundBody:
+        "Este endereço não corresponde a nenhum idioma que oferecemos. Escolha um dos idiomas abaixo para começar.",
+      pickLanguage: "Escolher um idioma",
     },
   },
 } as const satisfies Record<string, LanguageDefinition>;
