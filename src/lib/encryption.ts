@@ -4,12 +4,34 @@ const ALGORITHM = 'aes-256-gcm';
 const KEY_LENGTH = 32; // 256 bits
 const IV_LENGTH = 12; // 96 bits for GCM recommended
 
+/**
+ * Resolve the key-encryption key.
+ *
+ * There is deliberately no fallback. The previous implementation derived a
+ * key with `scryptSync('medilin-hipaa-default-kek-secret', 'salt', ...)` when
+ * HIPAA_MASTER_KEY was unset, which meant a secret committed to a public
+ * repository silently protected every record whenever the real variable was
+ * missing — and HIPAA_MASTER_KEY was not listed in .env.example, so the
+ * fallback was the expected path. Absence is now an error.
+ */
 function getMasterKey(masterKeyHex?: string): Buffer {
-  const hex = masterKeyHex || process.env.HIPAA_MASTER_KEY;
-  if (hex) {
-    return Buffer.from(hex, 'hex');
+  const hex = masterKeyHex ?? process.env.HIPAA_MASTER_KEY;
+
+  if (!hex) {
+    throw new Error(
+      'HIPAA_MASTER_KEY is not set. Refusing to encrypt: a fallback key would ' +
+        'mean the key protecting patient records is not a secret. Generate one ' +
+        'with `openssl rand -hex 32`.',
+    );
   }
-  return crypto.scryptSync('medilin-hipaa-default-kek-secret', 'salt', KEY_LENGTH);
+
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new Error(
+      `HIPAA_MASTER_KEY must be exactly 64 hex characters (32 bytes) for ${ALGORITHM}.`,
+    );
+  }
+
+  return Buffer.from(hex, 'hex');
 }
 
 export interface EncryptedEnvelope {

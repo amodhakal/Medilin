@@ -1,21 +1,42 @@
 # Medilin
 
-**Live Demo:** https://sol-hacks2026.vercel.app
+## Status
+
+**Medilin is a hackathon prototype. It is not HIPAA compliant and must not be
+used with real patient data or for actual patient care.**
+
+It has previously been described in this README and in the UI as a
+"HIPAA compliant voice bridge". That claim is not accurate and has been
+removed. Concretely, as of this commit:
+
+- There is no authentication on any endpoint, including the intake API, the
+  appointment API, the audit log, and the email webhook.
+- Appointments are held in an in-memory `Map`, so they are lost on redeploy and
+  are not shared between serverless instances.
+- Patient details are placed in the spectate page's query string, which puts
+  them in browser history and in any access log that records the URL.
+- Application logs currently print full patient records.
+- No business associate agreement is in place with any vendor, all of which
+  receive patient data (Google, Resend, ElevenLabs).
+- The clinic "call" is simulated in-process. No phone is placed.
+- The encryption and audit-log modules exist and are verified, but the audit
+  log is in-memory, so its hash chain resets to genesis on every restart and
+  provides no durable tamper evidence.
 
 ## Project Description
 
 Medilin is a proof-of-concept multilingual healthcare appointment booking platform designed to help patients who face language barriers or time constraints when scheduling medical appointments. 
 
-The vision is simple: patients fill out an intake form in their native language, and an AI agent automatically calls the clinic to book an appointment on their behalf. The patient receives a confirmation email, so no phone calls, no language barriers, no hassle.
+The vision is simple: patients fill out an intake form in their native language, and an AI agent calls the clinic to book an appointment on their behalf. The patient receives a confirmation email, so no phone calls, no language barriers, no hassle.
 
-**Current Demo Status:** This hackathon prototype demonstrates the core AI voice negotiation technology. When a patient submits an intake form, the system automatically simulates a hospital booking response with a negotiated appointment time (different from the requested time) and sends a confirmation email. The spectate URL allows optional observation of the AI agent conversation.
+**Current Demo Status:** This hackathon prototype demonstrates the core AI voice negotiation technology. When a patient submits an intake form, the system simulates a hospital booking response with a negotiated appointment time (different from the requested time) and sends a confirmation email. The spectate URL allows optional observation of the AI agent conversation.
 
 ### How It Works
 
 1. **Patient Intake**: Users fill out a healthcare intake form in their preferred language
-2. **Automated Booking**: The system simulates a hospital response with a negotiated appointment time
-3. **Confirmation**: The patient automatically receives a confirmation email with appointment details in their chosen language
-4. **Optional Observation**: Users can visit the spectate URL to observe the AI agent conversation simulating the booking process
+2. **Simulated Booking**: The system fabricates a hospital response with a negotiated appointment time
+3. **Confirmation**: The patient receives a confirmation email with appointment details in their chosen language
+4. **Optional Observation**: Users can visit the spectate URL to observe the simulated booking conversation
 
 ### Production Vision
 
@@ -24,7 +45,8 @@ In a production deployment, the AI agent would:
 - Handle real availability checks and calendar integration
 - Manage conflicts and rescheduling
 - Integrate with clinic EMR/scheduling systems
-- Handle HIPAA compliance requirements
+- Satisfy HIPAA obligations, which requires considerably more than the
+  encryption and audit logging implemented here
 
 ## Tech Stack
 
@@ -38,14 +60,14 @@ In a production deployment, the AI agent would:
 
 1. **Clone the repository**
 ```bash
-   git clone https://github.com/amodhakal/SolHacks2026.git
-   cd SolHacks2026
+   git clone https://github.com/amodhakal/Medilin.git
+   cd Medilin
 ```
 
 2. **Install dependencies**
+
+   This project uses [Bun](https://bun.sh) and commits a single `bun.lock`.
 ```bash
-   npm install
-   # or
    bun install
 ```
 
@@ -53,21 +75,40 @@ In a production deployment, the AI agent would:
 ```bash
    cp .env.example .env
 ```
-   
-   Add the following keys to `.env`:
-   - `ELEVENLABS_API_KEY` - Your ElevenLabs API key
-   - `GOOGLE_GENERATIVE_AI_API_KEY` - Your Google Gemini API key
-   - `RESEND_API_KEY` - Your Resend API key for sending emails
+
+   `.env.example` is the full list; these five are **required** and the server
+   refuses to start without them:
+   - `GEMINI_KEY` - Google Gemini API key, for intake translation
+   - `RESEND_KEY` - Resend API key, for confirmation email
+   - `HIPAA_MASTER_KEY` - 32-byte hex key for encrypting patient data at rest.
+     Generate with `openssl rand -hex 32`. There is no fallback: if this is
+     unset, encryption throws rather than protecting records with a key that
+     lives in the source tree.
+   - `ELEVENLABS_AGENT_PATIENT_ID` - Conversational AI agent for the patient
+   - `ELEVENLABS_AGENT_RECEPTIONIST_ID` - Conversational AI agent for reception
+
+   `ELEVENLABS_API_KEY` is listed in `.env.example` but is not yet read by any
+   code. The rest of the optional variables each gate one feature.
 
 4. **Run the development server**
 ```bash
-   npm run dev
-   # or
    bun run dev
 ```
 
 5. **Open in browser**
    Visit http://localhost:3000
+
+> The server validates its environment on start (see `src/instrumentation.ts`)
+> and refuses to boot with every missing variable listed at once. If it does
+> not come up, check `.env` against `.env.example`.
+
+### Resend sender limitation
+
+Confirmation email is sent through Resend. On the free tier Resend only
+delivers to the address on the account itself, so a confirmation addressed to
+a patient will not arrive until a sending domain is verified. `EMAIL_FROM`
+defaults to `onboarding@resend.dev`, which has the same restriction. This is
+a Resend account limitation, not a bug in the app.
 
 ## How to Demo
 
@@ -86,27 +127,33 @@ In a production deployment, the AI agent would:
 ```
 ├── src/
 │   ├── app/
-│   │   ├── page.tsx              # Main intake form
-│   │   ├── language/[slug]/      # Language-specific pages
-│   │   ├── spectate/[id]/        # Spectator page for agent calls
+│   │   ├── page.tsx              # Landing page, language picker
+│   │   ├── language/[slug]/      # Localized intake form
+│   │   ├── spectate/[id]/        # Voice session viewer (server wrapper + client)
 │   │   ├── api/
 │   │   │   ├── intake/           # Intake form submission
-│   │   │   ├── appointments/     # Appointment booking
-│   │   │   ├── webhook/          # ElevenLabs webhook handler
+│   │   │   ├── appointments/     # Appointment read/create
+│   │   │   ├── webhook/          # Internal email dispatcher
+│   │   │   ├── audit/            # Audit log read/write
 │   │   │   └── health/           # Health check endpoint
+│   │   ├── instrumentation.ts    # Boot-time environment validation
 │   │   ├── layout.tsx
 │   │   ├── globals.css
 │   │   └── actions.ts
-│   ├── components/
-│   │   └── ElevenLabsProvider.tsx
+│   ├── config/                   # Non-secret application configuration
 │   └── lib/
+│       ├── env.ts                # Environment schema (source of truth)
 │       ├── translateFromEnglish.ts
 │       ├── translateToEnglish.ts
-│       └── appointments.ts
+│       ├── appointments.ts
+│       ├── audit.ts
+│       └── encryption.ts
+├── scripts/
+│   └── verify-hipaa.ts           # Encryption + audit chain checks
 ├── public/
 ├── package.json
 ├── next.config.ts
-├── tailwind.config.ts
+├── postcss.config.mjs            # Tailwind v4 is configured here
 └── tsconfig.json
 ```
 

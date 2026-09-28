@@ -99,14 +99,7 @@ export default function LanguagePage({ params }: PageProps) {
     const formData = new FormData(e.currentTarget);
     formData.append("language", lang);
     const response = await submitIntakeForm(formData);
-    
-    console.log("\n========================================");
-    console.log("NEW APPOINTMENT REQUEST");
-    console.log("========================================");
-    console.log("Appointment ID:", response.appointmentId);
-    console.log("Spectate URL:", response.spectateUrl);
-    console.log("========================================\n");
-    
+
     toast.success(t.toastProcessing);
     
     if (response.spectateUrl) {
