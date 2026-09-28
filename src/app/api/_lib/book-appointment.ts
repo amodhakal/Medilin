@@ -3,6 +3,7 @@ import "server-only";
 import { getClinicName } from "@/config";
 import { createAppointment, issuePatientActions } from "@/lib/appointments";
 import { logError, logInfo } from "@/lib/logger";
+import { translateHousehold } from "@/lib/llm/household";
 import { sealForDelivery } from "@/lib/phi-token";
 import { translateToEnglish } from "@/lib/translateToEnglish";
 import type { IntakeFormData } from "@/lib/validation/intake";
@@ -30,6 +31,26 @@ import { negotiateAppointmentTime } from "./schedule";
  * root-relative spectate URL, which is what a caller in the same process wants:
  * there is no trustworthy absolute origin available inside a server action, and
  * a relative URL resolves against whichever origin the user is actually on.
+ *
+ * ## Households (#69)
+ *
+ * A booking may now carry other people. Two things follow from that, and both
+ * are here rather than spread across the pipeline.
+ *
+ * Translation happens twice. `translateToEnglish` handles the account holder and
+ * knows about one person; `translateHousehold` then handles everyone else, one
+ * call per person. Without the second step a Spanish household would reach a
+ * clinician with the child's fever still in Spanish while the parent's is
+ * translated.
+ *
+ * The confirmation names everyone. `translateToEnglish` cannot know about the
+ * household, and the email is built from the payload below, so the people are
+ * listed there -- reduced to the three fields an email actually needs, because
+ * the account holder supplied the rest and an email is forwarded and kept.
+ *
+ * A single-patient booking adds nothing to any of this: `household` is omitted
+ * from the payload rather than sent empty, so the confirmation the model is
+ * asked to render is byte-for-byte what it was before.
  */
 
 export interface Booking {
@@ -57,7 +78,16 @@ export async function bookAppointment(
   const translatedData = await translateToEnglish(data, sourceLanguage);
   logInfo("intake.translated", { language: sourceLanguage });
 
-  const appointment = await createAppointment(translatedData);
+  // Everyone else in the booking, in the account holder's own language first and
+  // then in English. A no-op, and costs nothing, for a one-person booking.
+  const record = await translateHousehold(translatedData);
+  const dependents = record.dependents ?? [];
+
+  if (dependents.length > 0) {
+    logInfo("intake.household_translated", { householdSize: dependents.length });
+  }
+
+  const appointment = await createAppointment(record);
 
   // Was `?patientInfo=${encodeURIComponent(JSON.stringify(translatedData))}`,
   // which put the whole record in the URL. Neither of the two tokens that
@@ -66,7 +96,7 @@ export async function bookAppointment(
   // carries the record sealed under a single key, which is what keeps the link
   // working across serverless instances. Which of the two depends on the store,
   // and the decision belongs to sealForDelivery rather than to this call site.
-  const token = sealForDelivery(JSON.stringify(translatedData), appointment.id);
+  const token = sealForDelivery(JSON.stringify(record), appointment.id);
   const spectateUrl = `${origin}/spectate/${token}`;
 
   logInfo("intake.session_url_created", { appointmentId: appointment.id });
@@ -90,11 +120,11 @@ export async function bookAppointment(
     logError("intake.manage_link_failed", error, { appointmentId: appointment.id });
   }
 
-  const mockHospitalResponse = {
-    patientInfo: translatedData,
+  const mockHospitalResponse: Record<string, unknown> = {
+    patientInfo: record,
     // The clinic negotiates forward from the requested slot rather than
     // stamping `now + random(0, 24h)`; see ./schedule.
-    agreedDateTime: negotiateAppointmentTime(translatedData.appointmentDateTime),
+    agreedDateTime: negotiateAppointmentTime(record.appointmentDateTime),
     confirmed: true,
     hospitalName: getClinicName(),
     referenceNumber: `HOSP-${appointment.id}`,
@@ -103,6 +133,19 @@ export async function bookAppointment(
     ...(managePath ? { manageUrl: managePath } : {}),
   };
 
+  // Omitted entirely for a one-person booking, so the email the model is asked
+  // to write does not change for anybody who is not using the new feature. The
+  // three fields are the ones a confirmation needs and no more: a child's date
+  // of birth is not needed to say "we have booked an appointment for Maya", and
+  // this payload becomes the body of an email that gets forwarded and filed.
+  if (dependents.length > 0) {
+    mockHospitalResponse.household = dependents.map((person) => ({
+      firstName: person.firstName,
+      relationship: person.relationship,
+      additionalInfo: person.additionalInfo,
+    }));
+  }
+
   logInfo("intake.booking_simulated", { appointmentId: appointment.id });
 
   // Was `fetch(`${origin}/api/webhook`, { headers: internalHeaders(), ... })`:
@@ -110,7 +153,7 @@ export async function bookAppointment(
   // request's own Host header, whose response was never inspected. The delivery
   // is a function call now, for the same reasons as #43 in the server action.
   const delivery = await deliverConfirmation({
-    email: translatedData.email,
+    email: record.email,
     language: sourceLanguage,
     info: JSON.stringify(mockHospitalResponse),
   });

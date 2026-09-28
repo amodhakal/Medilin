@@ -105,6 +105,96 @@ export const emailTranslationSchema = z
 export type EmailTranslation = z.infer<typeof emailTranslationSchema>;
 
 /**
+ * Routing hint, and the one field here with a cost when it is wrong.
+ *
+ * Deliberately three values and a string, not an enum the rest of the app
+ * branches on: this is what a reception queue could sort by, and the name says
+ * `suggested` because the model is reading a paragraph of free text, not
+ * examining anyone. `emergency` is not one of them. A patient describing chest
+ * pain is an emergency whoever triages them, and a four-value enum invites
+ * somebody to build an "emergency" bucket that the model is expected to fill in
+ * from a sentence, which is the failure this whole endpoint is shaped to avoid.
+ */
+export const URGENCIES = ["routine", "soon", "urgent"] as const;
+
+export type Urgency = (typeof URGENCIES)[number];
+
+/**
+ * Schema for a clinician intake/triage summary.
+ *
+ * A statement to the decoder, not to the caller: it makes the reply have this
+ * shape, and `triageSummarySchema` below is what makes the values usable. Every
+ * field is required, because a summary missing a part is not a summary the
+ * caller can render honestly -- a partial document silently shown to a
+ * clinician reads as a complete one.
+ */
+export const INTAKE_SUMMARY_RESPONSE_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    chiefComplaint: {
+      type: Type.STRING,
+      description:
+        "One short line, the patient's reason for coming in, in the patient's own terms. Not a condition and not a cause.",
+    },
+    summary: {
+      type: Type.STRING,
+      description:
+        "A few sentences restating the account for a clinician, including duration and severity only if the patient stated them.",
+    },
+    symptoms: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description:
+        "Each symptom the patient described, as a separate short phrase. Only what was stated.",
+    },
+    urgency: {
+      type: Type.STRING,
+      enum: [...URGENCIES],
+      description:
+        "A routing hint: how soon the clinic should look at this. Not a clinical determination.",
+    },
+    followUpQuestions: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description:
+        "Questions a clinician would need answered before the consultation, derived from gaps in the account.",
+    },
+  },
+  required: ["chiefComplaint", "summary", "symptoms", "urgency", "followUpQuestions"],
+};
+
+const SUMMARY_TEXT_MAX = 2000;
+const CHIEF_COMPLAINT_MAX = 200;
+const LIST_ITEM_MAX = 200;
+const LIST_MAX_ITEMS = 10;
+
+/**
+ * What the caller is willing to render.
+ *
+ * `.strict()`, like every other schema in this app, and for the same reason: a
+ * model that volunteers a `diagnosis` key must have it refused rather than
+ * carried through, because a summary is read as if every part of it came from
+ * the patient's own account.
+ *
+ * Everything is capped and everything is rejected rather than truncated. The
+ * difference matters for a clinical artefact: a summary silently cut at 2,000
+ * characters can stop mid-sentence and still render as though it were the whole
+ * thing, whereas a refusal is visible and the caller can fall back to showing
+ * the clinician the patient's own words.
+ */
+export const triageSummarySchema = z
+  .object({
+    chiefComplaint: z.string().trim().min(1).max(CHIEF_COMPLAINT_MAX),
+    summary: z.string().trim().min(1).max(SUMMARY_TEXT_MAX),
+    symptoms: z.array(z.string().trim().min(1).max(LIST_ITEM_MAX)).max(LIST_MAX_ITEMS),
+    urgency: z.enum(URGENCIES),
+    followUpQuestions: z.array(z.string().trim().min(1).max(LIST_ITEM_MAX)).max(LIST_MAX_ITEMS),
+  })
+  .strict();
+
+export type TriageSummary = z.infer<typeof triageSummarySchema>;
+
+/**
  * Parse a response that the API has already constrained to JSON.
  *
  * A single `JSON.parse`, with no extraction step, because in JSON mode the whole

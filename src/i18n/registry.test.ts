@@ -1,14 +1,25 @@
 import { describe, expect, test } from "bun:test";
 
-import { MEDICAL_DEPARTMENTS, SUPPORTED_LANGUAGES } from "@/lib/validation/intake";
+import {
+  DEPENDENT_RELATIONSHIPS,
+  MAX_DEPENDENTS,
+  MEDICAL_DEPARTMENTS,
+  SUPPORTED_LANGUAGES,
+  dependentSchema,
+} from "@/lib/validation/intake";
 import {
   DEFAULT_LANGUAGE,
   DEPARTMENT_OPTIONS,
+  DEPENDENT_FIELD_LABELS,
   ENGLISH_MESSAGES,
+  FIELD_LABELS,
+  INTAKE_FIELDS,
   LANGUAGES,
   LANGUAGE_SLUGS,
   LIVE_LANGUAGE_SLUGS,
+  MAX_HOUSEHOLD_SIZE,
   PENDING_LANGUAGE_SLUGS,
+  RELATIONSHIP_OPTIONS,
   formatMessage,
   getLanguage,
   htmlLang,
@@ -16,6 +27,7 @@ import {
   isLiveLanguage,
   messagesFor,
   resolveBookableLanguage,
+  type MessageKey,
 } from "./registry";
 
 describe("language registry", () => {
@@ -198,6 +210,135 @@ describe("department options", () => {  test("cover exactly the departments the 
   });
 });
 
+/**
+ * Household booking (#69).
+ *
+ * The dependency that matters is the same one the departments have: the values
+ * the dropdown sends are the server's constant, and the labels are this
+ * registry's messages, so a relationship the form cannot offer is a relationship
+ * the schema refuses and vice versa. Everything else here is about a patient
+ * being able to book for their child in a language they can read.
+ */
+describe("household relationship options", () => {
+  test("cover exactly the relationships the intake schema accepts", () => {
+    expect(RELATIONSHIP_OPTIONS.map((option) => option.value)).toEqual([
+      ...DEPENDENT_RELATIONSHIPS,
+    ]);
+  });
+
+  test("every option has a message to label it with", () => {
+    for (const option of RELATIONSHIP_OPTIONS) {
+      expect(ENGLISH_MESSAGES[option.messageKey].trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  test("the placeholder is not offered as a relationship", () => {
+    // A blank option the server would refuse. The department select has the same
+    // guard, and it is a select rather than a radio group for the same reason.
+    expect(RELATIONSHIP_OPTIONS.map((option) => option.value)).not.toContain("");
+  });
+
+  test("no two relationships share a label", () => {
+    // A dropdown with "Other" twice is a form a clinician cannot read back.
+    const labels = RELATIONSHIP_OPTIONS.map((option) => ENGLISH_MESSAGES[option.messageKey]);
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+});
+
+describe("the household message set", () => {
+  const HOUSEHOLD_KEYS = [
+    "household",
+    "householdIntro",
+    "addPerson",
+    "removePerson",
+    "personHeading",
+    "dependentLastNameOptional",
+    "dependentRelationship",
+    "dependentReason",
+    "selectRelationship",
+    "householdLimit",
+    "householdConfirmed",
+  ] as const satisfies readonly MessageKey[];
+
+  test("every household string exists, in every language", () => {
+    // Parity is enforced by the key-set test above; this is the more specific
+    // version, so that adding a household string and forgetting two languages
+    // fails with a message that names household rather than "key 61".
+    for (const key of HOUSEHOLD_KEYS) {
+      for (const slug of LIVE_LANGUAGE_SLUGS) {
+        expect(messagesFor(slug)[key].trim().length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  test("no household string is left in English in another language", () => {
+    for (const key of HOUSEHOLD_KEYS) {
+      for (const slug of LIVE_LANGUAGE_SLUGS) {
+        if (slug === DEFAULT_LANGUAGE) continue;
+        expect(messagesFor(slug)[key]).not.toBe(ENGLISH_MESSAGES[key]);
+      }
+    }
+  });
+
+  test("the person heading takes a number, and the limit takes a count", () => {
+    // Both are the only two placeholders household adds, and both are
+    // positional: a translation decides where the number goes.
+    expect(formatMessage(ENGLISH_MESSAGES.personHeading, { number: 2 })).toContain("2");
+    expect(formatMessage(ENGLISH_MESSAGES.householdLimit, { count: 5 })).toContain("5");
+    expect(formatMessage(ENGLISH_MESSAGES.householdConfirmed, { count: 3 })).toContain("3");
+  });
+
+  test("every household string is a plain sentence with no leftover braces", () => {
+    // A key shipped with its placeholder un-filled renders "{number}" to a
+    // patient, which is the failure `formatMessage` deliberately makes obvious.
+    for (const key of HOUSEHOLD_KEYS) {
+      for (const slug of LIVE_LANGUAGE_SLUGS) {
+        const value = messagesFor(slug)[key];
+        if (key === "personHeading" || key === "householdLimit" || key === "householdConfirmed") {
+          continue;
+        }
+        expect(value).not.toContain("{");
+      }
+    }
+  });
+});
+
+describe("the household cap", () => {
+  test("the client's cap on a household is the server's cap", () => {
+    // The registry holds a literal rather than importing the schema, because it
+    // ships to a browser. This is what keeps the two from drifting: a form that
+    // stops offering the fifth card, or offers a sixth the server refuses, is a
+    // bug nobody finds until a parent is mid-booking.
+    expect(MAX_HOUSEHOLD_SIZE).toBe(MAX_DEPENDENTS);
+  });
+});
+
+describe("household field labels", () => {
+  test("the household group and each dependent field have a label", () => {
+    for (const [field, messageKey] of Object.entries({
+      ...FIELD_LABELS,
+      ...DEPENDENT_FIELD_LABELS,
+    })) {
+      expect(ENGLISH_MESSAGES[messageKey as MessageKey].trim().length).toBeGreaterThan(0);
+      expect(field.trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  test("the household itself is labelable, because the schema accepts it", () => {
+    // The invariant formIssues.test.ts enforces over the primary fields, stated
+    // for the new key: a field the schema accepts has to be nameable in the
+    // error summary, or a rejected household submission cannot be shown to the
+    // person who has to fix it.
+    expect(Object.hasOwn(FIELD_LABELS, "dependents")).toBe(true);
+    expect(INTAKE_FIELDS).toContain("dependents");
+  });
+
+  test("every dependent field the schema accepts is labelable", () => {
+    const accepted: string[] = Object.keys(dependentSchema.shape);
+    expect(Object.keys(DEPENDENT_FIELD_LABELS).sort()).toEqual(accepted.sort());
+  });
+});
+
 describe("formatMessage", () => {
   test("fills a placeholder", () => {
     expect(formatMessage("Redirecting in {seconds} seconds.", { seconds: 20 })).toBe(
@@ -244,7 +385,10 @@ describe("formatMessage", () => {
   });
 
   test("no message is left with a placeholder nobody supplies", () => {
-    const known = ["seconds"];
+    // A registry of every placeholder the app fills in, not a rule against
+    // having placeholders. Household booking added two: which person a card is,
+    // and how many people a booking may carry.
+    const known = ["seconds", "number", "count"];
     for (const slug of LIVE_LANGUAGE_SLUGS) {
       for (const value of Object.values(messagesFor(slug))) {
         for (const match of value.matchAll(/\{(\w+)\}/g)) {
