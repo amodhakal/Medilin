@@ -13,9 +13,9 @@ const INTAKE_LIMIT = 5;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
 export async function POST(request: NextRequest) {
-  // Each accepted request costs a Gemini call and a Resend email, and the
-  // translation helpers retry up to ten times on failure, so an unthrottled
-  // client can burn the whole budget in a loop.
+  // Each accepted request costs a Gemini call and a Resend email, and a
+  // translation makes up to three attempts, so an unthrottled client can burn
+  // the whole budget in a loop.
   const limited = await enforceRateLimit(callerKey(request, "intake"), INTAKE_LIMIT, RATE_LIMIT_WINDOW_MS);
   if (limited) return limited;
 

@@ -34,6 +34,7 @@ const fastPolicy: RetryPolicy = {
   maxAttempts: 2,
   baseDelayMs: 0,
   maxDelayMs: 0,
+  totalBudgetMs: 1000,
 };
 
 interface Recorded {
