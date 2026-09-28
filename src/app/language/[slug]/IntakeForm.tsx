@@ -7,6 +7,7 @@ import Link from "next/link";
 import {
   DEPARTMENT_OPTIONS,
   getLanguage,
+  htmlLang,
   type LanguageSlug,
 } from "@/i18n/registry";
 
@@ -20,7 +21,8 @@ import {
  * not recognise, so a bad URL never reaches here.
  */
 export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
-  const t = getLanguage(slug).messages;
+  const language = getLanguage(slug);
+  const t = language.messages;
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -38,11 +40,23 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
     }
 
     toast.success(t.toastProcessing);
-    window.location.href = result.spectateUrl;
+    // assign() rather than `window.location.href = url`, which the React
+    // compiler's immutability rule rejects as a write to a global. Same
+    // navigation, and a full document load rather than a client-side one,
+    // which is what a page opening two WebSockets wants.
+    window.location.assign(result.spectateUrl);
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col items-center justify-center p-6">
+    <div
+      // The document's language, declared on the part of the document that is
+      // in it. A screen reader uses this to pick a voice and, for `dir`, to
+      // read punctuation and numbers the right way round; without it this form
+      // is announced in English with Spanish text in it.
+      lang={htmlLang(language)}
+      dir={language.direction}
+      className="min-h-screen bg-slate-50 text-slate-900 flex flex-col items-center justify-center p-6"
+    >
       <div className="w-full max-w-xl my-8">
         <Link
           href="/"

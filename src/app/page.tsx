@@ -1,6 +1,9 @@
 import Link from "next/link";
 
+import { PROTOTYPE_NOTICE, homeMetadata } from "@/i18n/metadata";
 import { LANGUAGE_SLUGS, getLanguage } from "@/i18n/registry";
+
+export const metadata = homeMetadata();
 
 export default function HomePage() {
   return (
@@ -16,7 +19,7 @@ export default function HomePage() {
           </span>
         </div>
         <div className="text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 px-3.5 py-1.5 rounded-full">
-          Prototype &mdash; not for clinical use
+          {PROTOTYPE_NOTICE}
         </div>
       </header>
 
@@ -39,14 +42,18 @@ export default function HomePage() {
               <Link
                 key={slug}
                 href={`/language/${slug}`}
-                lang={language.locale}
                 className="group bg-white border border-slate-200 hover:border-cyan-500 rounded-2xl p-6 shadow-sm hover:shadow-md transition-all duration-200 flex flex-col justify-between"
               >
                 <div>
                   <div className="text-3xl mb-4" aria-hidden="true">
                     {language.flag}
                   </div>
-                  <h2 className="text-lg font-bold text-slate-900 group-hover:text-cyan-600 transition-colors">
+                  {/* `lang` on the endonym only: it is written in that
+                      language, while the blurb below is the reader's. */}
+                  <h2
+                    lang={language.locale}
+                    className="text-lg font-bold text-slate-900 group-hover:text-cyan-600 transition-colors"
+                  >
                     {language.name}
                   </h2>
                   <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">

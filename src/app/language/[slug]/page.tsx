@@ -1,6 +1,8 @@
+import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
 import { LANGUAGE_SLUGS, isLanguageSlug } from "@/i18n/registry";
+import { languageMetadata } from "@/i18n/metadata";
 import IntakeForm from "./IntakeForm";
 
 /**
@@ -20,6 +22,29 @@ import IntakeForm from "./IntakeForm";
  */
 export function generateStaticParams(): Array<{ slug: string }> {
   return LANGUAGE_SLUGS.map((slug) => ({ slug }));
+}
+
+/**
+ * Per-language document metadata.
+ *
+ * The title, description, canonical URL, hreflang set, and Open Graph locale
+ * all come from the registry, so a language cannot be added to the picker
+ * without also getting a title. The alternates point at every language, which
+ * is what tells a search engine these are translations of one form rather than
+ * four unrelated pages.
+ */
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ slug: string }>;
+}): Promise<Metadata> {
+  const { slug } = await params;
+
+  if (!isLanguageSlug(slug)) {
+    notFound();
+  }
+
+  return languageMetadata(slug);
 }
 
 export default async function LanguagePage({
