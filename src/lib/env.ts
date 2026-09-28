@@ -64,6 +64,13 @@ const serverEnvSchema = z.object({
   TWILIO_ACCOUNT_SID: z.string().min(1).optional(),
   TWILIO_AUTH_TOKEN: z.string().min(1).optional(),
   TWILIO_FROM_NUMBER: z.string().min(1).optional(),
+
+  // Webhook signing secrets (#65). Each is consulted only when its vendor's
+  // signature header is present on an inbound /api/webhook request; when
+  // unset, vendor verification for that vendor is skipped and the internal
+  // shared secret remains the only gate.
+  TWILIO_WEBHOOK_SECRET: z.string().min(1).optional(),
+  ELEVENLABS_WEBHOOK_SECRET: z.string().min(1).optional(),
 });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;
