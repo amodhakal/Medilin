@@ -9,18 +9,30 @@ import Link from "next/link";
 import { LowBandwidthToggle } from "@/i18n/display-preferences";
 import {
   DEPARTMENT_OPTIONS,
+  MAX_HOUSEHOLD_SIZE,
+  RELATIONSHIP_OPTIONS,
+  formatMessage,
   htmlLang,
   type IntakeFieldName,
   type LiveLanguage,
   type LiveLanguageSlug,
+  type Messages,
 } from "@/i18n/registry";
 import {
   collectIssues,
   errorId,
+  fieldId,
   hasFieldErrors,
   summaryEntries,
   type FieldErrors,
 } from "./formIssues";
+import {
+  DEPENDENT_FIELDS,
+  nextHouseholdSize,
+  peopleCount,
+  type DependentFieldName,
+  dependentFieldName,
+} from "./household";
 import { BookingConfirmation } from "./BookingConfirmation";
 import { createSubmitGate } from "./submitGate";
 
@@ -74,6 +86,34 @@ const CONTROL_INVALID =
 const ERROR_TEXT = "mt-1.5 text-xs font-medium text-danger";
 const ERROR_BORDER = "border-danger-rule";
 
+/**
+ * One card per person, as the form's own state.
+ *
+ * An index and nothing else, because the index is the identity: it is what the
+ * input is named after, what a server error path addresses, and what the DOM id
+ * is derived from. A card holds no field values, so removing the middle one
+ * cannot leave someone else's text attached to the wrong name, and the browser's
+ * own inputs keep the values keyed by the name they were rendered with.
+ */
+interface HouseholdCard {
+  key: number;
+}
+
+/**
+ * The next card's index.
+ *
+ * Monotonic and never reused, so removing a person in the middle leaves a gap in
+ * the rendered names while the fields on either side of it keep the names they
+ * were given. Reusing the index would move a validation message that is still
+ * showing onto a different person's card.
+ */
+let nextCardKey = 0;
+
+function freshCard(): HouseholdCard {
+  nextCardKey += 1;
+  return { key: nextCardKey };
+}
+
 export default function IntakeForm({
   slug,
   language,
@@ -89,12 +129,53 @@ export default function IntakeForm({
   const [booked, setBooked] = useState<Booking | null>(null);
   const [staying, setStaying] = useState(false);
   const [remaining, setRemaining] = useState(REDIRECT_SECONDS);
+  // How many other people are in this booking, and a stable identity for each.
+  // The array position is the index a card is named after; `key` is what React
+  // reconciles on, and the two must not be the same number.
+  const [cards, setCards] = useState<HouseholdCard[]>([]);
   const summaryRef = useRef<HTMLDivElement | null>(null);
   const confirmationRef = useRef<HTMLHeadingElement | null>(null);
   // The gate refuses a second submission synchronously, which a state flag
   // cannot: two clicks in one frame both read `pending === false`. The state
   // alongside it is what renders the disabled button.
   const gate = useRef(createSubmitGate());
+
+  const people = peopleCount(cards.length);
+  const roomLeft = nextHouseholdSize(cards.length);
+
+  const showError = (field: IntakeFieldName) => Boolean(errors[field]);
+  const errorFor = (index: number, field: DependentFieldName) =>
+    errors[dependentFieldName(index, field)];
+
+  const addPerson = () => {
+    if (nextHouseholdSize(cards.length) === null) return;
+
+    setCards((current) => [...current, freshCard()]);
+    setErrors((current) => {
+      const cleared: FieldErrors = { ...current };
+      // A stale message on a brand new card would be about a person who is not
+      // there yet, and a household-level error about the count is now stale in
+      // the other direction.
+      delete cleared.dependents;
+      return cleared;
+    });
+  };
+
+  const removePerson = (index: number) => {
+    setCards((current) => current.filter((_, at) => at !== index));
+    setErrors((current) => {
+      const cleared: FieldErrors = { ...current };
+      // Every message that named the card that just went, not only the ones
+      // still rendered at their old positions -- and the ones that moved up a
+      // slot, which are re-addressed by the cards that are still there. Leaving
+      // the removed card's errors behind puts a date-of-birth message under
+      // whichever person shifted up into the gap.
+      for (const field of DEPENDENT_FIELDS) {
+        delete cleared[dependentFieldName(index, field)];
+      }
+      return cleared;
+    });
+  };
 
   /**
    * The countdown to the consultation.
@@ -211,10 +292,7 @@ export default function IntakeForm({
     }
   };
 
-  const showError = (field: IntakeFieldName) => Boolean(errors[field]);
-
-  return (
-    // `main` with an id, because the skip link in the root layout points here
+  return (    // `main` with an id, because the skip link in the root layout points here
     // and because this is the page's only content: one form, on a page whose
     // whole interactive surface is that form.
     <main
@@ -544,6 +622,68 @@ export default function IntakeForm({
             </div>
 
             {/*
+              The household section. Last, after the account holder's own
+              questions, because it is the part most people do not need: a
+              patient booking for themselves should never have to scroll past
+              four other people to find the button.
+
+              A fieldset per person, so a screen reader announces "Person 2,
+              child" as a group rather than four unlabelled inputs in a row.
+            */}
+            <section
+              id="dependents"
+              aria-describedby={showError("dependents") ? errorId("dependents") : undefined}
+              className={`rounded-2xl border border-rule bg-surface-sunken p-4 sm:p-5 ${
+                showError("dependents") ? ERROR_BORDER : ""
+              }`}
+            >
+              <h2 className="text-sm font-bold text-ink">{t.household}</h2>
+              <p className="mt-1 text-xs leading-relaxed text-ink-muted">
+                {t.householdIntro}
+              </p>
+
+              {showError("dependents") && (
+                <p id={errorId("dependents")} className={ERROR_TEXT}>
+                  {errors.dependents}
+                </p>
+              )}
+
+              {cards.length > 0 && (
+                <p className="mt-3 text-xs font-medium text-ink-soft">
+                  {formatMessage(t.householdLimit, { count: MAX_HOUSEHOLD_SIZE })}
+                </p>
+              )}
+
+              <div className="mt-4 space-y-4">
+                {cards.map((card, index) => (
+                  <DependentCard
+                    key={card.key}
+                    index={index}
+                    onRemove={() => removePerson(index)}
+                    messages={t}
+                    errorFor={errorFor}
+                  />
+                ))}
+              </div>
+
+              {/*
+                Hidden once the cap is reached rather than disabled. A disabled
+                button with no explanation is a dead control; this one is simply
+                not there, and the limit is stated in words above so the absence
+                reads as a decision rather than a bug.
+              */}
+              {roomLeft !== null && (
+                <button
+                  type="button"
+                  onClick={addPerson}
+                  className="mt-4 w-full inline-flex items-center justify-center gap-2 border border-accent text-accent hover:bg-accent-soft font-semibold py-3 rounded-xl transition-colors cursor-pointer text-sm tracking-wide tap-target"
+                >
+                  {t.addPerson}
+                </button>
+              )}
+            </section>
+
+            {/*
               `disabled` rather than a click handler that ignores the second
               click: a disabled button is out of the tab order and out of the
               accessibility tree's reachable set, so a screen reader user is
@@ -598,6 +738,7 @@ export default function IntakeForm({
             <BookingConfirmation
               url={booked.url}
               appointmentId={booked.appointmentId}
+              people={people}
               remaining={remaining}
               staying={staying}
               onStay={() => setStaying(true)}
@@ -612,5 +753,150 @@ export default function IntakeForm({
         </div>
       </div>
     </main>
+  );
+}
+
+/**
+ * One other person in the booking.
+ *
+ * Its own component, so the account holder's form does not grow a second copy of
+ * every control and so this markup can be rendered to a string in a test -- which
+ * is the only way to check that a card's inputs are named the way the server's
+ * validation errors address them, and that two cards never share an id.
+ *
+ * It takes no state. Every input is uncontrolled and identified by its `name`,
+ * which is what lets a card be removed from the middle of a household without
+ * moving one person's text under another person's name: React reconciles the DOM
+ * node on `key`, and only the name it is submitted under changes.
+ *
+ * `errorFor` returns the message the server sent for one field on this card, or
+ * undefined. It is passed in rather than the whole error map so that this
+ * component cannot reach a field that is not on its own card, and it returns the
+ * text rather than a boolean because a control that is marked invalid with no
+ * message beside it tells a patient nothing about what to fix.
+ */
+export function DependentCard({
+  index,
+  onRemove,
+  messages: t,
+  errorFor,
+}: {
+  index: number;
+  onRemove: () => void;
+  messages: Messages;
+  errorFor: (index: number, field: DependentFieldName) => string | undefined;
+}) {
+  // The submitted name, and the DOM id the error summary links to. The two are
+  // the same string with the dots turned into dashes; see `fieldId` in
+  // ./formIssues, which is what the summary uses on the other side of that.
+  const name = (field: DependentFieldName) => dependentFieldName(index, field);
+  const id = (field: DependentFieldName) => fieldId(name(field));
+
+  const control = (field: DependentFieldName) => {
+    const message = errorFor(index, field);
+    return {
+      message,
+      "aria-invalid": message ? (true as const) : undefined,
+      "aria-describedby": message ? errorId(name(field)) : undefined,
+      className: `${CONTROL} ${message ? CONTROL_INVALID : ""}`,
+    };
+  };
+
+  return (
+    <fieldset className="rounded-xl border border-rule bg-surface p-4">
+      <legend className="px-1 text-xs font-bold uppercase tracking-wider text-ink-soft">
+        {formatMessage(t.personHeading, { number: index + 2 })}
+      </legend>
+
+      {/*
+        A real button rather than a checkbox or a swipe. Removing a person
+        discards what they typed, so it has to be a control that can be reached,
+        focused, and announced -- and it is a button so that a form submission
+        never picks it up as a value.
+      */}
+      <div className="mb-3 flex justify-end">
+        <button
+          type="button"
+          onClick={onRemove}
+          className="text-xs font-semibold text-danger hover:underline tap-target"
+        >
+          {t.removePerson}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label htmlFor={id("firstName")} className={LABEL}>
+            {t.firstName}
+          </label>
+          <input type="text" id={id("firstName")} name={name("firstName")} required dir="auto" {...control("firstName")} />
+          {errorFor(index, "firstName") && (
+            <p id={errorId(name("firstName"))} className={ERROR_TEXT}>
+              {errorFor(index, "firstName")}
+            </p>
+          )}
+        </div>
+
+        {/*
+          Not `required`, and labelled as optional. A child is usually recorded
+          under the account holder's surname, which is already on the form, and
+          the server accepts an absent one for the same reason.
+        */}
+        <div>
+          <label htmlFor={id("lastName")} className={LABEL}>
+            {t.dependentLastNameOptional}
+          </label>
+          <input type="text" id={id("lastName")} name={name("lastName")} dir="auto" {...control("lastName")} />
+          {errorFor(index, "lastName") && (
+            <p id={errorId(name("lastName"))} className={ERROR_TEXT}>
+              {errorFor(index, "lastName")}
+            </p>
+          )}
+        </div>
+
+        <div>
+          <label htmlFor={id("dob")} className={LABEL}>
+            {t.dob}
+          </label>
+          <input type="date" id={id("dob")} name={name("dob")} required {...control("dob")} />
+          {errorFor(index, "dob") && (
+            <p id={errorId(name("dob"))} className={ERROR_TEXT}>
+              {errorFor(index, "dob")}
+            </p>
+          )}
+        </div>
+
+        <div>
+          <label htmlFor={id("relationship")} className={LABEL}>
+            {t.dependentRelationship}
+          </label>
+          <select id={id("relationship")} name={name("relationship")} required {...control("relationship")}>
+            <option value="">{t.selectRelationship}</option>
+            {RELATIONSHIP_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {t[option.messageKey]}
+              </option>
+            ))}
+          </select>
+          {errorFor(index, "relationship") && (
+            <p id={errorId(name("relationship"))} className={ERROR_TEXT}>
+              {errorFor(index, "relationship")}
+            </p>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-4">
+        <label htmlFor={id("additionalInfo")} className={LABEL}>
+          {t.dependentReason}
+        </label>
+        <textarea id={id("additionalInfo")} name={name("additionalInfo")} rows={2} dir="auto" {...control("additionalInfo")} />
+        {errorFor(index, "additionalInfo") && (
+          <p id={errorId(name("additionalInfo"))} className={ERROR_TEXT}>
+            {errorFor(index, "additionalInfo")}
+          </p>
+        )}
+      </div>
+    </fieldset>
   );
 }

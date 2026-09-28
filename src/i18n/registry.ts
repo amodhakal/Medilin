@@ -1,4 +1,5 @@
 import type {
+  DependentRelationship,
   IntakeFormData,
   MedicalDepartment,
   SupportedLanguage,
@@ -87,6 +88,30 @@ const ENGLISH = {
   emailPlaceholder: "jordan.reyes@example.com",
   phonePlaceholder: "+1 (555) 019 2834",
   additionalInfoPlaceholder: "Describe your symptoms, or why you are coming in.",
+
+  // Household booking. A parent bringing a child, a partner booking for both of
+  // them, an adult child arranging a visit for a parent: the intake form used
+  // to have no way to say any of that, so the second person was either not
+  // mentioned or given a whole second appointment that had to be negotiated
+  // separately. See #69.
+  household: "Other people in this booking",
+  householdIntro:
+    "Booking for someone else? Add them below and give a reason for each visit, so the clinician can prepare for everyone.",
+  addPerson: "Add another person",
+  removePerson: "Remove this person",
+  personHeading: "Person {number}",
+  householdLimit: "You can add up to {count} other people to one booking.",
+  householdConfirmed:
+    "Booked for {count} people in total, including you. Everyone will join the same consultation.",
+  dependentLastNameOptional: "Last name (optional)",
+  dependentRelationship: "Relationship to you",
+  selectRelationship: "-- Select relationship --",
+  dependentReason: "Why are they coming in?",
+  relationshipChild: "Child",
+  relationshipSpouse: "Spouse or partner",
+  relationshipParent: "Parent",
+  relationshipSibling: "Sibling",
+  relationshipOther: "Other relative",
 } as const;
 
 /** Exported so a test can hold every language to the English key set. */
@@ -250,7 +275,25 @@ const DEFINITIONS = {
       emailPlaceholder: "jordan.reyes@ejemplo.com",
       phonePlaceholder: "+34 600 123 456",
       additionalInfoPlaceholder:
-        "Describe tus síntomas o el motivo de tu visita.",
+        "Describe sus síntomas o el motivo de su visita.",
+      household: "Otras personas en esta cita",
+      householdIntro:
+        "¿Reserva para otra persona? Añádala aquí e indique el motivo de cada visita para que el profesional pueda prepararse para todos.",
+      addPerson: "Añadir otra persona",
+      removePerson: "Quitar esta persona",
+      personHeading: "Persona {number}",
+      householdLimit: "Puede añadir hasta {count} personas más a una misma cita.",
+      householdConfirmed:
+        "Reservado para {count} personas en total, usted incluida. Todos participarán en la misma consulta.",
+      dependentLastNameOptional: "Apellido (opcional)",
+      dependentRelationship: "Relación contigo",
+      selectRelationship: "-- Seleccionar relación --",
+      dependentReason: "¿Por qué viene?",
+      relationshipChild: "Hija o hijo",
+      relationshipSpouse: "Cónyuge o pareja",
+      relationshipParent: "Madre o padre",
+      relationshipSibling: "Hermana o hermano",
+      relationshipOther: "Otro familiar",
     },
   },
   portuguese: {
@@ -314,6 +357,24 @@ const DEFINITIONS = {
       phonePlaceholder: "+55 11 91234 5678",
       additionalInfoPlaceholder:
         "Descreva seus sintomas ou o motivo da consulta.",
+      household: "Outras pessoas nesta consulta",
+      householdIntro:
+        "Está agendando para outra pessoa? Adicione abaixo e diga o motivo de cada consulta para que o profissional possa se preparar para todos.",
+      addPerson: "Adicionar outra pessoa",
+      removePerson: "Remover esta pessoa",
+      personHeading: "Pessoa {number}",
+      householdLimit: "Você pode adicionar até {count} outras pessoas a uma mesma consulta.",
+      householdConfirmed:
+        "Agendado para {count} pessoas ao todo, incluindo você. Todos participarão da mesma consulta.",
+      dependentLastNameOptional: "Sobrenome (opcional)",
+      dependentRelationship: "Relação com você",
+      selectRelationship: "-- Selecionar relação --",
+      dependentReason: "Por que estão vindo?",
+      relationshipChild: "Filha ou filho",
+      relationshipSpouse: "Cônjuge ou parceiro",
+      relationshipParent: "Mãe ou pai",
+      relationshipSibling: "Irmã ou irmão",
+      relationshipOther: "Outro familiar",
     },
   },
 
@@ -494,11 +555,25 @@ export function htmlLang(language: LanguageDefinition): string {
   return language.locale.split("-")[0];
 }
 
-export interface DepartmentOption {
+/**
+ * One entry in a dropdown: the value the server accepts, and the message that
+ * labels it.
+ *
+ * Generic over the value because there are now two such dropdowns with
+ * different value types, and a relationship list typed as a department list is a
+ * compile error waiting for someone to add "Dentist" to it.
+ */
+export interface ChoiceOption<T extends string> {
   /** Exactly the value the intake schema accepts. */
-  readonly value: MedicalDepartment;
+  readonly value: T;
   readonly messageKey: MessageKey;
 }
+
+/** @deprecated kept as the department-specific name; see ChoiceOption. */
+export type DepartmentOption = ChoiceOption<MedicalDepartment>;
+
+/** A relationship in the household dropdown. */
+export type RelationshipOption = ChoiceOption<DependentRelationship>;
 
 /**
  * The department dropdown, in the order the form shows it.
@@ -515,6 +590,34 @@ export const DEPARTMENT_OPTIONS: readonly DepartmentOption[] = [
   { value: "Pediatrician", messageKey: "pediatrician" },
   { value: "Psychiatrist", messageKey: "psychiatrist" },
   { value: "Other", messageKey: "other" },
+];
+
+/**
+ * How many other people one booking may carry, for the client.
+ *
+ * A literal rather than an import of the server's `MAX_DEPENDENTS`, for the same
+ * reason `DEPARTMENT_OPTIONS` holds literal values: this module reaches a
+ * browser and zod should not come with it. registry.test.ts asserts the two are
+ * equal, so a cap raised on the server without raising it here is a build
+ * failure rather than a form that quietly stops offering the last card.
+ */
+export const MAX_HOUSEHOLD_SIZE = 5;
+
+/**
+ * The relationship dropdown on a dependent's card.
+ *
+ * The same construction, and for the same reason: the values are the server's
+ * `DEPENDENT_RELATIONSHIPS` and the labels are this registry's messages.
+ * A relationship is a triage hint -- a clinician filtering a day by "is this a
+ * child" needs something they can match on -- so an open text field would be
+ * worse than useless.
+ */
+export const RELATIONSHIP_OPTIONS: readonly RelationshipOption[] = [
+  { value: "child", messageKey: "relationshipChild" },
+  { value: "spouse", messageKey: "relationshipSpouse" },
+  { value: "parent", messageKey: "relationshipParent" },
+  { value: "sibling", messageKey: "relationshipSibling" },
+  { value: "other", messageKey: "relationshipOther" },
 ];
 
 /**
@@ -546,6 +649,11 @@ export const FIELD_LABELS = {
   appointmentDateTime: "appointmentDateTime",
   medical_department: "whoToVisit",
   additionalInfo: "additionalInfo",
+  // The household as a whole. A rejection of the list itself -- too many
+  // people, or a list that is not a list -- lands here, and it has to be
+  // nameable or the message would have nowhere to go. The failures inside a
+  // person's card are labelled by DEPENDENT_FIELD_LABELS below.
+  dependents: "household",
 } as const satisfies Record<IntakeFieldName, MessageKey>;
 
 /** Every field a patient fills in, in the order the form shows them. */
@@ -559,4 +667,32 @@ export const INTAKE_FIELDS = [
   "appointmentDateTime",
   "medical_department",
   "additionalInfo",
+  "dependents",
 ] as const satisfies readonly IntakeFieldName[];
+
+/**
+ * The fields on one dependent's card, to the message that labels each.
+ *
+ * Separate from `FIELD_LABELS` because the two namespaces overlap but are not
+ * the same: `firstName` here is the child's first name and `firstName` there is
+ * the account holder's, and they are rendered on the same page at the same time.
+ * The keys are checked against the server's `dependentSchema` in
+ * registry.test.ts, so a field added to a dependent is a field that has to be
+ * labelable.
+ */
+export const DEPENDENT_FIELD_LABELS = {
+  firstName: "firstName",
+  lastName: "lastName",
+  dob: "dob",
+  relationship: "dependentRelationship",
+  additionalInfo: "dependentReason",
+} as const satisfies Record<string, MessageKey>;
+
+/** The keys of `DEPENDENT_FIELD_LABELS`, in the order a card renders them. */
+export const DEPENDENT_FIELDS = [
+  "firstName",
+  "lastName",
+  "dob",
+  "relationship",
+  "additionalInfo",
+] as const satisfies readonly (keyof typeof DEPENDENT_FIELD_LABELS)[];

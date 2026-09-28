@@ -26,6 +26,15 @@ export interface BookingConfirmationProps {
   remaining: number;
   /** Whether the patient has declined the automatic redirect. */
   staying: boolean;
+  /**
+   * How many people the booking is for, counting the account holder (#69).
+   *
+   * Defaults to one, and one renders exactly what it always did. A parent who
+   * added two children and was shown a confirmation naming one person has no way
+   * to tell whether the other two were dropped, and the next thing they do about
+   * that is submit the form again.
+   */
+  people?: number;
   onStay: () => void;
   onResume: () => void;
   messages: Messages;
@@ -37,6 +46,7 @@ export function BookingConfirmation({
   appointmentId,
   remaining,
   staying,
+  people = 1,
   onStay,
   onResume,
   messages: t,
@@ -84,6 +94,17 @@ export function BookingConfirmation({
       <p className="mt-6 font-mono text-xs text-ink-muted break-all">
         {t.reference}: {appointmentId}
       </p>
+
+      {/*
+        Only when there is more than one person, so a single-patient booking
+        renders byte-for-byte what it always did. Placed above the reference
+        because it is about what was booked, not about the link below.
+      */}
+      {people > 1 && (
+        <p className="mt-4 text-sm font-medium text-ink">
+          {formatMessage(t.householdConfirmed, { count: people })}
+        </p>
+      )}
 
       {/*
         The token itself, behind a disclosure. It is a bearer credential for the
