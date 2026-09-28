@@ -101,6 +101,16 @@ const serverEnvSchema = z.object({
   // to choose, and the instruction Twilio acts on is fetched from outside.
   TWILIO_CALLBACK_BASE_URL: z.string().min(1).optional(),
 
+  // Where a Twilio media stream is terminated (#3). A `wss://` URL owned by a
+  // long-lived service, not by this serverless application: a media stream is a
+  // WebSocket that stays open for the length of a call, and this deployment has
+  // no process to hold it. See src/lib/twilio/media-stream.ts for the whole
+  // argument, which is the same one #15 settled for the ElevenLabs socket.
+  //
+  // Unset is a working configuration, not a broken one: the clinic's line is then
+  // answered with a spoken greeting, which is a real telephone call.
+  TWILIO_MEDIA_STREAM_URL: z.string().min(1).optional(),
+
   // Webhook signing secrets (#65). Each is consulted only when its vendor's
   // signature header is present on an inbound /api/webhook request; when
   // unset, vendor verification for that vendor is skipped and the internal

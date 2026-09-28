@@ -101,3 +101,64 @@ function sanitiseClinicName(value: string): string {
 
   return cleaned === "" ? FALLBACK_CLINIC_NAME : cleaned;
 }
+
+/**
+ * Hand Twilio a socket rather than a sentence (#3).
+ *
+ * `<Connect><Stream>` is what makes this a conversation: Twilio opens the URL
+ * and every frame of the call's audio goes both ways through it, so the clinic
+ * is talking to the agent this application already runs rather than hearing a
+ * recording. The greeting above is the fallback for a deployment with no bridge,
+ * and the two are the same function of configuration.
+ *
+ * Two checks, both here rather than at the call site, because both are about
+ * what this document would do on a real call:
+ *
+ *   - The URL must be absolute `wss:`. A Stream pointed at `http:` is a call's
+ *     audio in plaintext, and `<Stream>` is the one TwiML verb in this
+ *     application that opens a connection rather than producing a sound.
+ *   - The attribute is escaped. A URL is not XML, and one carrying a quote would
+ *     otherwise be able to add a verb to the document -- which, on a call to a
+ *     clinic, is a thing worth being pedantic about.
+ *
+ * `track="both_tracks"` is stated rather than defaulted. A stream is inbound,
+ * outbound or both, and the default is a vendor-side value this application
+ * would rather not be wrong about: an inbound-only stream is a call the clinic
+ * can hear into and never answer.
+ *
+ * Throws on a URL it refuses. That is deliberate and is the opposite of the
+ * rule the rest of this file follows: the greeting has a safe fallback for every
+ * input, and this one does not. A caller that cannot build a stream URL has no
+ * call to place, and the error is a bug in the code above it rather than
+ * something a clinic's line should be connected to.
+ */
+export function buildMediaStreamTwiML({ streamUrl }: { streamUrl: string }): string {
+  if (typeof streamUrl !== "string" || !isAbsoluteWss(streamUrl)) {
+    throw new TwiMLBuildError("the stream URL is not an absolute wss URL");
+  }
+
+  return (
+    `${XML_DECLARATION}<Response><Connect>` +
+    `<Stream url="${escapeXml(streamUrl)}" track="both_tracks" />` +
+    `</Connect></Response>`
+  );
+}
+
+function isAbsoluteWss(value: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === "wss:" && parsed.hostname !== "";
+}
+
+/** A document this builder will not produce. See buildMediaStreamTwiML. */
+export class TwiMLBuildError extends Error {
+  constructor(reason: string) {
+    super(`TwiML refused: ${reason}`);
+    this.name = "TwiMLBuildError";
+  }
+}
+

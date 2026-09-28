@@ -42,17 +42,32 @@ import { getTwilioVoice } from "./voice";
  *
  * ## The part that is still a lie, and where it is fixed
  *
- * The time the patient is told was not agreed with anybody. It is the local
- * mock negotiation in ../_lib/schedule, which this branch does not touch, and it
- * is still what the confirmation says. So after this branch a real clinic line
- * rings for a booking whose time no human has seen. That is a deliberate
- * intermediate state -- the alternative is to ship a call that announces a slot
- * this application made up, which is worse -- and the branch above replaces the
- * greeting with a streamed conversation in which the slot is actually negotiated.
+ * The time the patient is told was not agreed with anybody. It is the local mock
+ * negotiation in ../_lib/schedule, which this branch does not touch, and it is
+ * still what the confirmation says. So after this branch a real clinic line
+ * rings for a booking whose time no human has seen.
+ *
+ * The branch stacked on this one makes the call a conversation -- the TwiML
+ * fetched at the answer URL becomes a media stream into the receptionist agent
+ * -- which is most of the way there, and not all of it: the agent negotiates a
+ * slot out loud and the result is not yet written back onto the appointment, so
+ * the email still carries the locally-negotiated time. That gap is named in
+ * @/lib/twilio/media-stream and is the next piece of #3, not something this
+ * module pretends to have solved.
  */
 
 /** The route Twilio fetches its instructions from. */
 export const CLINIC_CALL_ANSWER_PATH = "/api/twilio/voice/answer";
+
+/**
+ * The route Twilio posts what happened to the call to (#3).
+ *
+ * Two events are requested of Twilio -- `initiated` and `completed` -- rather
+ * than all four, because a call this application cannot influence is not four
+ * more requests to store. `initiated` is the record that a call exists;
+ * `completed` is the record that the bill has stopped.
+ */
+export const CLINIC_CALL_STATUS_PATH = "/api/twilio/voice/status";
 
 export type ClinicCallReport =
   | { status: "dialed"; sid: string; callStatus: string }
@@ -89,6 +104,8 @@ export async function dialClinic({
     return { status: "skipped", reason: "not_configured" };
   }
 
+  const statusUrl = `${voice.callbackBaseUrl}${CLINIC_CALL_STATUS_PATH}`;
+
   const budget = await reserveCallBudget();
   if (!budget.allowed) {
     logWarn("twilio.call_budget_exhausted", {
@@ -104,6 +121,13 @@ export async function dialClinic({
       to: voice.to,
       from: voice.from,
       twimlUrl: answerUrl,
+      // Without this the only honest statement this application can make about
+      // its own telephony is the one it made before the call. Omitted when the
+      // status route's URL is not one it will dial, which is the same rule the
+      // answer URL follows and for the same reason.
+      statusCallback: isSafeCallbackUrl(statusUrl)
+        ? statusUrl
+        : undefined,
     });
 
     // The status is Twilio's own word, which is the part worth having: `queued`

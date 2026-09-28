@@ -67,8 +67,9 @@ import { negotiateAppointmentTime } from "./schedule";
  * nobody's business in this branch and a clinic cannot be consulted from a pure
  * function. So the intermediate state is deliberate and stated rather than
  * hidden: a real call rings, and the time in the confirmation email is still one
- * this application made up. The branch stacked on top of this one is where the
- * call becomes a conversation that negotiates the slot.
+ * this application made up. The branch stacked on top of this one turns the call
+ * into a conversation, and is where the gap closes -- except that it does not
+ * fully, which the comment at the call site below says.
  */
 
 export interface Booking {
@@ -164,13 +165,13 @@ export async function bookAppointment(
     }));
   }
 
-  // The receptionist, or the log line that stood in for one (#64).
+  // The receptionist, or the log line that stood in for one (#64, #3).
   //
   // This was `logInfo("intake.booking_simulated")` and nothing else, which meant
   // a clinic's line was never telephoned: a patient was told their appointment
   // was confirmed by a system that had spoken to nobody. `dialClinic` places a
   // real Twilio call when the deployment has the credentials for one, and
-  // returns `simulated` -- the same log line, the same outcome, no network call
+  // reports `simulated` -- the same log line, the same outcome, no network call
   // -- when it does not, which is every deployment without a Twilio account
   // including this repository's CI.
   //
@@ -182,11 +183,17 @@ export async function bookAppointment(
   // function carries on to the confirmation, and the report lives in the log
   // rather than in a value that reaches a page a patient is looking at.
   //
-  // The negotiated time above is still this application's own decision, made in
-  // ./schedule, and no human has seen it. That is the state this branch is
-  // honest about rather than fixing here: the call rings, and the branch stacked
-  // on top is what the call negotiates.
+  // What the call does once it connects is decided by the TwiML at
+  // /api/twilio/voice/answer, not here: a streamed conversation with the
+  // receptionist agent where a bridge is configured, and a spoken greeting where
+  // one is not. The negotiated time above is still this application's own
+  // decision, made in ./schedule, and the conversation is not yet written back
+  // onto the appointment -- so the slot the patient is told about is still the
+  // one this application made up. That is the remaining gap in #3, it is named
+  // in @/lib/twilio/media-stream, and it is not something this function can fix
+  // without a record write on the path of a telephone call.
   const clinicCall = await dialClinic({ appointmentId: appointment.id });
+
   if (clinicCall.status === "failed") {
     // Already logged with its reason by dialClinic. Recorded here as a decision
     // rather than a surprise for whoever reads the log after an incident: a

@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { buildBookingGreetingTwiML, escapeXml, MAX_SAY_CHARACTERS } from "./twiml";
+import {
+  buildBookingGreetingTwiML,
+  buildMediaStreamTwiML,
+  escapeXml,
+  MAX_SAY_CHARACTERS,
+} from "./twiml";
 
 /**
  * The document a clinic's line speaks.
@@ -86,5 +91,57 @@ describe("buildBookingGreetingTwiML", () => {
 
     expect(spoken.startsWith("A".repeat(MAX_SAY_CHARACTERS))).toBe(true);
     expect(spoken).not.toContain("A".repeat(MAX_SAY_CHARACTERS + 1));
+  });
+});
+
+/**
+ * Handing Twilio a socket instead of a sentence (#3).
+ *
+ * `<Connect><Stream url>` is the difference between a clinic's line hearing a
+ * recorded greeting and a clinic receptionist having a conversation with the
+ * agent this application already runs. It is also a URL Twilio opens and
+ * follows for the length of a call, so the attribute is escaped and the builder
+ * takes the URL it was given rather than building one: deciding where the audio
+ * goes is ./media-stream's job, and it has already checked the scheme.
+ */
+describe("buildMediaStreamTwiML", () => {
+  const STREAM_URL = "wss://bridge.example/media?conversation=wss%3A%2F%2Fvendor%2Fx";
+
+  test("is a Stream inside a Connect inside a Response", () => {
+    const xml = buildMediaStreamTwiML({ streamUrl: STREAM_URL });
+
+    expect(xml.startsWith('<?xml version="1.0" encoding="UTF-8"?>')).toBe(true);
+    expect(xml).toContain("<Connect>");
+    expect(xml).toContain("<Stream ");
+    expect(xml).toContain("</Connect></Response>");
+  });
+
+  test("carries the stream URL it was given, unaltered", () => {
+    const xml = buildMediaStreamTwiML({ streamUrl: STREAM_URL });
+
+    expect(xml).toContain(`url="${STREAM_URL}"`);
+  });
+
+  test("asks for both directions, because a conversation needs both", () => {
+    // Spelled out rather than left to the default: an inbound-only stream is a
+    // call the clinic can hear into and never answer, and the default is a
+    // vendor-side value this application would rather not be wrong about.
+    expect(buildMediaStreamTwiML({ streamUrl: STREAM_URL })).toContain('track="both_tracks"');
+  });
+
+  test("escapes a URL that would otherwise close the attribute", () => {
+    const xml = buildMediaStreamTwiML({ streamUrl: 'wss://bridge.example/"><Say>hi</Say>' });
+
+    expect(xml).toContain("&quot;&gt;&lt;Say&gt;hi&lt;/Say&gt;");
+    expect(xml).not.toContain('"><Say>');
+  });
+
+  test("refuses a stream URL that is not one", () => {
+    // A Stream pointed at http is a call's audio in plaintext, and a builder
+    // that would emit it anyway is a builder that has to be trusted not to be
+    // handed one -- so the check is here, next to the escaping.
+    for (const streamUrl of ["", "http://bridge.example/media", "/media", "wss://"]) {
+      expect(() => buildMediaStreamTwiML({ streamUrl })).toThrow();
+    }
   });
 });

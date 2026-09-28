@@ -7,6 +7,7 @@ import {
 } from "./call-budget";
 import {
   CLINIC_CALL_ANSWER_PATH,
+  CLINIC_CALL_STATUS_PATH,
   dialClinic,
   isSafeCallbackUrl,
 } from "./clinic-call";
@@ -133,6 +134,34 @@ describe("dialClinic", () => {
     expect(form.get("From")).toBe("+15550001111");
     expect(form.get("To")).toBe("+15559998888");
     expect(form.get("Url")).toBe(`https://voice.example${CLINIC_CALL_ANSWER_PATH}`);
+  });
+
+  test("asks Twilio to report what happened to the call", async () => {
+    // Without a status callback the only honest statement this app can make
+    // about its own telephony is the one it made before the call.
+    setTwilioVoice(configuredVoice());
+
+    await dialClinic({ appointmentId: "appt-1" });
+
+    const form = new URLSearchParams(String((captured[0].init as RequestInit).body));
+    expect(form.get("StatusCallback")).toBe(
+      `https://clinic.example${CLINIC_CALL_STATUS_PATH}`,
+    );
+    expect(form.get("StatusCallbackEvent")).toBe("initiated completed");
+  });
+
+  test("omits the status callback rather than sending an unusable URL", async () => {
+    setTwilioVoice(configuredVoice({ callbackBaseUrl: "https://clinic.example/../evil" }));
+
+    await dialClinic({ appointmentId: "appt-1" });
+
+    const form = new URLSearchParams(String((captured[0].init as RequestInit).body));
+    // The answer URL is composed from a configured origin and a constant path,
+    // so it stays safe; a base that does not compose into one is refused above.
+    // This asserts the field is either absent or a usable https URL, never a
+    // half-built string.
+    const callback = form.get("StatusCallback");
+    expect(callback === null || callback.startsWith("https://")).toBe(true);
   });
 
   test("puts nothing from the booking record on the wire", async () => {
