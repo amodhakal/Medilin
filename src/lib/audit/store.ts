@@ -50,6 +50,19 @@ export const AUDIT_REASONS = [
   // auditor asking "who cancelled this?" should not have to answer "someone
   // with a bearer token, and the trail does not say which kind".
   "patient_link",
+  // #63. Somebody with the internal shared secret opened the clinic dashboard
+  // and every record on the page came back. Its own reason because `internal_api`
+  // is what the webhook, the audit log and the status lookup all say, and a
+  // dashboard read is the one access in this application that is a *bulk* read:
+  // twenty patients' records at once, none of them individually requested. An
+  // auditor asking who pulled up forty accounts cannot be answered by a trail
+  // where those reads are filed as forty unrelated webhook calls.
+  //
+  // It names the surface and not a person, because there is no person to name --
+  // the gate is one shared secret. That limitation is the point of this entry
+  // existing: it makes the access visible even though the access cannot be
+  // attributed.
+  "clinician_dashboard",
 ] as const;
 
 export type AuditReason = (typeof AUDIT_REASONS)[number];
@@ -83,6 +96,13 @@ export const AUDIT_ACTIONS = [
   // "who cancelled this?" with no account of the twenty failed attempts on the
   // same record that week.
   "APPOINTMENT_ACTION_REFUSED",
+  // #63. One page of the clinic dashboard. Its own action for the same reason
+  // `patient_link` is its own reason: a trail is append-only, and a read that
+  // happened twenty times over cannot honestly be filed as a `PHI_READ` that a
+  // reader has to reconstruct. The page is the unit an auditor would ask about
+  // -- "who looked at a list of accounts on Tuesday" -- so it is the unit
+  // recorded.
+  "CLINIC_SCHEDULE_READ",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

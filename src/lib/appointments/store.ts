@@ -282,6 +282,48 @@ export interface AppointmentStore {
   listByStatus(statuses: readonly AppointmentStatus[], limit: number): Promise<Appointment[]>;
 
   /**
+   * One page of the same window, starting at `offset`, in booking order.
+   *
+   * Arrived with the clinic dashboard (#63), and it exists only because
+   * `listByStatus` has no way to say "and now the next twenty".
+   *
+   * The awkward options were all worse. Scanning the prefix again and dropping
+   * `offset` rows would decrypt the same records on every page, so paging would
+   * cost more the further in you went. Growing `listByStatus` with an offset
+   * parameter would change the signature the reminder job already calls, for a
+   * method whose whole job is "everything due, bounded", and a reminder run
+   * does not page. A second data source -- a search index, a second table -- was
+   * never on the table, because the record is the record.
+   *
+   * **The order is booking order, total and stable, and that is a requirement
+   * rather than a detail.** `created_at ASC, id ASC`: the id tiebreak is what
+   * makes the order total. Offset paging over an order that is not total skips
+   * and repeats rows -- two appointments created in the same millisecond have
+   * no defined order, so page two can begin with a row page one already showed,
+   * and a clinician reading a day list sees a patient appear twice and another
+   * vanish. Both implementations have to agree on the tiebreak for that to hold,
+   * which is why it is spelled out here rather than left to each sort.
+   *
+   * **Still not ordered by appointment time**, and `listByStatus` says why: the
+   * time is inside the ciphertext, so there is no column to range-scan and no
+   * ordering key to sort on. A clinic sees booking order, and the caller sorts
+   * the page it was given by the time the patient asked for. The fix at scale is
+   * the same named one as on `listByStatus`: a plaintext `starts_at` column
+   * written alongside the record, which this repository has decided not to add.
+   *
+   * `limit` and `offset` are clamped rather than trusted, and both
+   * implementations clamp them the same way. A negative offset must never become
+   * a negative array index -- in JavaScript that is counted from the end of the
+   * list, and the store would answer with the newest records for a caller that
+   * asked for none.
+   */
+  listPage(
+    statuses: readonly AppointmentStatus[],
+    limit: number,
+    offset: number,
+  ): Promise<Appointment[]>;
+
+  /**
    * Claim a one-shot key, and report whether this caller won it.
    *
    * The primitive behind "do not send this twice", and it is a claim rather than

@@ -565,3 +565,166 @@ export async function listReminderCandidates(
 export async function claimReminder(appointmentId: string): Promise<boolean> {
   return getAppointmentStore().claimOnce("reminder", appointmentId);
 }
+
+/*
+ * ---------------------------------------------------------------------------
+ * The clinic dashboard (#63)
+ * ---------------------------------------------------------------------------
+ *
+ * The only reader in this application that shows a clinician everything a record
+ * holds, and the first time a caller has wanted the *list* rather than one
+ * appointment. It is here, in the facade, for the reason the other five families
+ * are here: a reader added later is audited by existing rather than by
+ * remembering. Whoever builds the next surface over this data gets the trail for
+ * free, and cannot opt out of it.
+ *
+ * The PHI difference from `/track` is the point of the feature and is not
+ * something to be reconciled later. `/track` decrypts the same record and shows
+ * four fields, because that link is designed to be forwarded by accident. A
+ * clinician in a consulting room needs the name, the date of birth, the contact
+ * details, the insurance answer, the department, the language an interpreter is
+ * needed for, and the patient's own account of why they are here. Both are
+ * correct; they are different surfaces and the code that decides which is which
+ * is `src/lib/clinic/schedule-view.ts`, which is an allowlist in the opposite
+ * direction and says so.
+ */
+
+/**
+ * The statuses a clinic's working list is made of.
+ *
+ * The same two values as `REMINDABLE_STATUSES`, and deliberately its own
+ * constant rather than a reuse: reminder eligibility and "still needs to happen"
+ * are different questions that happen to agree today, and a change to one should
+ * be a decision about the other rather than a side effect.
+ */
+export const CLINIC_SCHEDULE_STATUSES: readonly Appointment["status"][] = [
+  "scheduled",
+  "confirmed",
+];
+
+/** How many records one dashboard page opens by default, and at most. */
+export const CLINIC_PAGE_SIZE = 20;
+
+/**
+ * The furthest this dashboard will page.
+ *
+ * A cap on how many records a single surface will open, not on how many exist.
+ * A deep `OFFSET` in Postgres is a scan that throws away everything before it, so
+ * the tenth page costs more than the first and the thousandth costs more still,
+ * and the honest thing at that point is to refuse rather than to be slow. A real
+ * clinic with more live appointments than this needs a scheduling column and a
+ * range scan, which is the named next step on `listPage` -- not a bigger number
+ * here.
+ */
+export const CLINIC_MAX_OFFSET = 200;
+
+export interface ClinicSchedulePage {
+  /** The records on this page, in booking order. Opened: the store has decrypted them. */
+  appointments: Appointment[];
+  /** Where this page actually started, which is not necessarily where it was asked to. */
+  offset: number;
+  /** The page size in force, after clamping. */
+  limit: number;
+  /** Where the next page starts, or `null` when this is the last one. */
+  nextOffset: number | null;
+  /**
+   * True when the clinic has appointments this dashboard will not show.
+   *
+   * Reported rather than absorbed, and it is the same argument as
+   * `ReminderCandidates.truncated`: a list that stops without saying so looks
+   * exactly like a clinic whose last booking was this morning, and the symptom
+   * of getting it wrong is a patient who turned up for a missed appointment.
+   */
+  truncated: boolean;
+}
+
+export interface ClinicScheduleQuery {
+  /** Page size. Clamped to `[1, CLINIC_PAGE_SIZE]`. */
+  limit?: number;
+  /** Where to start. Clamped to the end of the ceiling. */
+  offset?: number;
+}
+
+/**
+ * One page of the clinic's list, and an entry in the trail for every record on it.
+ *
+ * **`actor` is required, for the reason `getAppointment`'s is.** A dashboard is
+ * a bulk read -- twenty patients' records in one request -- and the actor is the
+ * only field in the trail that says who asked. It is not defaulted, because a
+ * default is what a new caller forgets and the trail then attributes a read to
+ * `system`, which is a thing that reads no records at all.
+ *
+ * What the route passes is `AUDIT_ACTORS.internalApi`, and that is the whole of
+ * what it means: somebody holding the shared secret. This application has no
+ * clinician accounts, so the trail can say that a dashboard was opened and when,
+ * and cannot say by whom. That is a real gap in a real control and it is stated
+ * here rather than implied by a role name that sounds like a person.
+ *
+ * **Bounded twice, on purpose.** `limit` is clamped to `CLINIC_PAGE_SIZE` so a
+ * query string cannot ask for the whole clinic, and the offset is clamped to
+ * `CLINIC_MAX_OFFSET` so it cannot ask for a scan. Both clamps report
+ * `truncated: true` rather than quietly answering with a short list, because a
+ * silently truncated list is indistinguishable from a quiet clinic.
+ *
+ * **The read is one over the page size.** That is the same trick
+ * `listReminderCandidates` uses and the same reason: `truncated` should be a fact
+ * and not an inference from a full page. It costs one extra decrypted record and
+ * buys an honest answer about whether there is more.
+ *
+ * **The audit entries are written after the read, one per record, and the whole
+ * call throws if they cannot be written.** Failing closed matters more on this
+ * path than on any other in the file: a single-record read that cannot be logged
+ * leaks one record, and this leaks the page. A caller that caught the error and
+ * re-read through `getAppointment` per id would have the same records and no
+ * record of having asked, which is the failure the trail exists to prevent.
+ *
+ * Cancelled and completed appointments are excluded by the store, in the status
+ * filter, so no caller can be handed one by passing a different list.
+ */
+export async function listClinicSchedule(
+  actor: string,
+  options: ClinicScheduleQuery = {},
+): Promise<ClinicSchedulePage> {
+  const limit = clamp(options.limit ?? CLINIC_PAGE_SIZE, 1, CLINIC_PAGE_SIZE);
+  const requested = clamp(options.offset ?? 0, 0, Number.MAX_SAFE_INTEGER);
+  // Clamped against the limit as well as the ceiling, so the page a caller is
+  // shown can never start beyond it and the next page is always a page this
+  // function would agree to serve.
+  const offset = Math.min(requested, Math.max(0, CLINIC_MAX_OFFSET - limit));
+
+  const opened = await getAppointmentStore().listPage(
+    CLINIC_SCHEDULE_STATUSES,
+    limit + 1,
+    offset,
+  );
+
+  for (const appointment of opened.slice(0, limit)) {
+    await recordAuditEvent({
+      actor,
+      action: "CLINIC_SCHEDULE_READ",
+      resource: appointmentResource(appointment.id),
+      details: { reason: "clinician_dashboard", status: appointment.status },
+    });
+  }
+
+  const atCeiling = offset + limit >= CLINIC_MAX_OFFSET;
+  const truncated = opened.length > limit || offset < requested || atCeiling;
+
+  return {
+    appointments: opened.slice(0, limit),
+    offset,
+    limit,
+    // No next page once the ceiling is reached, even where `truncated` is true.
+    // The alternative is a Next link to an offset this function clamps straight
+    // back to this page: a pager that shows the same twenty patients for ever,
+    // which is worse than a list that stops and says so.
+    nextOffset: truncated && !atCeiling ? offset + limit : null,
+    truncated,
+  };
+}
+
+/** A number inside `[min, max]`, with a non-number read as the minimum. */
+function clamp(value: number, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return min;
+  return Math.min(Math.max(Math.trunc(value), min), max);
+}

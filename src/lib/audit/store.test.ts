@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  AUDIT_ACTIONS,
   AUDIT_ACTORS,
+  AUDIT_REASONS,
   AuditDetailsError,
   assertAuditDetails,
   buildEntry,
@@ -238,5 +240,45 @@ describe("the hash chain", () => {
 describe("appointmentResource", () => {
   test("has one format, so entries about an appointment can be joined", () => {
     expect(appointmentResource("abc")).toBe("appointment:abc");
+  });
+});
+
+// The two members the clinic dashboard (#63) added to the closed sets.
+//
+// Both are additions rather than a reuse, and the reuse is what had to be argued
+// against: a dashboard read could be filed as `PHI_READ` / `internal_api`, which
+// is what every other caller holding the secret does. That would be accurate and
+// useless -- a dashboard is a *bulk* read of many patients' records at once, and
+// an auditor asking "who pulled up a list of forty accounts, and when?" cannot
+// be answered by a trail in which those forty reads are interleaved with the
+// webhook's.
+//
+// The cost of growing a closed set is that it has to be argued for in a diff,
+// which is exactly what these two lines are.
+describe("the closed sets, extended for the clinic dashboard", () => {
+  test("a dashboard read is its own action rather than a generic PHI_READ", () => {
+    expect(AUDIT_ACTIONS).toContain("CLINIC_SCHEDULE_READ");
+  });
+
+  test("and its own reason", () => {
+    expect(AUDIT_REASONS).toContain("clinician_dashboard");
+  });
+
+  test("the reason survives the details check, so the entry can actually be written", () => {
+    // The runtime check in `assertAuditDetails` is the one that would refuse it,
+    // and `recordAuditEvent` throws on a refused reason -- so a reason that is
+    // not in `DETAIL_KEYS`'s value set is a dashboard that cannot be audited,
+    // which is a dashboard that fails closed on every request.
+    expect(
+      assertAuditDetails({ reason: "clinician_dashboard", status: "scheduled" }),
+    ).toEqual({ reason: "clinician_dashboard", status: "scheduled" });
+  });
+
+  test("still carries no PHI: the set of keys has not grown", () => {
+    // The reason says which surface; it must never carry who looked, because
+    // there is no clinician identity in this application to carry.
+    expect(() =>
+      assertAuditDetails({ reason: "clinician_dashboard", clinician: "Dr Smith" } as never),
+    ).toThrow(AuditDetailsError);
   });
 });
