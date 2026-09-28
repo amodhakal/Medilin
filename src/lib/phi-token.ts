@@ -1,6 +1,7 @@
 import "server-only";
 
 import * as crypto from "crypto";
+import { AUDIT_ACTORS } from "@/lib/audit";
 import { getAppointment, isDurableAppointmentStore } from "@/lib/appointments";
 import { ALGORITHM, IV_LENGTH, getMasterKey } from "./encryption";
 
@@ -162,12 +163,28 @@ export function sealReference(appointmentId: string): string {
  * A cancelled appointment still resolves. The record is still the patient's, the
  * status is on the record, and a link that stopped working the moment someone
  * cancelled would tell a patient their request had vanished.
+ *
+ * A version 1 token is not audited. The record comes out of the ciphertext, so
+ * there is no store read to attribute, and no appointment id to attribute it to.
+ * That gap closes with itself: version 2 tokens exist only when the durable
+ * store does, and in that configuration every read of a record goes through the
+ * store and is recorded. Links minted before the database was configured stay
+ * unaudited until they expire, which is another reason #59 should give tokens a
+ * lifetime.
  */
 export async function resolveRecord(token: string): Promise<string | null> {
   if (token.startsWith(REFERENCE_PREFIX)) {
     if (!REFERENCE_PATTERN.test(token)) return null;
 
-    const appointment = await getAppointment(token.slice(REFERENCE_PREFIX.length));
+    // `linkBearer` because that is genuinely all the trail can know: this is a
+    // bearer link with no account behind it, and the pages cannot tell each other
+    // apart from in here. Telling a patient's own read from the demo operator's
+    // is a property of the token, and a token that carries a purpose and an
+    // expiry is what #59 needs anyway.
+    const appointment = await getAppointment(
+      token.slice(REFERENCE_PREFIX.length),
+      AUDIT_ACTORS.linkBearer,
+    );
     return appointment ? JSON.stringify(appointment.patientInfo) : null;
   }
 

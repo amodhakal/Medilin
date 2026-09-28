@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { InMemoryAuditLogStore, setAuditLogStore } from "@/lib/audit";
 import { resetServerEnvCache } from "@/lib/env";
 import { setLlmClient } from "@/lib/gemini";
 import type { IntakeFormData } from "@/lib/validation/intake";
@@ -64,6 +65,7 @@ beforeEach(() => {
   resendStatus = 200;
   emails = [];
   stubModel();
+  setAuditLogStore(new InMemoryAuditLogStore());
 
   globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body)) as { to: string[]; subject: string };
@@ -160,4 +162,53 @@ describe("bookAppointment", () => {
     expect(result).not.toHaveProperty("spectateUrl");
   });
 
+  test("a booking is in the audit trail, and carries no part of the record", async () => {
+    // The write path is audited by the store rather than by this function, which
+    // is the point: a booking cannot happen without leaving an entry, and a
+    // caller added later cannot skip it.
+    const trail = new InMemoryAuditLogStore();
+    setAuditLogStore(trail);
+
+    const booking = await bookAppointment(submission, "https://clinic.test");
+    const logs = await trail.read();
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0].action).toBe("APPOINTMENT_CREATED");
+    expect(logs[0].resource).toBe(`appointment:${booking.appointmentId}`);
+    expect(logs[0].details).toEqual({
+      reason: "intake",
+      status: "scheduled",
+      language: "spanish",
+    });
+
+    // The trail is immutable and cannot be redacted, so what is in it has to be
+    // the appointment id and three non-identifying fields.
+    const serialised = JSON.stringify(logs);
+    for (const leak of ["Ada", "Lovelace", "ada@example.test", "dolor de cabeza", "1985-12-10"]) {
+      expect(serialised).not.toContain(leak);
+    }
+  });
+
+  test("a booking that cannot be audited does not happen", async () => {
+    // Fail closed, and the fail-closed side that is not a crypto key: no trail
+    // entry means no appointment, rather than an appointment nobody can account
+    // for. The submission is still translated and the confirmation still goes
+    // nowhere, because the record is stored before the email is sent.
+    setAuditLogStore({
+      async append() {
+        throw new Error("The database could not be reached.");
+      },
+      async read() {
+        return [];
+      },
+      async verify() {
+        return true;
+      },
+    });
+
+    await expect(bookAppointment(submission, "https://clinic.test")).rejects.toThrow(
+      /could not be reached/,
+    );
+    expect(emails).toEqual([]);
+  });
 });

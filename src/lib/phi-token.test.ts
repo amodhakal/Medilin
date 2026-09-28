@@ -7,7 +7,9 @@ import {
   sealReference,
 } from "./phi-token";
 import { InMemoryAppointmentStore, PostgresAppointmentStore, setAppointmentStore } from "./appointments";
+import { InMemoryAuditLogStore, setAuditLogStore } from "./audit";
 import { resetServerEnvCache } from "./env";
+import { encryptPHI } from "./encryption";
 import type { SqlClient } from "./storage";
 import type { AppointmentRecord } from "./validation/intake";
 
@@ -64,12 +66,15 @@ const APPOINTMENT_ID = "3f7c1e2a-9b4d-4c58-8a61-2d0e7b5f9c34";
  */
 function durableStore(): SqlClient {
   const answer = (sql: string, params: readonly unknown[]): unknown[] => {
-    if (sql.includes("CREATE TABLE")) return [];
+    if (sql.includes("CREATE TABLE") || sql.includes("COMMENT ON")) return [];
     if (sql.includes("SELECT") && params[0] === APPOINTMENT_ID) {
       return [
         {
           id: APPOINTMENT_ID,
-          patient_info: patientRecord,
+          // What the column actually holds: an envelope, not a record. Sealed
+          // here rather than at module scope, so the key set in beforeAll is the
+          // one in use.
+          patient_info: encryptPHI(JSON.stringify(patientRecord)),
           status: "scheduled",
           conversation_ended: false,
           created_at: "2026-09-01T10:00:00.000Z",
@@ -88,8 +93,16 @@ function durableStore(): SqlClient {
   };
 }
 
+// A reference is resolved through `getAppointment`, which writes a PHI_READ
+// entry on the way out, so a trail has to exist for the reference tests to mean
+// anything. A fresh one per test keeps the assertions about tokens.
 afterEach(() => {
   setAppointmentStore(null);
+  setAuditLogStore(new InMemoryAuditLogStore());
+});
+
+beforeAll(() => {
+  setAuditLogStore(new InMemoryAuditLogStore());
 });
 
 describe("sealRecord", () => {

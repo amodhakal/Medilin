@@ -1,4 +1,5 @@
 import { SqlError, type SqlClient } from "@/lib/storage";
+import { decryptPHI, encryptPHI, type EncryptedEnvelope } from "@/lib/encryption";
 import { isAppointmentStatus, type Appointment, type AppointmentPatch, type AppointmentStore } from "./store";
 import type { AppointmentRecord } from "@/lib/validation/intake";
 
@@ -11,6 +12,24 @@ import type { AppointmentRecord } from "@/lib/validation/intake";
  * link stopped resolving, and the clinic had a booking it could not find.
  *
  * Design notes that a reviewer should not have to reverse-engineer.
+ *
+ * **The record is envelope-encrypted on the way in and opened on the way out.**
+ * The `AppointmentStore` interface is in plaintext -- booking, the status API and
+ * the sealed token all work with a record, not with ciphertext -- and this class
+ * is the one place that knows the difference. Encrypting here rather than in the
+ * booking path means no caller can forget: a new caller gets encryption by
+ * calling `create`, exactly as it gets persistence by calling `create`.
+ *
+ * `encryptPHI` is the envelope in ../encryption -- a fresh DEK per record, the
+ * plaintext under the DEK, the DEK wrapped under `HIPAA_MASTER_KEY` -- and it
+ * fails closed. A deployment with a database and no master key cannot book, and
+ * that is the correct outcome: the alternative is a table of plaintext records
+ * that nobody was warned about.
+ *
+ * The in-memory store does not encrypt, and neither should it. Process memory is
+ * not "at rest", the key would be in the same process as the plaintext, and the
+ * default configuration has to work with no database and no ceremony. Encrypting
+ * there would be the appearance of a control rather than one.
  *
  * **The identifier column is `text`, not `uuid`.** It is tempting to type it
  * `uuid`, and against a `uuid` column a lookup for `"not-a-uuid"` is a cast
@@ -50,7 +69,7 @@ export class PostgresAppointmentStore implements AppointmentStore {
        RETURNING ${COLUMNS}`,
       [
         appointment.id,
-        JSON.stringify(appointment.patientInfo),
+        seal(appointment.patientInfo),
         appointment.status,
         appointment.conversationEnded,
         appointment.createdAt.toISOString(),
@@ -97,7 +116,7 @@ export class PostgresAppointmentStore implements AppointmentStore {
         RETURNING ${COLUMNS}`,
       [
         id,
-        patch.patientInfo === undefined ? null : JSON.stringify(patch.patientInfo),
+        patch.patientInfo === undefined ? null : seal(patch.patientInfo),
         patch.status ?? null,
         patch.conversationEnded ?? null,
       ],
@@ -153,7 +172,67 @@ export class PostgresAppointmentStore implements AppointmentStore {
           CHECK (status IN ('scheduled', 'confirmed', 'cancelled', 'completed'))
       )
     `);
+
+    // Declared rather than left to be inferred, because the column name says what
+    // it holds and not how. Anyone reading the schema, or querying the table
+    // directly, should not have to know which writer put what in it.
+    await this.sql.query(`
+      COMMENT ON COLUMN appointments.patient_info IS
+        'Envelope-encrypted patient record (AES-256-GCM under a per-record DEK wrapped by HIPAA_MASTER_KEY). Ciphertext, not plaintext.'
+    `);
   }
+}
+
+/**
+ * Encrypt a record for storage.
+ *
+ * The envelope is stored as a single jsonb object rather than spread over six
+ * columns: it is one value with one lifecycle, a round trip through Postgres
+ * cannot leave half of it behind, and a `SELECT *` cannot accidentally select
+ * the ciphertext without its auth tag.
+ */
+function seal(patientInfo: AppointmentRecord): string {
+  return JSON.stringify(encryptPHI(JSON.stringify(patientInfo)));
+}
+
+/** Open a stored record. Throws rather than returning a partial record. */
+function open(sealed: unknown): AppointmentRecord {
+  return JSON.parse(decryptPHI(toEnvelope(sealed))) as AppointmentRecord;
+}
+
+/**
+ * Narrow the stored jsonb to an envelope.
+ *
+ * Every field is checked, because `decryptPHI` reads all six and would fail on a
+ * missing one with a `Buffer.from(undefined)` that says nothing about which
+ * column is wrong. A row that is not an envelope is a record this code cannot
+ * read, and the honest answer is to say so rather than to return `undefined` and
+ * let a patient be told they have no appointment.
+ */
+function toEnvelope(value: unknown): EncryptedEnvelope {
+  const parsed = typeof value === "string" ? safeParse(value) : value;
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("appointments row: patient_info is not a JSON object");
+  }
+
+  const source = parsed as Record<string, unknown>;
+  const fields = [
+    "ciphertext",
+    "encryptedDEK",
+    "iv",
+    "dekIv",
+    "authTag",
+    "dekAuthTag",
+  ] as const;
+
+  for (const field of fields) {
+    if (typeof source[field] !== "string" || source[field] === "") {
+      throw new Error(`appointments row: patient_info is missing ${field}`);
+    }
+  }
+
+  return source as unknown as EncryptedEnvelope;
 }
 
 const COLUMNS =
@@ -193,22 +272,12 @@ export function toAppointment(row: AppointmentRow): Appointment {
 
   return {
     id: row.id,
-    patientInfo: toPatientRecord(row.patient_info),
+    patientInfo: open(row.patient_info),
     status: row.status,
     conversationEnded: row.conversation_ended,
     createdAt: toDate(row.created_at, "created_at"),
     updatedAt: toDate(row.updated_at, "updated_at"),
   };
-}
-
-function toPatientRecord(value: unknown): AppointmentRecord {
-  const parsed = typeof value === "string" ? safeParse(value) : value;
-
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("appointments row: patient_info is not a JSON object");
-  }
-
-  return parsed as AppointmentRecord;
 }
 
 function safeParse(value: string): unknown {

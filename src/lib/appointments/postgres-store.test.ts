@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { SqlError, type SqlClient } from "@/lib/storage";
+import { encryptPHI, type EncryptedEnvelope } from "@/lib/encryption";
 import { PostgresAppointmentStore } from "./postgres-store";
 import type { Appointment } from "./store";
 import type { AppointmentRecord } from "../validation/intake";
@@ -35,10 +36,33 @@ const PATIENT: AppointmentRecord = {
 const CREATED_AT = "2026-09-01T10:00:00.000Z";
 const UPDATED_AT = "2026-09-02T11:30:00.000Z";
 
+// Set at module scope because the fixture rows are sealed records: what a row
+// holds is ciphertext, and building one needs a key. The "no key" tests below
+// delete it and restore it in afterEach.
+const KEY = "a".repeat(64);
+const savedMasterKey = process.env.HIPAA_MASTER_KEY;
+process.env.HIPAA_MASTER_KEY = KEY;
+
+// The "no key" cases below delete it deliberately, and every other test in this
+// file needs it back afterwards to build a sealed fixture row.
+afterEach(() => {
+  process.env.HIPAA_MASTER_KEY = KEY;
+});
+
+afterAll(() => {
+  if (savedMasterKey === undefined) delete process.env.HIPAA_MASTER_KEY;
+  else process.env.HIPAA_MASTER_KEY = savedMasterKey;
+});
+
+/** The shape a stored record has: an envelope, not a record. */
+function sealed(patientInfo: AppointmentRecord): EncryptedEnvelope {
+  return encryptPHI(JSON.stringify(patientInfo));
+}
+
 function row(overrides: Record<string, unknown> = {}) {
   return {
     id: "a1",
-    patient_info: PATIENT,
+    patient_info: sealed(PATIENT),
     status: "scheduled",
     conversation_ended: false,
     created_at: CREATED_AT,
@@ -84,6 +108,12 @@ function fakeDatabase(handlers: Record<string, Handler>): FakeDatabase {
       params: readonly unknown[] = [],
     ): Promise<T[]> {
       statements.push({ sql: statement, params });
+
+      // Schema bootstrap: answered for every test so that adding a DDL statement
+      // does not mean editing twenty handler maps.
+      if (statement.includes("CREATE TABLE") || statement.includes("COMMENT ON")) {
+        return [];
+      }
 
       for (const [fragment, handler] of Object.entries(handlers)) {
         if (statement.includes(fragment)) return handler(statement, params) as T[];
@@ -164,13 +194,18 @@ describe("PostgresAppointmentStore", () => {
       await new PostgresAppointmentStore(sql).create(appointment());
 
       const insert = statements.find((s) => s.sql.includes("INSERT"))!;
-      expect(insert.params).toEqual([
-        "a1",
-        JSON.stringify(PATIENT),
-        "scheduled",
-        false,
-        CREATED_AT,
-        UPDATED_AT,
+      // The second parameter is the envelope, not the record: see "PHI at rest".
+      expect(insert.params[0]).toBe("a1");
+      expect(insert.params[2]).toBe("scheduled");
+      expect(insert.params[3]).toBe(false);
+      expect(insert.params.slice(4)).toEqual([CREATED_AT, UPDATED_AT]);
+      expect(Object.keys(JSON.parse(String(insert.params[1]))).sort()).toEqual([
+        "authTag",
+        "ciphertext",
+        "dekAuthTag",
+        "dekIv",
+        "encryptedDEK",
+        "iv",
       ]);
     });
 
@@ -200,13 +235,114 @@ describe("PostgresAppointmentStore", () => {
       expect(created).toEqual(appointment({ status: "confirmed" }));
     });
 
-    test("throws rather than inventing a record the database did not confirm", async () => {
-      const { sql } = fakeDatabase({ "CREATE TABLE": () => [], INSERT: handles.create([]) });
-      await expect(
-        new PostgresAppointmentStore(sql).create(appointment()),
-      ).rejects.toBeInstanceOf(SqlError);
-    });
+  test("throws rather than inventing a record the database did not confirm", async () => {
+    const { sql } = fakeDatabase({ "CREATE TABLE": () => [], INSERT: handles.create([]) });
+    await expect(
+      new PostgresAppointmentStore(sql).create(appointment()),
+    ).rejects.toBeInstanceOf(SqlError);
   });
+});
+
+describe("PHI at rest", () => {
+  test("what reaches the database is ciphertext, not the record", async () => {
+    // Issue #4: patient data encrypted at rest. The interface is in plaintext,
+    // so the only place this can be true is here.
+    process.env.HIPAA_MASTER_KEY = KEY;
+    const { sql, statements } = fakeDatabase({
+      "CREATE TABLE": () => [],
+      INSERT: handles.create([row({ patient_info: sealed(PATIENT) })]),
+    });
+
+    await new PostgresAppointmentStore(sql).create(appointment());
+
+    const stored = JSON.parse(String(statements.find((s) => s.sql.includes("INSERT"))!.params[1]));
+    for (const leak of ["REDACTED", "patient@example.test", "1985-12-10", "+1 555 0100"]) {
+      expect(JSON.stringify(stored)).not.toContain(leak);
+    }
+    expect(Object.keys(stored).sort()).toEqual([
+      "authTag",
+      "ciphertext",
+      "dekAuthTag",
+      "dekIv",
+      "encryptedDEK",
+      "iv",
+    ]);
+  });
+
+  test("round-trips the record through the envelope", async () => {
+    process.env.HIPAA_MASTER_KEY = KEY;
+    const { sql } = fakeDatabase({
+      "CREATE TABLE": () => [],
+      INSERT: handles.create([row({ patient_info: sealed(PATIENT) })]),
+    });
+
+    const created = await new PostgresAppointmentStore(sql).create(appointment());
+
+    expect(created.patientInfo).toEqual(PATIENT);
+  });
+
+  test("each record gets its own data key", async () => {
+    // A DEK reused across records means one recovered key opens every one of
+    // them, and the point of the envelope is that it does not.
+    process.env.HIPAA_MASTER_KEY = KEY;
+    const a = encryptPHI(JSON.stringify(PATIENT));
+    const b = encryptPHI(JSON.stringify(PATIENT));
+
+    expect(a.encryptedDEK).not.toBe(b.encryptedDEK);
+  });
+
+  test("declares in the schema that the column is ciphertext", async () => {
+    process.env.HIPAA_MASTER_KEY = KEY;
+    const { sql, statements } = fakeDatabase({
+      "CREATE TABLE": () => [],
+      INSERT: handles.create([row({ patient_info: sealed(PATIENT) })]),
+    });
+
+    await new PostgresAppointmentStore(sql).create(appointment());
+
+    // Someone reading the schema, or querying the table directly, should not have
+    // to know which writer put what in it.
+    expect(
+      statements.some((s) => s.sql.includes("COMMENT ON COLUMN appointments.patient_info")),
+    ).toBe(true);
+  });
+
+  test("fails closed when there is no master key to encrypt with", async () => {
+    // The same posture as before: a database without a key must not quietly hold
+    // plaintext records that nobody was warned about.
+    const { sql, statements } = fakeDatabase({ INSERT: handles.create([row()]) });
+    delete process.env.HIPAA_MASTER_KEY;
+
+    await expect(new PostgresAppointmentStore(sql).create(appointment())).rejects.toThrow(
+      /HIPAA_MASTER_KEY is not set/,
+    );
+    expect(statements.some((s) => s.sql.includes("INSERT"))).toBe(false);
+  });
+
+  test("fails closed when the stored record cannot be opened", async () => {
+    process.env.HIPAA_MASTER_KEY = KEY;
+    const { sql } = fakeDatabase({
+      "CREATE TABLE": () => [],
+      SELECT: handles.get([row({ patient_info: sealed(PATIENT) })]),
+    });
+
+    process.env.HIPAA_MASTER_KEY = "b".repeat(64);
+
+    await expect(new PostgresAppointmentStore(sql).get("a1")).rejects.toThrow();
+  });
+
+  test.each([
+    ["a plaintext record written before encryption was added", PATIENT],
+    ["a column that is not an object", "[1,2]"],
+    ["an envelope missing its auth tag", { ...sealed(PATIENT), authTag: undefined }],
+  ])("refuses to return a record it cannot open: %s", async (_label, stored) => {
+    // The alternative is answering "you have no appointment" to a patient who has
+    // one, silently, forever.
+    const { sql } = fakeDatabase({ SELECT: handles.get([row({ patient_info: stored })]) });
+
+    await expect(new PostgresAppointmentStore(sql).get("a1")).rejects.toThrow();
+  });
+});
 
   describe("get", () => {
     test("looks the appointment up by id", async () => {
@@ -246,7 +382,7 @@ describe("PostgresAppointmentStore", () => {
     test("accepts a patient_info column that arrives as a JSON string", async () => {
       const { sql } = fakeDatabase({
         "CREATE TABLE": () => [],
-        SELECT: handles.get([row({ patient_info: JSON.stringify(PATIENT) })]),
+        SELECT: handles.get([row({ patient_info: JSON.stringify(sealed(PATIENT)) })]),
       });
 
       expect((await new PostgresAppointmentStore(sql).get("a1"))!.patientInfo).toEqual(PATIENT);

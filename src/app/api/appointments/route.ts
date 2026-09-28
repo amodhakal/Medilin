@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { AUDIT_ACTORS } from "@/lib/audit";
 import { getAppointment } from "@/lib/appointments";
 import { requireInternalSecret } from "@/lib/auth/internal";
 import { logInfo } from "@/lib/logger";
@@ -42,7 +43,12 @@ export async function GET(request: NextRequest) {
   // Awaited rather than read synchronously: a durable store is a network round
   // trip, and a synchronous signature over one would either block the event
   // loop or hide the await behind a promise nobody checks.
-  const appointment = await getAppointment(id);
+  //
+  // The actor is `internal-api` because that is what the guard above
+  // established: whoever holds the shared secret. The audit entry is written by
+  // `getAppointment` before this returns, so this read is in the trail even
+  // though nothing here remembers to put it there.
+  const appointment = await getAppointment(id, AUDIT_ACTORS.internalApi);
 
   if (!appointment) {
     return NextResponse.json({ error: "Appointment not found" }, { status: 404 });

@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
+import { AUDIT_ACTORS, appointmentResource, recordAuditEvent } from "@/lib/audit";
 import { getSqlClient } from "@/lib/storage";
 import type { AppointmentRecord } from "@/lib/validation/intake";
 import { InMemoryAppointmentStore } from "./memory-store";
@@ -21,6 +22,13 @@ import {
  * Everything above this file depends on the interface, not on either
  * implementation, so swapping a store is one call to `setAppointmentStore` and
  * never a change to booking, to the sealed token, or to a route.
+ *
+ * Every one of the four also writes to the audit trail, here rather than at the
+ * call sites. That placement is the part worth arguing about: it means a record
+ * cannot be created, read, changed or cancelled without leaving an entry, and a
+ * reader added later -- a new page, a new route, a new job -- is audited by
+ * existing rather than by remembering. The alternative is four call sites that
+ * each have to remember, and the fifth one is the one that gets forgotten.
  */
 
 /**
@@ -64,17 +72,29 @@ export function isDurableAppointmentStore(): boolean {
 }
 
 /**
- * Record a new appointment.
+ * Record a new appointment, and record having recorded it.
  *
- * The id is minted here rather than in the store so that the same value is
- * returned, stored, emailed as the reference number, and put in the audit
- * entry -- one identifier, one source.
+ * The audit entry is written *before* the record, which is the opposite order
+ * from the read path and is deliberate. An access that cannot be logged must not
+ * happen at all, so the entry goes in first: if the trail cannot be written,
+ * `recordAuditEvent` throws and no patient data reaches the database. The cost
+ * is that a record write that then fails leaves an entry describing an attempt
+ * that did not complete, which for a trail is a false positive rather than a
+ * gap -- and a gap is the failure that matters.
  */
 export async function createAppointment(patientInfo: AppointmentRecord): Promise<Appointment> {
   const now = new Date();
+  const id = uuidv4();
+
+  await recordAuditEvent({
+    actor: AUDIT_ACTORS.system,
+    action: "APPOINTMENT_CREATED",
+    resource: appointmentResource(id),
+    details: { reason: "intake", status: "scheduled", language: patientInfo.language },
+  });
 
   return getAppointmentStore().create({
-    id: uuidv4(),
+    id,
     patientInfo,
     createdAt: now,
     updatedAt: now,
@@ -83,25 +103,68 @@ export async function createAppointment(patientInfo: AppointmentRecord): Promise
   });
 }
 
-export async function getAppointment(id: string): Promise<Appointment | undefined> {
-  return getAppointmentStore().get(id);
+/**
+ * Read an appointment, and record the read.
+ *
+ * The entry is written *after* the read, because there is nothing to log until
+ * there is something to have read. What makes it fail closed is what happens
+ * next: if the entry cannot be written, this throws and the caller never sees
+ * the record. The data was loaded into this process and no further -- it is not
+ * returned, not rendered, and not emailed.
+ *
+ * `actor` is required rather than defaulted. A read of a patient's record is
+ * exactly the event the trail exists for, and a default would make the common
+ * case -- a new reader that forgets -- look the same as a deliberate one. The
+ * closed set is in ../audit.
+ */
+export async function getAppointment(
+  id: string,
+  actor: string,
+): Promise<Appointment | undefined> {
+  const appointment = await getAppointmentStore().get(id);
+  if (!appointment) return undefined;
+
+  await recordAuditEvent({
+    actor,
+    action: "PHI_READ",
+    resource: appointmentResource(appointment.id),
+    details: { status: appointment.status },
+  });
+
+  return appointment;
 }
 
 /**
- * Change an appointment, or return `undefined` if there is no such id.
+ * Change an appointment, and record having changed it.
  *
- * Validated before it is dispatched so that a caller gets the same refusal, and
- * the same message, whichever store is in use.
+ * Audited before the write, for the same reason as create: a modification that
+ * cannot be logged must not happen.
  */
 export async function updateAppointment(
   id: string,
   patch: AppointmentPatch,
 ): Promise<Appointment | undefined> {
   assertValidAppointmentPatch(patch);
+
+  await recordAuditEvent({
+    actor: AUDIT_ACTORS.system,
+    action: "APPOINTMENT_UPDATED",
+    resource: appointmentResource(id),
+    details: { reason: "status_change", status: patch.status },
+  });
+
   return getAppointmentStore().update(id, patch);
 }
 
+/** Cancel an appointment, and record the cancellation. */
 export async function cancelAppointment(id: string): Promise<Appointment | undefined> {
+  await recordAuditEvent({
+    actor: AUDIT_ACTORS.system,
+    action: "APPOINTMENT_CANCELLED",
+    resource: appointmentResource(id),
+    details: { reason: "status_change", status: "cancelled" },
+  });
+
   return getAppointmentStore().cancel(id);
 }
 
@@ -110,7 +173,6 @@ export {
   isAppointmentStatus,
   type Appointment,
   type AppointmentPatch,
-  type AppointmentStatus,
   type AppointmentStore,
 } from "./store";
 export { InMemoryAppointmentStore } from "./memory-store";
