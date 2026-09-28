@@ -14,6 +14,7 @@ import {
   CLINIC_PAGE_SIZE,
   InMemoryAppointmentStore,
   PostgresAppointmentStore,
+  appendTranscript,
   cancelAppointment,
   claimReminder,
   createAppointment,
@@ -23,11 +24,13 @@ import {
   issuePatientActions,
   listClinicSchedule,
   listReminderCandidates,
+  readTranscript,
   rescheduleAppointment,
   setAppointmentStore,
   spendPatientAction,
   updateAppointment,
 } from "./appointments";
+import type { TranscriptLine } from "./appointments";
 import type { AppointmentRecord } from "./validation/intake";
 
 /**
@@ -1075,5 +1078,151 @@ describe("listClinicSchedule", () => {
     // the same sin as logging a refused attempt as a change.
     const reads = (await readAuditLog()).filter((e) => e.action === "CLINIC_SCHEDULE_READ");
     expect(reads).toEqual([]);
+  });
+});
+
+/** A trail that is down, which is what a durable store being unreachable looks like. */
+function brokenTrail() {
+  return {
+    async append(): Promise<never> {
+      throw new Error("the trail is unavailable");
+    },
+    async read() {
+      return [];
+    },
+    async verify() {
+      return false;
+    },
+  };
+}
+
+describe("the call transcript", () => {
+  function line(overrides: Partial<TranscriptLine> = {}): TranscriptLine {
+    return {
+      seq: 0,
+      role: "patient",
+      text: "My left eye has been painful since Tuesday.",
+      at: new Date("2026-09-01T10:00:01.000Z"),
+      finalized: true,
+      ...overrides,
+    };
+  }
+
+  async function withAppointment(): Promise<{ store: InMemoryAppointmentStore; id: string }> {
+    const store = new InMemoryAppointmentStore();
+    setAppointmentStore(store);
+    const created = await createAppointment(record());
+    return { store, id: created.id };
+  }
+
+  test("persists a line and reads it back in order", async () => {
+    freshAudit();
+    const { id } = await withAppointment();
+
+    expect(await appendTranscript(id, [line({ seq: 0 }), line({ seq: 1, role: "receptionist" })])).toBe(2);
+
+    const read = await readTranscript(id, AUDIT_ACTORS.linkBearer);
+    expect(read.map((entry) => entry.seq)).toEqual([0, 1]);
+    expect(read[0].text).toBe("My left eye has been painful since Tuesday.");
+  });
+
+  test("leaves an entry behind for the append, and one for the read", async () => {
+    // The reason the audit call is in this file rather than at the call sites: a
+    // transcript is PHI, and a surface that reads one and forgets to say so is
+    // the failure the whole facade exists to make impossible.
+    const trail = freshAudit();
+    const { id } = await withAppointment();
+
+    await appendTranscript(id, [line()]);
+    await readTranscript(id, AUDIT_ACTORS.linkBearer);
+
+    const entries = await readAuditLog();
+    expect(entries.map((entry) => entry.action)).toEqual([
+      "APPOINTMENT_CREATED",
+      "TRANSCRIPT_APPENDED",
+      "PHI_READ",
+    ]);
+    // Filed as its own resource rather than under the appointment, so "who read
+    // this patient's record?" is not answered with a demo session mixed in.
+    expect(entries[1].resource).toBe(`transcript:${id}`);
+    expect(entries[2].resource).toBe(`transcript:${id}`);
+    expect(entries[2].actor).toBe(AUDIT_ACTORS.linkBearer);
+    expect(verifyAuditChain()).resolves.toBe(true);
+  });
+
+  test("does not log an append for a batch with nothing in it", async () => {
+    // A trail entry for a write that did not happen is the kind of thing that
+    // makes a trail untrustworthy, and the browser sends an empty batch every
+    // time it flushes with nothing new.
+    const trail = freshAudit();
+    const { id } = await withAppointment();
+
+    expect(await appendTranscript(id, [])).toBe(0);
+
+    const entries = await readAuditLog();
+    expect(entries.map((entry) => entry.action)).toEqual(["APPOINTMENT_CREATED"]);
+  });
+
+  test("refuses a line the store could not hold, before anything is written", async () => {
+    freshAudit();
+    const { store, id } = await withAppointment();
+
+    await expect(appendTranscript(id, [line({ role: "operator" as TranscriptLine["role"] })])).rejects.toThrow(
+      /role/i,
+    );
+    expect(store.transcriptCount).toBe(0);
+  });
+
+  test("stores nothing, and says so, for an appointment that is not there", async () => {
+    freshAudit();
+    await withAppointment();
+
+    expect(await appendTranscript("not-an-appointment", [line()])).toBe(0);
+  });
+
+  test("a read that cannot be recorded does not hand back the transcript", async () => {
+    // The same fail-closed posture as `getAppointment`, and for the same reason:
+    // the data is loaded into this process and no further -- not rendered, not
+    // exported, not logged. This is a patient's account of their own symptoms.
+    const trail = freshAudit();
+    const { id } = await withAppointment();
+    await appendTranscript(id, [line()]);
+
+    // A trail that cannot be written.
+    setAuditLogStore(brokenTrail());
+
+    await expect(readTranscript(id, AUDIT_ACTORS.linkBearer)).rejects.toThrow(/unavailable/);
+  });
+
+  test("an append that cannot be recorded does not store the line", async () => {
+    // The write side of the same posture: an access that cannot be logged must
+    // not happen at all, so the entry goes in first and the data does not.
+    freshAudit();
+    const { store, id } = await withAppointment();
+
+    setAuditLogStore(brokenTrail());
+
+    await expect(appendTranscript(id, [line()])).rejects.toThrow(/unavailable/);
+    expect(store.transcriptCount).toBe(0);
+  });
+
+  test("an empty transcript is an empty array, not an error", async () => {
+    // A patient whose call never got started has a booking and no conversation.
+    // That is a real state, and the replay page has to render it rather than
+    // crash.
+    freshAudit();
+    const { id } = await withAppointment();
+
+    expect(await readTranscript(id, AUDIT_ACTORS.linkBearer)).toEqual([]);
+  });
+
+  test("passes the cap through to the store", async () => {
+    freshAudit();
+    const { id } = await withAppointment();
+    for (let seq = 0; seq < 5; seq += 1) await appendTranscript(id, [line({ seq })]);
+
+    const read = await readTranscript(id, AUDIT_ACTORS.linkBearer, { limit: 2 });
+
+    expect(read.map((entry) => entry.seq)).toEqual([3, 4]);
   });
 });

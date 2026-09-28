@@ -172,6 +172,35 @@ export function sealReference(appointmentId: string): string {
  * unaudited until they expire, which is another reason #59 should give tokens a
  * lifetime.
  */
+/**
+ * The appointment a token names, or null.
+ *
+ * For a version 2 reference, the uuid it is. For a version 1 sealed token,
+ * null -- and that is not a gap in the function, it is the format.
+ *
+ * A sealed token *is* the record. There is no identifier in it because there is
+ * no row behind it: it resolves on any instance forever, is not revocable, and
+ * cannot be deleted along with the appointment it describes. So a surface that
+ * needs to address something *about* a record rather than the record itself --
+ * a transcript, an export -- has nothing to address for a link of that shape,
+ * and refusing is the only honest answer. Inventing an id out of the ciphertext
+ * would produce a key that looks like it points somewhere.
+ *
+ * Added for #57. It exists here rather than in the transcript module because
+ * the version-2 format is this file's business, and a second copy of
+ * `REFERENCE_PATTERN` in another file is a credential format that can drift from
+ * the one that mints it -- which is not a thing worth being able to test for.
+ *
+ * Pure over a string: no key, no store, no database. A caller that needs the
+ * *record* calls `resolveRecord`; a caller that needs a key must not be holding
+ * a patient's data to get it.
+ */
+export function appointmentIdForToken(token: string): string | null {
+  if (!token.startsWith(REFERENCE_PREFIX)) return null;
+  if (!REFERENCE_PATTERN.test(token)) return null;
+  return token.slice(REFERENCE_PREFIX.length);
+}
+
 export async function resolveRecord(token: string): Promise<string | null> {
   if (token.startsWith(REFERENCE_PREFIX)) {
     if (!REFERENCE_PATTERN.test(token)) return null;

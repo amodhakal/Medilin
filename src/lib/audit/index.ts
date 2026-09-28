@@ -103,6 +103,7 @@ export {
   GENESIS_HASH,
   AuditDetailsError,
   appointmentResource,
+  transcriptResource,
   assertAuditDetails,
   buildEntry,
   calculateEntryHash,

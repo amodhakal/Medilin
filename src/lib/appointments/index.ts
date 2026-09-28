@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import { ACTION_TOKEN_TTL_MS, mintActionToken, openActionToken } from "@/lib/action-token";
-import { AUDIT_ACTORS, appointmentResource, recordAuditEvent } from "@/lib/audit";
+import { AUDIT_ACTORS, appointmentResource, recordAuditEvent, transcriptResource } from "@/lib/audit";
 import type { AuditReason } from "@/lib/audit";
 import { logInfo } from "@/lib/logger";
 import { getSqlClient } from "@/lib/storage";
@@ -9,11 +9,13 @@ import { InMemoryAppointmentStore } from "./memory-store";
 import { PostgresAppointmentStore } from "./postgres-store";
 import {
   assertValidAppointmentPatch,
+  assertValidTranscriptBatch,
   REMINDABLE_STATUSES,
   type Appointment,
   type AppointmentPatch,
   type AppointmentStore,
   type PatientAction,
+  type TranscriptLine,
 } from "./store";
 
 /**
@@ -219,15 +221,21 @@ export async function cancelAppointment(
 
 export {
   APPOINTMENT_STATUSES,
+  MAX_TRANSCRIPT_TEXT_LENGTH,
   PATIENT_ACTIONS,
   REMINDABLE_STATUSES,
+  TRANSCRIPT_LINE_LIMIT,
+  TRANSCRIPT_ROLES,
   isAppointmentStatus,
   isPatientAction,
+  isTranscriptRole,
   type ActionGrant,
   type Appointment,
   type AppointmentPatch,
   type AppointmentStore,
   type PatientAction,
+  type TranscriptLine,
+  type TranscriptRole,
 } from "./store";
 export { InMemoryAppointmentStore } from "./memory-store";
 export { PostgresAppointmentStore } from "./postgres-store";
@@ -728,3 +736,105 @@ function clamp(value: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return min;
   return Math.min(Math.max(Math.trunc(value), min), max);
 }
+
+/*
+ * ---------------------------------------------------------------------------
+ * The call transcript (#57)
+ * ---------------------------------------------------------------------------
+ *
+ * Two functions, and the reason they are in this file rather than in a
+ * transcript module of their own is the reason the other four families are
+ * here: a surface that reads or writes a patient's record and does not leave an
+ * entry behind is the failure this file was written to make impossible. A
+ * reader added later -- a replay page, an export route, a new job -- is audited
+ * by existing rather than by remembering.
+ *
+ * What is new here is that the thing being audited is *the most sensitive data
+ * in the application*. `patientInfo` is a record of what somebody asked for;
+ * a transcript is what they said while asking, in the words the voice agents
+ * used, which is where a symptom gets described at length.
+ */
+
+/**
+ * Add lines to a transcript, and record having added them.
+ *
+ * The entry goes in *before* the write, for the same reason `createAppointment`
+ * does it before the insert: a write that cannot be logged must not happen at
+ * all. The cost is that an append for an appointment that turns out not to exist
+ * leaves an entry describing a write that did not land. That is a false
+ * positive in a trail, and a false positive is not the failure that matters --
+ * a gap is.
+ *
+ * An empty batch is not an event. The browser flushes after every change to the
+ * relay, and most of those flushes have nothing new in them; a trail entry per
+ * flush would be a trail of nothing.
+ *
+ * `reason` is `track_link` and always will be: a transcript is written by
+ * whoever holds the spectate link, which is the same bearer credential the
+ * tracking page is opened with. It is not `internal_api` and it is not
+ * `patient_link`, because neither of those is what happened.
+ */
+export async function appendTranscript(
+  appointmentId: string,
+  lines: readonly TranscriptLine[],
+  options: { now?: number } = {},
+): Promise<number> {
+  assertValidTranscriptBatch(lines);
+
+  if (lines.length === 0) return 0;
+
+  await recordAuditEvent({
+    actor: AUDIT_ACTORS.linkBearer,
+    action: "TRANSCRIPT_APPENDED",
+    resource: transcriptResource(appointmentId),
+    details: { reason: "track_link" },
+  });
+
+  const written = await getAppointmentStore().appendTranscript(appointmentId, lines);
+
+  // The count is not PHI, and `count` is on the allowlist in
+  // @/lib/logger/redact, so a batch of lines is logged as a number and never as
+  // a transcript. That is the whole redaction posture for this path: there is
+  // nothing here to allow-list, because nothing here is ever emitted.
+  if (written > 0) {
+    logInfo("transcript.appended", { appointmentId, count: written });
+  }
+
+  return written;
+}
+
+/**
+ * Read a transcript, and record the read.
+ *
+ * `actor` is required for the same reason `getAppointment`'s is, and the same
+ * question it answers: a transcript is a patient's own account of their
+ * symptoms, and a default would make the common case -- a new caller that
+ * forgot -- indistinguishable from a deliberate one.
+ *
+ * Audited *after* the read, like every read in this file. There is nothing to
+ * log until there is something to have read, and what makes it fail closed is
+ * what happens next: if the entry cannot be written this throws, the caller
+ * never sees the lines, and the transcript is not rendered, exported, or
+ * logged. It was loaded into this process and no further.
+ *
+ * A line that the durable store cannot open stops the read rather than being
+ * skipped. A transcript that quietly loses a line is a call that appears to have
+ * gone differently than it did.
+ */
+export async function readTranscript(
+  appointmentId: string,
+  actor: string,
+  options: { limit?: number } = {},
+): Promise<TranscriptLine[]> {
+  const lines = await getAppointmentStore().getTranscript(appointmentId, options.limit);
+
+  await recordAuditEvent({
+    actor,
+    action: "PHI_READ",
+    resource: transcriptResource(appointmentId),
+    details: { reason: "track_link" },
+  });
+
+  return lines;
+}
+

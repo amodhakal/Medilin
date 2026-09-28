@@ -1,4 +1,4 @@
-import { resolveRecord } from "@/lib/phi-token";
+import { appointmentIdForToken, resolveRecord } from "@/lib/phi-token";
 import { isVoiceConfigured } from "@/lib/voice/elevenlabs";
 import { notFound } from "next/navigation";
 import SpectateClient, { type SpectatePatient } from "./SpectateClient";
@@ -64,6 +64,14 @@ export default async function SpectatePage({
       // and it is not a new disclosure: the visitor has it in their address bar
       // either way.
       sessionToken={id}
+      // Whether this link can address a stored transcript at all. Decided here
+      // rather than in the client, because a version 1 token is the record sealed
+      // into the URL with nothing stored behind it, so there is no transcript to
+      // replay for it -- and a link on the page that always 404s is worse than
+      // no link. `appointmentIdForToken` is a pure function over the token: no
+      // key, no store, and no chance of a call site reading the record to find
+      // the id.
+      transcriptAvailable={appointmentIdForToken(id) !== null}
     />
   );
 }
