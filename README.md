@@ -115,15 +115,23 @@ a Resend account limitation, not a bug in the app.
 ## How to Demo
 
 1. Fill out and submit the intake form in your preferred language
-2. Get the email with the appointment information automatically
+2. The confirmation screen shows a link to join the live call, plus the
+   booking reference. Click it, or stay on the page — it redirects to the
+   spectate session automatically after a few seconds.
+3. On the spectate page, use the **Copy link** button in the "This session's
+   link" section to share the session. No console inspection needed: the link
+   is in the page, both on the confirmation screen and on the spectate page
+   itself.
+4. Click **Start the call** to hear the simulated appointment booking call
+5. Click **End call** once the agents have reached an agreement
+6. Check your email for the confirmation message in the language you originally selected
 
-### If you want to observe the AI agent conversation (Optional):
-2. Open the browser console (F12 or right-click → Inspect → Console)
-3. Copy the spectate URL shown in the console (optional - for observing the AI process)
-4. Navigate to the spectate URL
-5. Click "Start Conversation" to hear the simulated appointment booking call
-6. Click "Stop" once the agents have reached an agreement
-7. Check your email for the confirmation message in the language you originally selected
+> Treat the session link like a password: anyone who opens it can see the
+> appointment behind the call, so only share it with whoever is watching the
+> demo with you.
+>
+> For what happens between form submit and confirmation email, see
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Project Structure
 ```
@@ -132,6 +140,9 @@ a Resend account limitation, not a bug in the app.
 │   │   ├── page.tsx              # Landing page, language picker
 │   │   ├── language/[slug]/      # Localized intake form
 │   │   ├── spectate/[id]/        # Voice session viewer (server wrapper + client)
+│   │   ├── track/                # Public appointment page (sealed-token link)
+│   │   │   ├── page.tsx          # Explains that the link itself is the appointment
+│   │   │   └── [token]/          # Sealed appointment summary (server-decrypted)
 │   │   ├── api/
 │   │   │   ├── intake/           # Intake form submission
 │   │   │   ├── appointments/     # Appointment read/create
@@ -143,6 +154,8 @@ a Resend account limitation, not a bug in the app.
 │   │   ├── globals.css
 │   │   └── actions.ts
 │   ├── config/                   # Non-secret application configuration
+│   ├── docs/
+│   │   └── ARCHITECTURE.md         # Pipeline, sealed tokens, relay, routes
 │   └── lib/
 │       ├── env.ts                # Environment schema (source of truth)
 │       ├── translateFromEnglish.ts
