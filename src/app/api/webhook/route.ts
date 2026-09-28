@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { translateFromEnglish } from "@/lib/translateFromEnglish";
 import { Resend } from "resend";
+import { getEmailFrom } from "@/config";
+import { getServerEnv } from "@/lib/env";
 
 export async function POST(request: NextRequest) {
   try {
@@ -24,10 +26,10 @@ export async function POST(request: NextRequest) {
 
     const { subject, body } = await translateFromEnglish(info, language);
 
-    const resend = new Resend(process.env.RESEND_KEY);
+    const resend = new Resend(getServerEnv().RESEND_KEY);
 
     const { data, error } = await resend.emails.send({
-      from: "onboarding@resend.dev",
+      from: getEmailFrom(),
       to: [email],
       subject: subject,
       html: body,

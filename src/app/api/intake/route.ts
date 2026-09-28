@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { translateToEnglish } from "@/lib/translateToEnglish";
 import { createAppointment } from "@/lib/appointments";
+import { getClinicName } from "@/config";
 
 export async function POST(request: NextRequest) {
   try {
@@ -27,7 +28,7 @@ export async function POST(request: NextRequest) {
         Date.now() + Math.floor(Math.random() * 86400000),
       ).toISOString(),
       confirmed: true,
-      hospitalName: "City Medical Center",
+      hospitalName: getClinicName(),
       referenceNumber: `HOSP-${appointment.id}`,
     };
 

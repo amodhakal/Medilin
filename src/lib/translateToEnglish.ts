@@ -1,8 +1,16 @@
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import { getServerEnv } from "@/lib/env";
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_KEY,
-});
+/**
+ * Constructed lazily.
+ *
+ * Previously this ran at module scope, so importing the module built a client
+ * with an `undefined` key and logged "API key should be set" during `next build`
+ * and on every cold start, deferring the real failure to the first API call.
+ */
+function getClient(): GoogleGenAI {
+  return new GoogleGenAI({ apiKey: getServerEnv().GEMINI_KEY });
+}
 
 const MAX_RETRIES = 10;
 const BASE_DELAY_MS = 1000;
@@ -53,7 +61,7 @@ Return ONLY a valid JSON object with the same structure, but with values transla
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const response = await ai.models.generateContent({
+      const response = await getClient().models.generateContent({
         model: "gemini-3-flash-preview",
         config: {
           thinkingConfig: {

@@ -53,11 +53,20 @@ In a production deployment, the AI agent would:
 ```bash
    cp .env.example .env
 ```
-   
-   Add the following keys to `.env`:
-   - `ELEVENLABS_API_KEY` - Your ElevenLabs API key
-   - `GOOGLE_GENERATIVE_AI_API_KEY` - Your Google Gemini API key
-   - `RESEND_API_KEY` - Your Resend API key for sending emails
+
+   `.env.example` is the full list; these five are **required** and the server
+   refuses to start without them:
+   - `GEMINI_KEY` - Google Gemini API key, for intake translation
+   - `RESEND_KEY` - Resend API key, for confirmation email
+   - `HIPAA_MASTER_KEY` - 32-byte hex key for encrypting patient data at rest.
+     Generate with `openssl rand -hex 32`. There is no fallback: if this is
+     unset, encryption throws rather than protecting records with a key that
+     lives in the source tree.
+   - `ELEVENLABS_AGENT_PATIENT_ID` - Conversational AI agent for the patient
+   - `ELEVENLABS_AGENT_RECEPTIONIST_ID` - Conversational AI agent for reception
+
+   `ELEVENLABS_API_KEY` is listed in `.env.example` but is not yet read by any
+   code. The rest of the optional variables each gate one feature.
 
 4. **Run the development server**
 ```bash
