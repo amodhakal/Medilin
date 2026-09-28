@@ -960,6 +960,86 @@ describe("reconfigure", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* Construction                                                                */
+/* -------------------------------------------------------------------------- */
+
+describe("construction", () => {
+  /**
+   * The invariant #54 rests on.
+   *
+   * `useAgentRelay` creates the machine inside a `useState` initialiser, and
+   * the React Compiler rewrites that into a `useMemo`. Under StrictMode's
+   * double render the initialiser runs twice, and on a config change the memo
+   * produces a second machine that `useState` throws away. Both are only
+   * harmless while the constructor has no side effects — the moment it opens
+   * a socket or schedules a timer, the compiler starts leaking machines and
+   * says nothing about it.
+   */
+  test("constructing a relay touches nothing", () => {
+    const clock = new FakeClock();
+    const urls: string[] = [];
+
+    const relay = new AgentRelay({
+      createSocket: (url) => {
+        urls.push(url);
+        return new FakeSocket();
+      },
+      clock,
+    });
+
+    expect(urls).toEqual([]);
+    expect(clock.pending).toBe(0);
+    expect(relay.getState()).toEqual(initialRelayState());
+    expect(relay.getState().phase).toBe("idle");
+  });
+
+  test("a machine with no configuration says so rather than opening a blank socket", () => {
+    const clock = new FakeClock();
+    const urls: string[] = [];
+    const relay = new AgentRelay({
+      createSocket: (url) => {
+        urls.push(url);
+        return new FakeSocket();
+      },
+      clock,
+      log: () => {},
+    });
+
+    relay.start();
+
+    expect(urls).toEqual([]);
+    expect(relay.getState().phase).toBe("failed");
+    expect(relay.getState().error).toContain("No patient caller agent is configured");
+  });
+
+  test("picks up configuration handed over after construction", () => {
+    const harness = makeRelay();
+    const clock = new FakeClock();
+    const urls: string[] = [];
+    const relay = new AgentRelay({
+      createSocket: (url) => {
+        urls.push(url);
+        return new FakeSocket();
+      },
+      clock,
+      log: () => {},
+    });
+
+    relay.reconfigure({
+      patientAgentId: "agent_patient_1",
+      receptionistAgentId: "agent_receptionist_1",
+    });
+    relay.start();
+
+    expect(urls).toHaveLength(2);
+    expect(urls[0]).toContain("agent_patient_1");
+    expect(urls[1]).toContain("agent_receptionist_1");
+    expect(relay.getState().socket.patient).toBe("connecting");
+    expect(harness.relay).toBeDefined();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* Teardown                                                                    */
 /* -------------------------------------------------------------------------- */
 

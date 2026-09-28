@@ -280,13 +280,23 @@ function conversationUrl(agentId: string): string {
 /* The machine                                                                 */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * All of it optional.
+ *
+ * The four identity fields are optional because a machine is constructed
+ * before it has any configuration, and deliberately so: see the note on
+ * `useAgentRelay`. A missing agent id is reported as a failed connect at
+ * `start` rather than being papered over with a placeholder, because
+ * connecting to `agent_id=` is a request that either fails confusingly at the
+ * vendor or, worse, is not obviously not the configured agent.
+ */
 export interface AgentRelayConfig {
-  patientAgentId: string;
-  receptionistAgentId: string;
+  patientAgentId?: string;
+  receptionistAgentId?: string;
   /** Sent to the patient agent to open the call. May contain PHI. */
-  patientOpeningContext: string;
+  patientOpeningContext?: string;
   /** Sent to the receptionist agent to open the call. */
-  receptionistOpeningContext: string;
+  receptionistOpeningContext?: string;
   /** Merged into the patient socket's conversation init payload. */
   patientDynamicVariables?: Record<string, unknown>;
   createSocket?: (url: string) => RelaySocket;
@@ -402,7 +412,14 @@ export class AgentRelay {
   /** Set while this machine is closing sockets on purpose. */
   private stopping = false;
 
-  constructor(config: AgentRelayConfig) {
+  /**
+   * Build a machine. This must stay free of side effects.
+   *
+   * Verified, not assumed — see `constructing a relay touches nothing` in
+   * `useAgentRelay.test.ts`, and the comment on `useAgentRelay` for why it
+   * matters under the React Compiler.
+   */
+  constructor(config: AgentRelayConfig = {}) {
     this.config = config;
     this.createSocket = config.createSocket ?? ((url) => new WebSocket(url) as RelaySocket);
     this.clock = config.clock ?? realClock;
@@ -473,10 +490,19 @@ export class AgentRelay {
       stalled: false,
     });
 
+    // Checked up front, so a missing configuration is one stated failure
+    // rather than whichever side happened to be opened last overwriting the
+    // other's message.
+    for (const side of ["patient", "receptionist"] as const) {
+      if (!this.agentIdFor(side)) {
+        this.fail(side, `No ${label(side)} agent is configured.`);
+        return;
+      }
+    }
+
     this.openSide("patient");
     this.openSide("receptionist");
   }
-
   /** End the call deliberately. */
   stop(): void {
     if (this.disposed) return;
@@ -515,9 +541,18 @@ export class AgentRelay {
 
   /* -------------------------------- sockets ------------------------------ */
 
+  private agentIdFor(side: AgentSide): string | undefined {
+    return side === "patient" ? this.config.patientAgentId : this.config.receptionistAgentId;
+  }
+
   private openSide(side: AgentSide): void {
-    const agentId =
-      side === "patient" ? this.config.patientAgentId : this.config.receptionistAgentId;
+    // Checked in `start` as well. Belt and braces: an id that vanished between
+    // the preflight and here would otherwise open a socket against nothing.
+    const agentId = this.agentIdFor(side);
+    if (!agentId) {
+      this.fail(side, `No ${label(side)} agent is configured.`);
+      return;
+    }
 
     const socket = this.createSocket(conversationUrl(agentId));
     this.sockets[side] = socket;
@@ -680,9 +715,9 @@ export class AgentRelay {
     switch (frame.type) {
       case "conversation_initiation_client_data": {
         const context =
-          side === "patient"
+          (side === "patient"
             ? this.config.patientOpeningContext
-            : this.config.receptionistOpeningContext;
+            : this.config.receptionistOpeningContext) ?? "";
         const delay = this.config.contextDelayMs ?? DEFAULT_CONTEXT_DELAY_MS;
         this.schedule(() => {
           this.sockets[side]?.send(
@@ -1191,16 +1226,40 @@ export function useAgentRelay(options: UseAgentRelayOptions): UseAgentRelayResul
     patientDynamicVariables,
   } = options;
 
-  const [relay] = useState(
-    () =>
-      new AgentRelay({
-        patientAgentId,
-        receptionistAgentId,
-        patientOpeningContext,
-        receptionistOpeningContext,
-        patientDynamicVariables,
-      })
-  );
+  /**
+   * The machine, built once.
+   *
+   * Written as `useState(initialiser)` with no setter, which is the sanctioned
+   * way to get a value that must exist exactly once and must not be torn down
+   * by a re-render. Note what the React Compiler does with it, because it is
+   * the reason this is safe (#54):
+   *
+   *   useState(() => new AgentRelay(config))  =>  useState(useMemo(() => new AgentRelay(config), [config]))
+   *
+   * The compiler rewrites the throwaway initialiser into a memo. Two
+   * consequences, both benign here and neither obvious:
+   *
+   *  * A changed config builds a second machine and throws it away, because
+   *    `useState` only reads its initialiser on the first render. That is why
+   *    config is not passed in at all, and why the effect below is the only
+   *    path config takes. Nothing is built that is not used.
+   *  * Under StrictMode's double render, the initialiser runs twice and one
+   *    machine is discarded. Also only benign because the constructor has no
+   *    side effects — it opens no socket and schedules no timer. If someone
+   *    later moves socket setup into the constructor, both of the above start
+   *    leaking machines, and the compiler will not warn.
+   *
+   * `constructing a relay touches nothing` in the test file pins that
+   * invariant, so the change that breaks it fails the suite.
+   *
+   * Everything timer-heavy lives inside the machine, which the compiler does
+   * not analyse: it only rewrites components and hooks, not class bodies. The
+   * relay's `timers` Set, its `awaiting` turn, and its outbox are emitted
+   * verbatim. That is the other half of this branch's finding — the
+   * extraction in #46 is what made the compiler irrelevant to the risky code,
+   * not merely the reaction to it.
+   */
+  const [relay] = useState(() => new AgentRelay());
 
   const subscribe = useCallback(
     (onStoreChange: () => void) => relay.subscribe(onStoreChange),
