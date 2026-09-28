@@ -160,11 +160,31 @@ describe("a transcript the model reads badly", () => {
     // Same rule as the translation merge: only the fields we asked for are read
     // out of the reply, so a response carrying extra keys cannot smuggle them
     // into a record.
-    expect(Object.keys(extraction.fields).sort()).toEqual(
-      [...INTAKE_FIELDS, "language"].sort(),
-    );
+    //
+    // The assertion is that every key is one this app has -- not that every field
+    // the app has was produced. Those differ, and have since #69 added
+    // `dependents` to INTAKE_FIELDS: that is an array of people, and voice intake
+    // is one patient answering flat questions, so it is asked for nothing of the
+    // sort and there is no flat answer it could hold. Asserting equality with
+    // INTAKE_FIELDS made a household field a reason for the voice path to fail.
+    const known = new Set<string>([...INTAKE_FIELDS, "language"]);
+    for (const key of Object.keys(extraction.fields)) {
+      expect(known.has(key)).toBe(true);
+    }
     expect(JSON.stringify(extraction.fields)).not.toContain("Byron");
     expect(JSON.stringify(extraction.fields)).not.toContain("isAdmin");
+  });
+
+  test("does not invent a household the patient never described", async () => {
+    // The counterpart to the assertion above: `dependents` is a field this app
+    // has, and it is still absent. A flat transcript has no way to express a
+    // second person, and defaulting the field would put a person into a medical
+    // record who was never mentioned.
+    modelAnswering({ ...COMPLETE, dependents: [{ firstName: "Maya" }] });
+
+    const extraction = await extractIntakeFromTranscript("I am Ada, I have a headache", "english", NOW);
+
+    expect(extraction.fields).not.toHaveProperty("dependents");
   });
 
   test("treats an empty or non-object reply as nothing heard", async () => {
