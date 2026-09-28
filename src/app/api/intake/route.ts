@@ -6,6 +6,8 @@ import { intakeSchema } from "@/lib/validation/intake";
 import { parseJsonBody } from "@/lib/validation/parse";
 import { internalHeaders } from "@/lib/auth/internal";
 import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
+import { logError, logInfo } from "@/lib/logger";
+import { sealRecord } from "@/lib/phi-token";
 
 const INTAKE_LIMIT = 5;
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -23,20 +25,21 @@ export async function POST(request: NextRequest) {
 
     const data = parsed.data;
     const sourceLanguage = data.language;
-    console.log("Processing intake form from:", sourceLanguage, data);
+    logInfo("intake.received", { language: sourceLanguage });
 
     const translatedData = await translateToEnglish(data, sourceLanguage);
-    console.log("Converted into English:", translatedData);
+    logInfo("intake.translated", { language: sourceLanguage });
 
     const appointment = createAppointment(translatedData);
 
-    const baseUrl = request.nextUrl.origin;
-    const encodedPatientInfo = encodeURIComponent(
-      JSON.stringify(translatedData),
-    );
-    const spectateUrl = `${baseUrl}/spectate/${appointment.id}?patientInfo=${encodedPatientInfo}`;
+    // Was `?patientInfo=${encodeURIComponent(JSON.stringify(translatedData))}`,
+    // which put the whole record in the URL. The token is the record,
+    // encrypted: opaque in a log or a history entry, and openable only with
+    // the server-side key.
+    const token = sealRecord(JSON.stringify(translatedData));
+    const spectateUrl = `${request.nextUrl.origin}/spectate/${token}`;
 
-    console.log("Spectate URL:", spectateUrl);
+    logInfo("intake.session_url_created", { appointmentId: appointment.id });
 
     const mockHospitalResponse = {
       patientInfo: translatedData,
@@ -48,7 +51,7 @@ export async function POST(request: NextRequest) {
       referenceNumber: `HOSP-${appointment.id}`,
     };
 
-    console.log("Hospital response:", mockHospitalResponse);
+    logInfo("intake.booking_simulated", { appointmentId: appointment.id });
 
     const webhookUrl = `${request.nextUrl.origin}/api/webhook`;
     await fetch(webhookUrl, {
@@ -67,7 +70,7 @@ export async function POST(request: NextRequest) {
       spectateUrl: spectateUrl,
     });
   } catch (error) {
-    console.error("Translation error:", error);
+    logError("intake.failed", error);
     return NextResponse.json(
       { success: false, error: "Failed to process form" },
       { status: 500 },

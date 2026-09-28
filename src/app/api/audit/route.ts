@@ -3,6 +3,7 @@ import { auditLogger } from '@/lib/audit';
 import { auditEntrySchema } from '@/lib/validation/intake';
 import { parseJsonBody } from '@/lib/validation/parse';
 import { requireInternalSecret } from '@/lib/auth/internal';
+import { logError } from '@/lib/logger';
 
 export async function POST(request: Request) {
   // Unauthenticated writes let anyone forge audit entries, attributing access
@@ -19,7 +20,7 @@ export async function POST(request: Request) {
     const entry = auditLogger.log(actor, action, resource, details);
     return NextResponse.json({ success: true, entry });
   } catch (error) {
-    console.error('Audit API error:', error);
+    logError('audit.failed', error);
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }

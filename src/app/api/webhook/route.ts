@@ -6,6 +6,8 @@ import { getServerEnv } from "@/lib/env";
 import { parseJsonBody } from "@/lib/validation/parse";
 import { webhookPayloadSchema } from "@/lib/validation/intake";
 import { requireInternalSecret } from "@/lib/auth/internal";
+import { logError, logInfo } from "@/lib/logger";
+import type { SupportedLanguage } from "@/lib/validation/intake";
 
 export async function POST(request: NextRequest) {
   // Authenticate before anything else. Without this the endpoint is an open
@@ -14,16 +16,18 @@ export async function POST(request: NextRequest) {
   const guard = requireInternalSecret(request);
   if (!guard.ok) return guard.response;
 
+  // Hoisted so the catch block can report the language without restating a
+  // value it never received.
+  let language: SupportedLanguage | undefined;
+
   try {
     const parsed = await parseJsonBody(request, webhookPayloadSchema);
     if (!parsed.ok) return parsed.response;
 
-    const { email, language, info } = parsed.data;
+    language = parsed.data.language;
+    const { email, info } = parsed.data;
 
-    console.log(
-      `Webhook original: `,
-      JSON.stringify({ email, language, info }),
-    );
+    logInfo("webhook.received", { language });
 
     const { subject, body } = await translateFromEnglish(info, language);
 
@@ -37,11 +41,11 @@ export async function POST(request: NextRequest) {
     });
 
     if (error) {
-      console.error("Resend error:", error);
+      logError("webhook.resend_failed", error, { language });
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    console.log(`Email sent to ${email}:`, data);
+    logInfo("webhook.sent", { subject });
 
     return NextResponse.json({
       success: true,
@@ -49,7 +53,7 @@ export async function POST(request: NextRequest) {
       subject,
     });
   } catch (error) {
-    console.error("Webhook error:", error);
+    logError("webhook.failed", error, { language });
     return NextResponse.json(
       { error: "Invalid request body" },
       { status: 400 },

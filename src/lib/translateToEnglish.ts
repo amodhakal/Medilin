@@ -1,5 +1,6 @@
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { getServerEnv } from "@/lib/env";
+import { logInfo, logWarn } from "@/lib/logger";
 import {
   appointmentRecordSchema,
   type AppointmentRecord,
@@ -99,14 +100,18 @@ export async function translateToEnglish(
       return applyTranslation(base, parsed);
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      console.error(
-        `Translation attempt ${attempt + 1} failed:`,
-        lastError.message,
-      );
+      // The message is redacted and truncated by the logger: a Gemini SDK
+      // error can echo the request payload, which here is the symptom text
+      // that was sent for translation.
+      logWarn("llm.attempt_failed", {
+        cause: lastError,
+        attempt: attempt + 1,
+        limit: MAX_RETRIES,
+      });
 
       if (attempt < MAX_RETRIES - 1) {
         const delay = calculateDelayWithJitter(attempt);
-        console.log(`Retrying in ${delay}ms...`);
+        logInfo("llm.retry_scheduled", { durationMs: delay, attempt: attempt + 1 });
         await sleep(delay);
       }
     }
