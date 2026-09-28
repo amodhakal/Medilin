@@ -103,6 +103,21 @@ export const AUDIT_ACTIONS = [
   // -- "who looked at a list of accounts on Tuesday" -- so it is the unit
   // recorded.
   "CLINIC_SCHEDULE_READ",
+  // #57. The call transcript, which is the patient's own account of why they
+  // telephoned and is the most sensitive thing this application holds after the
+  // record itself. Two events rather than one, because they are different
+  // questions and a trail that cannot tell them apart cannot answer either.
+  //
+  // An append is a write to a patient's record made by whoever holds the
+  // spectate link. An export is something that leaves the system: a PDF on
+  // somebody's disk, in a downloads folder, emailed onward. "Was this
+  // transcript ever exported, and who asked?" is the first question an auditor
+  // asks of a record like this, and `PHI_READ` cannot answer it, because
+  // rendering a PDF and reading the same transcript on a page are the same
+  // operation as far as the store is concerned and wildly different events
+  // everywhere else.
+  "TRANSCRIPT_APPENDED",
+  "TRANSCRIPT_EXPORTED",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -306,6 +321,22 @@ export function verifyChain(entries: readonly AuditLogEntry[]): boolean {
 /** The resource string for an appointment. One format, so entries are joinable. */
 export function appointmentResource(id: string): string {
   return `appointment:${id}`;
+}
+
+/**
+ * The resource string for a call transcript.
+ *
+ * A different prefix rather than the same `appointmentResource` with a suffix,
+ * and the reason is that a transcript is its own record. It was written by a
+ * different actor, under a different link, at a different time from everything
+ * else about the appointment, and it is deleted with the appointment rather than
+ * with any of it. Filing its accesses under the appointment would make "who
+ * read this patient's record?" answer with the operator's demo session mixed in
+ * with the patient's own view of their appointment, which is the question the
+ * trail exists to be able to answer.
+ */
+export function transcriptResource(id: string): string {
+  return `transcript:${id}`;
 }
 
 /**

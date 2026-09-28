@@ -2,7 +2,12 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { SqlError, type SqlClient } from "@/lib/storage";
 import { encryptPHI, type EncryptedEnvelope } from "@/lib/encryption";
 import { PostgresAppointmentStore, toActionGrant } from "./postgres-store";
-import { REMINDABLE_STATUSES, type ActionGrant, type Appointment } from "./store";
+import {
+  REMINDABLE_STATUSES,
+  type ActionGrant,
+  type Appointment,
+  type TranscriptLine,
+} from "./store";
 import type { AppointmentRecord } from "../validation/intake";
 
 /**
@@ -82,6 +87,11 @@ function sealed(patientInfo: AppointmentRecord): EncryptedEnvelope {
   return encryptPHI(JSON.stringify(patientInfo));
 }
 
+/** The same for a transcript line, which stores a bare string under the same envelope. */
+function sealedText(text: string): EncryptedEnvelope {
+  return encryptPHI(text);
+}
+
 function row(overrides: Record<string, unknown> = {}) {
   return {
     id: "a1",
@@ -103,6 +113,30 @@ function appointment(overrides: Partial<Appointment> = {}): Appointment {
     updatedAt: new Date(UPDATED_AT),
     conversationEnded: false,
     status: "scheduled",
+    ...overrides,
+  };
+}
+
+/** What a transcript line is as the store hands it over. */
+function line(overrides: Partial<TranscriptLine> = {}): TranscriptLine {
+  return {
+    seq: 0,
+    role: "patient",
+    text: "I need to see a doctor about my eye.",
+    at: new Date("2026-09-01T10:00:01.000Z"),
+    finalized: true,
+    ...overrides,
+  };
+}
+
+/** What a transcript line looks like coming back out of a `jsonb` column. */
+function lineRow(overrides: Record<string, unknown> = {}) {
+  return {
+    seq: 0,
+    role: "patient",
+    line: sealedText("I need to see a doctor about my eye."),
+    said_at: "2026-09-01T10:00:01.000Z",
+    finalized: true,
     ...overrides,
   };
 }
@@ -931,6 +965,193 @@ describe("PHI at rest", () => {
       expect(
         statements.some((s) => s.sql.includes("CHECK (scope IN ('reminder'))")),
       ).toBe(true);
+    });
+  });
+
+  // The call transcript (#57). A line is a patient's own account of why they
+  // telephoned, so what matters here is the encryption at rest, the correction
+  // semantics, and that nothing reaches SQL as text.
+  describe("transcript", () => {
+    test("binds the text as an envelope, never as SQL text", async () => {
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_transcripts": handles.create([{ seq: 0 }]),
+      });
+
+      await new PostgresAppointmentStore(sql).appendTranscript("a1", [
+        line({ text: "); DROP TABLE appointments; --" }),
+      ]);
+
+      const insert = statements.find((s) => s.sql.includes("INSERT INTO appointment_transcripts"))!;
+      expect(insert.sql).not.toContain("DROP TABLE");
+      const stored = JSON.parse(String((insert.params[3] as unknown[])[0]));
+      expect(Object.keys(stored).sort()).toEqual([
+        "authTag",
+        "ciphertext",
+        "dekAuthTag",
+        "dekIv",
+        "encryptedDEK",
+        "iv",
+      ]);
+      expect(JSON.stringify(stored)).not.toContain("DROP TABLE");
+    });
+
+    test("a hostile transcript never reaches the statement text", async () => {
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_transcripts": handles.create([{ seq: 0 }]),
+      });
+
+      await new PostgresAppointmentStore(sql).appendTranscript("a1', 'b')", [
+        line({ text: "x", role: "operator" as TranscriptLine["role"] }),
+      ]).catch(() => undefined);
+
+      // The role is validated before the write, so the batch is refused and no
+      // statement carrying it is ever assembled.
+      expect(statements.filter((s) => s.sql.includes("appointment_transcripts") && s.sql.includes("INSERT"))).toHaveLength(0);
+    });
+
+    test("reports zero, and writes nothing, for an appointment that is not there", async () => {
+      // The insert selects its rows `FROM appointments WHERE id = $1`, so a
+      // missing appointment produces no rows at all rather than a foreign key
+      // error. A transcript with no appointment behind it is a patient's words
+      // that nothing would ever delete with the record.
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_transcripts": handles.create([]),
+      });
+
+      expect(await new PostgresAppointmentStore(sql).appendTranscript("gone", [line()])).toBe(0);
+      expect(statements.some((s) => s.sql.includes("FROM appointments WHERE id = $1"))).toBe(true);
+    });
+
+    test("writes a whole batch in one statement", async () => {
+      // A call is a stream of small increments; a round trip per line would make
+      // the transcript cost more than the call did. `unnest` over parallel arrays
+      // keeps the statement fixed -- no statement is assembled from the batch --
+      // which is the same property `update` has.
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_transcripts": handles.create([{ seq: 0 }, { seq: 1 }, { seq: 2 }]),
+      });
+
+      const written = await new PostgresAppointmentStore(sql).appendTranscript("a1", [
+        line({ seq: 0 }),
+        line({ seq: 1, role: "receptionist" }),
+        line({ seq: 2 }),
+      ]);
+
+      expect(written).toBe(3);
+      const inserts = statements.filter((s) => s.sql.includes("INSERT INTO appointment_transcripts"));
+      expect(inserts).toHaveLength(1);
+      expect(inserts[0].sql).toContain("unnest(");
+      expect(inserts[0].params[0]).toBe("a1");
+      expect(inserts[0].params[1]).toEqual([0, 1, 2]);
+      expect(inserts[0].params[2]).toEqual(["patient", "receptionist", "patient"]);
+    });
+
+    test("corrects a line that is already there rather than appending it again", async () => {
+      // The streaming case: a partial frame, then the final that completes it.
+      // `DO UPDATE` is the whole of it, and the update is scoped to the four
+      // mutable columns so nothing about the line's position can move.
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_transcripts": handles.create([{ seq: 0 }]),
+      });
+
+      await new PostgresAppointmentStore(sql).appendTranscript("a1", [line()]);
+
+      const insert = statements.find((s) => s.sql.includes("INSERT INTO appointment_transcripts"))!;
+      expect(insert.sql).toContain("ON CONFLICT (appointment_id, seq) DO UPDATE");
+      expect(insert.sql).not.toMatch(/DO UPDATE SET[^;]*\bseq\s*=/);
+    });
+
+    test("reads a transcript back in position order, bounded to the tail", async () => {
+      // The fake answers in the order the statement would really return: newest
+      // first, because that is what `ORDER BY seq DESC LIMIT n` is. The store
+      // reverses, so a caller gets the call the way it happened.
+      const { sql, statements } = fakeDatabase({
+        SELECT: handles.get([lineRow({ seq: 1 }), lineRow({ seq: 0 })]),
+      });
+
+      const read = await new PostgresAppointmentStore(sql).getTranscript("a1", 50);
+
+      expect(read.map((entry) => entry.seq)).toEqual([0, 1]);
+      const select = statements.find((s) => s.sql.includes("FROM appointment_transcripts"))!;
+      // Descending and bounded, then reversed here: a cap that kept the opening
+      // lines would replay a long call as its pleasantries.
+      expect(select.sql).toContain("ORDER BY seq DESC");
+      expect(select.sql).toContain("LIMIT $2");
+      expect(select.params).toEqual(["a1", 50]);
+    });
+
+    test("clamps a negative cap rather than passing it to Postgres", async () => {
+      const { sql, statements } = fakeDatabase({ SELECT: handles.get([]) });
+
+      await new PostgresAppointmentStore(sql).getTranscript("a1", -1);
+
+      expect(statements.find((s) => s.sql.includes("FROM appointment_transcripts"))!.params[1]).toBe(0);
+    });
+
+    test("opens the stored text, and throws rather than skipping a line that is not one", async () => {
+      // A transcript that silently loses a line is a call that appears to have
+      // gone differently than it did. Throwing is what makes that visible.
+      const { sql } = fakeDatabase({
+        SELECT: handles.get([lineRow(), lineRow({ line: "not an envelope" })]),
+      });
+
+      await expect(new PostgresAppointmentStore(sql).getTranscript("a1")).rejects.toThrow(
+        /line is not a JSON object/,
+      );
+    });
+
+    test("throws rather than replaying a line whose role is outside the closed set", async () => {
+      const { sql } = fakeDatabase({
+        SELECT: handles.get([lineRow({ role: "operator" })]),
+      });
+
+      await expect(new PostgresAppointmentStore(sql).getTranscript("a1")).rejects.toThrow(
+        /role is not one of/,
+      );
+    });
+
+    test("declares the role and the position as constraints, not only as types", async () => {
+      const { sql, statements } = fakeDatabase({});
+
+      await new PostgresAppointmentStore(sql).getTranscript("a1").catch(() => undefined);
+
+      expect(
+        statements.some((s) => s.sql.includes("CHECK (role IN ('patient', 'receptionist'))")),
+      ).toBe(true);
+      expect(statements.some((s) => s.sql.includes("CHECK (seq >= 0)"))).toBe(true);
+    });
+
+    test("cascades from the appointment, so deleting a record deletes the call", async () => {
+      const { sql, statements } = fakeDatabase({});
+
+      await new PostgresAppointmentStore(sql).getTranscript("a1").catch(() => undefined);
+
+      const ddl = statements.find((s) => s.sql.includes("CREATE TABLE IF NOT EXISTS appointment_transcripts"))!;
+      expect(ddl.sql).toContain("REFERENCES appointments (id) ON DELETE CASCADE");
+    });
+
+    test("says in the schema that the text is ciphertext", async () => {
+      // The column comment is what somebody reading the table -- with psql, or
+      // from a `SELECT *` -- needs to be told. `patient_info` has one; the text
+      // of a patient's conversation is the same kind of column and has to be as
+      // explicit.
+      const { sql, statements } = fakeDatabase({});
+
+      await new PostgresAppointmentStore(sql).getTranscript("a1").catch(() => undefined);
+
+      const comment = statements.find((s) => s.sql.includes("COMMENT ON COLUMN appointment_transcripts"))!;
+      expect(comment.sql).toContain("Ciphertext, not plaintext");
+    });
+
+    test("refuses a batch that names one position twice, before it is written", async () => {
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_transcripts": handles.create([{ seq: 0 }]),
+      });
+
+      await expect(
+        new PostgresAppointmentStore(sql).appendTranscript("a1", [line({ seq: 0 }), line({ seq: 0 })]),
+      ).rejects.toThrow(/same position/i);
+      expect(statements.some((s) => s.sql.includes("INSERT INTO appointment_transcripts"))).toBe(false);
     });
   });
 });

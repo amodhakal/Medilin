@@ -24,6 +24,14 @@ import type { AppointmentRecord } from "@/lib/validation/intake";
  * `claimOnce`. Both are here for the same reason, and both have comments on them
  * that are longer than their signatures, because the shape of `listByStatus` is
  * the result of the record being encrypted rather than of how reminders work.
+ *
+ * A third pair arrived with #57, for the call transcript: `appendTranscript` and
+ * `getTranscript`. They are here for a sharper version of the same reason. The
+ * transcript used to be a `useState` array in a client component, which is not
+ * merely a cold-start bug -- a patient's own account of why they called, held
+ * nowhere, written by nobody, and gone on reload. It is the most sensitive thing
+ * this application holds after the record itself, and it is the one thing that
+ * was never persisted.
  */
 
 /**
@@ -343,6 +351,196 @@ export interface AppointmentStore {
    * key.
    */
   claimOnce(scope: ClaimScope, key: string): Promise<boolean>;
+
+  /**
+   * Add lines to an appointment's transcript, and report that they are there.
+   *
+   * Returns how many lines the batch wrote -- which is the size of the batch, or
+   * zero when there is no such appointment. It is not a count of the transcript:
+   * `getTranscript` is what answers "how many lines are there", and a caller
+   * that wanted a running total should not get it as a side effect of a write
+   * that may have corrected a line rather than added one.
+   *
+   * Append, and the shape of it is the interesting part.
+   *
+   * A transcript arrives one line at a time, out of a live call, over a network,
+   * in whatever order the two agents happen to finish talking. So the unit is
+   * not "the transcript" -- nothing ever hands over the whole of it -- it is a
+   * **line at a position**, and the position is the caller's. `seq` is the
+   * relay's own entry id: monotonic within a session, assigned where the
+   * conversation is, and meaningful nowhere else.
+   *
+   * **A line is corrected in place; the transcript is not replaced.** A voice
+   * agent streams an utterance as a run of partial frames and then a final one,
+   * and a store that appended each frame separately would replay the call as
+   * "how how how are you are are are you". The partial and the final that
+   * completes it are one turn, so a second write for a `seq` that is already
+   * there updates that line and nothing else. That is also what makes the method
+   * safe to retry: a batch whose response a client never saw can be sent again
+   * without duplicating a word of the call.
+   *
+   * What a caller still cannot do is reorder or delete. `seq` is a position, a
+   * position is assigned by whoever observed the conversation, and no write
+   * moves a line off its position. A caller with a valid link can therefore
+   * rewrite the words of *its own* transcript -- which is a capability it
+   * already has, since it can append anything at all to it -- and cannot touch
+   * another appointment's, or erase one. That is the whole of the blast radius,
+   * and it is why this is a store method and not a `replaceTranscript`.
+   *
+   * Zero when there is no such appointment, which is a miss rather than a
+   * failure: a write for a record that is not there has nothing to store, and
+   * the caller above it decides what to say about that. It never creates a
+   * transcript for an appointment that does not exist, because an orphan
+   * transcript is a patient's conversation with no record behind it and nothing
+   * that would ever let it be deleted with the record.
+   *
+   * The whole batch is validated before any of it is written, so a partly valid
+   * batch stores nothing: half a call is not a call. A batch that names the same
+   * position twice is refused for the same reason -- one statement cannot write
+   * one line twice, and the durable store would reject it with an error about
+   * cardinality that means nothing to whoever sent it.
+   */
+  appendTranscript(appointmentId: string, lines: readonly TranscriptLine[]): Promise<number>;
+
+  /**
+   * An appointment's transcript, in the order it was said.
+   *
+   * Lines whose turn never finished are included. A stream the vendor stopped
+   * mid-utterance is closed by the relay, so in practice `finalized` is almost
+   * always true -- but "the agent was interrupted" is something a transcript
+   * should be able to show rather than a sentence to quietly drop, so the flag
+   * travels with the line instead of being used to filter one.
+   *
+   * Bounded, and the bound keeps the *tail*, because a cap that returned the
+   * first N lines would replay a long call as its opening pleasantries and drop
+   * the booking, which is the only part anyone wants. Bounded at all, because a
+   * store method that can return a whole appointment's transcript is a store
+   * method that eventually will return a whole table.
+   */
+  getTranscript(appointmentId: string, limit?: number): Promise<TranscriptLine[]>;
+}
+
+/**
+ * Who said a line.
+ *
+ * The same closed-set reasoning as `APPOINTMENT_STATUSES`, and for the same
+ * reason: a free-text role would admit "Patient", "PATIENT" and "patient " as
+ * three speakers, and this value is what a replay page groups by and what a PDF
+ * prints beside a sentence of a patient's medical history.
+ *
+ * Deliberately the two agents rather than a person. There is no clinician account
+ * in this application, and naming a role here that nothing can authenticate
+ * would be a fiction in the one place where the words are the record.
+ */
+export const TRANSCRIPT_ROLES = ["patient", "receptionist"] as const;
+
+export type TranscriptRole = (typeof TRANSCRIPT_ROLES)[number];
+
+export function isTranscriptRole(value: unknown): value is TranscriptRole {
+  return (
+    typeof value === "string" && (TRANSCRIPT_ROLES as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * One turn of a call, as the store remembers it.
+ *
+ * `at` is when the line was completed, not when the request that carried it
+ * arrived, and it is what a replay orders by and what a PDF prints beside the
+ * words.
+ */
+export interface TranscriptLine {
+  /**
+   * Position in the conversation. The caller's, and the only key a line has.
+   *
+   * Not a database sequence and not a uuid: it has to mean the same thing to
+   * the browser that produced the line and to the store that keeps it, or
+   * ordering is impossible. Monotonic within one session, from zero.
+   */
+  seq: number;
+  role: TranscriptRole;
+  /** What was said. PHI, and the reason the durable store encrypts it. */
+  text: string;
+  at: Date;
+  /** False while the line is still being streamed; see the interface comment. */
+  finalized: boolean;
+}
+
+/** How many lines `getTranscript` returns when the caller does not say. */
+export const TRANSCRIPT_LINE_LIMIT = 500;
+
+/**
+ * How long a line of speech may be, in characters.
+ *
+ * A bound rather than a validation of content: the point is that a caller
+ * cannot turn the transcript endpoint into somewhere to put an unbounded body,
+ * and a booking call's longest utterance is a sentence or two. A line longer
+ * than this is a caller that is not writing a transcript.
+ */
+export const MAX_TRANSCRIPT_TEXT_LENGTH = 4_000;
+
+/**
+ * Reject a line the store could not store honestly.
+ *
+ * Called by the facade so both implementations fail the same way with the same
+ * message, and by the in-memory store so it cannot be written to directly. The
+ * reasoning is `assertValidAppointmentPatch`'s: a record in a state nothing can
+ * compare against is worse than a failed request, because every later lookup
+ * silently misreads it.
+ *
+ * The messages name the field and never the value. A line's text is a patient
+ * describing their symptoms, and this error is about to be logged.
+ */
+export function assertValidTranscriptLine(line: TranscriptLine): void {
+  if (
+    typeof line.seq !== "number" ||
+    !Number.isInteger(line.seq) ||
+    line.seq < 0
+  ) {
+    throw new Error(
+      `Refusing to store a transcript line whose position is not a non-negative integer: ${JSON.stringify(line.seq)}`,
+    );
+  }
+
+  if (!isTranscriptRole(line.role)) {
+    throw new Error(
+      `Refusing to store a transcript line from an unknown role: ${JSON.stringify(line.role)}`,
+    );
+  }
+
+  if (typeof line.text !== "string" || line.text.length === 0) {
+    throw new Error("Refusing to store a transcript line with no text in it");
+  }
+
+  if (line.text.length > MAX_TRANSCRIPT_TEXT_LENGTH) {
+    throw new Error(
+      `Refusing to store a transcript line longer than ${MAX_TRANSCRIPT_TEXT_LENGTH} characters`,
+    );
+  }
+
+  if (!(line.at instanceof Date) || Number.isNaN(line.at.getTime())) {
+    throw new Error("Refusing to store a transcript line whose timestamp is not a date");
+  }
+}
+
+/** Validate a whole batch before any of it is written. Half a call is not a call. */
+export function assertValidTranscriptBatch(lines: readonly TranscriptLine[]): void {
+  for (const line of lines) assertValidTranscriptLine(line);
+
+  // One position, one line. Two lines at the same `seq` in one batch is either a
+  // bug in the batching or a caller trying to decide which of two texts is the
+  // record, and the durable store answers that with "ON CONFLICT DO UPDATE
+  // command cannot affect row a second time" -- a message about SQL internals,
+  // surfaced to somebody who was only trying to save a conversation.
+  const positions = new Set<number>();
+  for (const line of lines) {
+    if (positions.has(line.seq)) {
+      throw new Error(
+        `Refusing to store two transcript lines at the same position (${line.seq})`,
+      );
+    }
+    positions.add(line.seq);
+  }
 }
 
 /**

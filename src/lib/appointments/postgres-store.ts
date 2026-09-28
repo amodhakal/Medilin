@@ -1,6 +1,6 @@
 import { SqlError, type SqlClient } from "@/lib/storage";
 import { decryptPHI, encryptPHI, type EncryptedEnvelope } from "@/lib/encryption";
-import { isPatientAction, isAppointmentStatus, type ActionGrant, type Appointment, type AppointmentPatch, type AppointmentStore, type PatientAction } from "./store";
+import { isPatientAction, isAppointmentStatus, isTranscriptRole, assertValidTranscriptBatch, TRANSCRIPT_LINE_LIMIT, type ActionGrant, type Appointment, type AppointmentPatch, type AppointmentStore, type PatientAction, type TranscriptLine, type TranscriptRole } from "./store";
 import type { AppointmentRecord } from "@/lib/validation/intake";
 
 /**
@@ -339,6 +339,103 @@ export class PostgresAppointmentStore implements AppointmentStore {
     return rows.length === 1;
   }
 
+  /* ------------------------------ transcript ----------------------------- */
+
+  /**
+   * One statement for a whole batch, and the shape of it is the interesting
+   * part.
+   *
+   * **`INSERT ... SELECT ... FROM appointments WHERE id = $1` rather than a
+   * plain `INSERT`.** The select has no rows when the appointment does not
+   * exist, so a write for a record that is not there stores nothing and comes
+   * back as zero rows -- which is the store's "no such appointment". A plain
+   * insert would raise a foreign key violation, which is a 500 for something
+   * that is a miss, and would need a second existence check to turn back into
+   * one. The appointment table is the authority on whether an appointment
+   * exists, and this is how the write consults it without a round trip.
+   *
+   * **`unnest` over five parallel arrays**, so the statement is the same text
+   * for every batch. A transcript is a stream of small increments -- a call
+   * produces a handful of lines, each its own write -- and a round trip per
+   * line would make persisting the call cost more than making it. Nothing about
+   * the batch is assembled into SQL text: the only caller-controlled values in
+   * the statement are bound parameters, exactly as in `update`.
+   *
+   * **`ON CONFLICT (appointment_id, seq) DO UPDATE`**, and the whole of the
+   * "correct a line" contract is in that clause. A voice agent streams an
+   * utterance as partial frames and then one final; the partial and the final
+   * are one turn, and the store has to agree, or a replay reads "how how how
+   * are you". Only the four mutable columns are in the SET list, so `seq` and
+   * `appointment_id` -- the line's identity -- cannot move, and a caller cannot
+   * use a correction to reorder or re-parent a transcript.
+   *
+   * One statement also means the batch is all-or-nothing without any
+   * transaction of our own: there is no window in which half a call is stored.
+   */
+  async appendTranscript(
+    appointmentId: string,
+    lines: readonly TranscriptLine[],
+  ): Promise<number> {
+    // Validated before the statement is built, so a batch that names one
+    // position twice is refused here rather than by Postgres's "cannot affect
+    // row a second time", which says nothing to the caller that sent it.
+    assertValidTranscriptBatch(lines);
+
+    if (lines.length === 0) return 0;
+
+    await this.ready();
+
+    const rows = await this.sql.query<{ seq: number }>(
+      `INSERT INTO appointment_transcripts (appointment_id, seq, role, line, said_at, finalized)
+       SELECT $1, incoming.seq, incoming.role, incoming.line::jsonb, incoming.said_at, incoming.finalized
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::timestamptz[], $6::boolean[])
+              AS incoming(seq, role, line, said_at, finalized)
+        WHERE EXISTS (SELECT 1 FROM appointments WHERE id = $1)
+       ON CONFLICT (appointment_id, seq) DO UPDATE
+          SET role      = EXCLUDED.role,
+              line      = EXCLUDED.line,
+              said_at   = EXCLUDED.said_at,
+              finalized = EXCLUDED.finalized
+       RETURNING seq`,
+      [
+        appointmentId,
+        lines.map((line) => line.seq),
+        lines.map((line) => line.role),
+        lines.map((line) => sealText(line.text)),
+        lines.map((line) => line.at.toISOString()),
+        lines.map((line) => line.finalized),
+      ],
+    );
+
+    // No rows means the `WHERE EXISTS` matched nothing: there is no such
+    // appointment, and nothing was written. Every line of the batch produced
+    // exactly one row on the way in, so the count is the count.
+    return rows.length;
+  }
+
+  /**
+   * Newest first, bounded, then reversed here.
+   *
+   * `ORDER BY seq DESC LIMIT n` is the only shape a bounded tail is expressible
+   * in SQL, and the reversal is three lines of array work here. The alternative
+   * -- ascending with an offset computed from a count -- is a second statement
+   * and a race between the two.
+   */
+  async getTranscript(appointmentId: string, limit?: number): Promise<TranscriptLine[]> {
+    await this.ready();
+
+    const rows = await this.sql.query<TranscriptLineRow>(
+      `SELECT seq, role, line, said_at, finalized
+         FROM appointment_transcripts
+        WHERE appointment_id = $1
+        ORDER BY seq DESC
+        LIMIT $2`,
+      [appointmentId, limit === undefined ? TRANSCRIPT_LINE_LIMIT : Math.max(0, limit)],
+    );
+
+    return rows.map(toTranscriptLine).reverse();
+  }
+
   /**
    * Create the table if it is not there yet, once per process.
    *
@@ -432,6 +529,56 @@ export class PostgresAppointmentStore implements AppointmentStore {
         ON appointments (status, created_at)
     `);
 
+    // The call transcript (#57), and the most sensitive table in this schema
+    // after `appointments` itself: a patient's own account of why they
+    // telephoned, in the words the agents used.
+    //
+    // One row per line, and the primary key is `(appointment_id, seq)`. That
+    // composite is the whole storage contract, not an implementation detail: it
+    // is what makes a partial frame and the final that completes it one line
+    // rather than two, and what makes a batch that is retried idempotent
+    // without a ledger of what has been sent. `seq` is the position the
+    // conversation's own observer assigned.
+    //
+    // `ON DELETE CASCADE` is load-bearing in the way the other constraints are:
+    // a transcript that outlived its appointment would be a patient's words
+    // with no record behind them and no route to deletion. Deleting the record
+    // has to take the call with it, and the foreign key is what guarantees that
+    // nobody has to remember.
+    await this.sql.query(`
+      CREATE TABLE IF NOT EXISTS appointment_transcripts (
+        appointment_id text NOT NULL REFERENCES appointments (id) ON DELETE CASCADE,
+        seq            integer NOT NULL,
+        role           text NOT NULL,
+        line           jsonb NOT NULL,
+        said_at        timestamptz NOT NULL,
+        finalized      boolean NOT NULL DEFAULT true,
+        recorded_at    timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (appointment_id, seq),
+        -- The second line of defence for TRANSCRIPT_ROLES, for the reason
+        -- appointments_status_check is the second line of defence for
+        -- APPOINTMENT_STATUSES: the application validates before it writes, and
+        -- the constraint is what makes that validation impossible to forget or
+        -- to bypass with psql.
+        CONSTRAINT appointment_transcripts_role_check
+          CHECK (role IN ('patient', 'receptionist')),
+        -- A negative position would sort before the first line of every call and
+        -- is not a position anything can have been at.
+        CONSTRAINT appointment_transcripts_seq_check
+          CHECK (seq >= 0)
+      )
+    `);
+
+    // Stated in the schema, for the same reason `patient_info`'s is. Somebody
+    // reading this table with psql, or selecting it with `SELECT *`, should not
+    // have to know which writer put what in it -- and a column of a patient's
+    // medical conversation is the one place in this database where being wrong
+    // about that is a reportable incident rather than a code review comment.
+    await this.sql.query(`
+      COMMENT ON COLUMN appointment_transcripts.line IS
+        'Envelope-encrypted transcript text (AES-256-GCM under a per-line DEK wrapped by HIPAA_MASTER_KEY). Ciphertext, not plaintext.'
+    `);
+
     // Claims are never released, so the table only ever grows. A clinic booking
     // one reminder a day produces one row a day, which is nothing -- but the
     // statement below exists so that "nothing" is a decision somebody made rather
@@ -455,9 +602,23 @@ function seal(patientInfo: AppointmentRecord): string {
   return JSON.stringify(encryptPHI(JSON.stringify(patientInfo)));
 }
 
+/**
+ * Seal one line of a transcript.
+ *
+ * A bare string under the same envelope, not a record: there is nothing else on
+ * a transcript line but its text, and wrapping it in an object to match
+ * `patient_info` would mean a column holding a one-key map that every reader
+ * has to know the shape of. Each line gets its own DEK, which costs a key
+ * derivation per line and buys the property that one recovered key opens one
+ * sentence of one call rather than the whole conversation.
+ */
+function sealText(text: string): string {
+  return JSON.stringify(encryptPHI(text));
+}
+
 /** Open a stored record. Throws rather than returning a partial record. */
 function open(sealed: unknown): AppointmentRecord {
-  return JSON.parse(decryptPHI(toEnvelope(sealed))) as AppointmentRecord;
+  return JSON.parse(decryptPHI(toEnvelope(sealed, PATIENT_INFO_LABEL))) as AppointmentRecord;
 }
 
 /**
@@ -468,14 +629,17 @@ function open(sealed: unknown): AppointmentRecord {
  * column is wrong. A row that is not an envelope is a record this code cannot
  * read, and the honest answer is to say so rather than to return `undefined` and
  * let a patient be told they have no appointment.
+ *
+ * `label` names the column in the error, because "appointments row" is the
+ * wrong answer to give somebody debugging a transcript that will not open, and
+ * the two columns are the only places an envelope appears in this schema.
  */
-function toEnvelope(value: unknown): EncryptedEnvelope {
+function toEnvelope(value: unknown, label: string): EncryptedEnvelope {
   const parsed = typeof value === "string" ? safeParse(value) : value;
 
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("appointments row: patient_info is not a JSON object");
+    throw new Error(`${label} is not a JSON object`);
   }
-
   const source = parsed as Record<string, unknown>;
   const fields = [
     "ciphertext",
@@ -488,12 +652,15 @@ function toEnvelope(value: unknown): EncryptedEnvelope {
 
   for (const field of fields) {
     if (typeof source[field] !== "string" || source[field] === "") {
-      throw new Error(`appointments row: patient_info is missing ${field}`);
+      throw new Error(`${label} is missing ${field}`);
     }
   }
 
   return source as unknown as EncryptedEnvelope;
 }
+
+const PATIENT_INFO_LABEL = "appointments row: patient_info";
+const TRANSCRIPT_LINE_LABEL = "appointment_transcripts row: line";
 
 const COLUMNS =
   "id, patient_info, status, conversation_ended, created_at, updated_at";
@@ -577,7 +744,6 @@ function toGrantDate(value: unknown, column: string): Date {
   if (typeof value !== "string" && typeof value !== "number") {
     throw new Error(`appointment_action_grants row: ${column} is not a timestamp`);
   }
-
   const date = new Date(value);
 
   if (Number.isNaN(date.getTime())) {
@@ -649,4 +815,51 @@ function toDate(value: unknown, column: string): Date {
   }
 
   return date;
+}
+
+interface TranscriptLineRow {
+  seq: number;
+  role: string;
+  line: unknown;
+  said_at: string;
+  finalized: boolean;
+}
+
+/**
+ * Rebuild one line of a transcript from a database row.
+ *
+ * Checked rather than cast, for the reason `toAppointment` and `toActionGrant`
+ * both check theirs, and it matters more here than in either of those: a line
+ * that does not parse is a call that replays as though something was never
+ * said, and the symptom is a patient who appears not to have mentioned the
+ * thing they telephoned about. A row this code cannot open has to stop the read
+ * rather than be skipped.
+ *
+ * `role` is validated against the closed set specifically. It is the one field
+ * in this table that is not a patient's words, it is what a replay groups by
+ * and a PDF prints as a speaker, and a role the application has never heard of
+ * would be rendered as somebody's name that nobody in this system can vouch for.
+ */
+export function toTranscriptLine(row: TranscriptLineRow): TranscriptLine {
+  if (typeof row.seq !== "number" || !Number.isInteger(row.seq) || row.seq < 0) {
+    throw new Error("appointment_transcripts row: seq is not a non-negative integer");
+  }
+
+  if (!isTranscriptRole(row.role)) {
+    throw new Error(
+      `appointment_transcripts row: role is not one of the known roles (got ${JSON.stringify(row.role)})`,
+    );
+  }
+
+  if (typeof row.finalized !== "boolean") {
+    throw new Error("appointment_transcripts row: finalized is not a boolean");
+  }
+
+  return {
+    seq: row.seq,
+    role: row.role as TranscriptRole,
+    text: decryptPHI(toEnvelope(row.line, TRANSCRIPT_LINE_LABEL)),
+    at: toDate(row.said_at, "said_at"),
+    finalized: row.finalized,
+  };
 }

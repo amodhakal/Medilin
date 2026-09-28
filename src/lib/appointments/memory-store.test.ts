@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { InMemoryAppointmentStore } from "./memory-store";
-import { REMINDABLE_STATUSES, type ActionGrant, type Appointment } from "./store";
+import {
+  REMINDABLE_STATUSES,
+  type ActionGrant,
+  type Appointment,
+  type TranscriptLine,
+} from "./store";
 import type { AppointmentRecord } from "../validation/intake";
 
 // Obviously fake. This repository is public.
@@ -34,6 +39,17 @@ function appointment(id: string, overrides: Partial<Appointment> = {}): Appointm
 }
 
 const EXPIRES = new Date("2026-09-08T10:00:00.000Z");
+
+function line(overrides: Partial<TranscriptLine> = {}): TranscriptLine {
+  return {
+    seq: 0,
+    role: "patient",
+    text: "I need to see a doctor about my eye.",
+    at: new Date("2026-09-01T10:00:01.000Z"),
+    finalized: true,
+    ...overrides,
+  };
+}
 
 function grant(overrides: Partial<ActionGrant> = {}): ActionGrant {
   return {
@@ -573,4 +589,207 @@ describe("InMemoryAppointmentStore", () => {
       expect(store.claimCount).toBe(1);
     });
   });
+
+  describe("appendTranscript", () => {
+    test("appends a line to an appointment that exists", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      expect(await store.appendTranscript("a1", [line()])).toBe(1);
+      expect(await store.getTranscript("a1")).toEqual([line()]);
+    });
+
+    test("refuses to write against an appointment that is not there", async () => {
+      // Zero rather than a throw, and the reason is the same as `claimOnce`'s
+      // boolean rather than an exception: a write for a record nobody has has
+      // nothing to store, and the caller above it is the only thing that can
+      // turn that into a 404. Inventing an orphan transcript would be a patient
+      // record with no appointment behind it.
+      const store = new InMemoryAppointmentStore();
+      expect(await store.appendTranscript("missing", [line()])).toBe(0);
+    });
+
+    test("an empty batch is a no-op, not a write", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      expect(await store.appendTranscript("a1", [])).toBe(0);
+      expect(await store.getTranscript("a1")).toEqual([]);
+    });
+
+    test("returns the lines in seq order, however they arrived", async () => {
+      // The writer batches and batches interleave: a line that was streaming for
+      // four seconds finalises after a shorter line from the other agent. Order
+      // is the caller's `seq`, not the order the writes landed in, because the
+      // conversation has an order and the network does not.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      await store.appendTranscript("a1", [line({ seq: 2, text: "third" })]);
+      await store.appendTranscript("a1", [line({ seq: 0, text: "first" })]);
+      await store.appendTranscript("a1", [line({ seq: 1, text: "second" })]);
+
+      expect((await store.getTranscript("a1")).map((entry) => entry.text)).toEqual([
+        "first",
+        "second",
+        "third",
+      ]);
+    });
+
+    test("a second write for the same seq corrects the line, not the transcript", async () => {
+      // The streaming case, and the reason this is not a plain append. A voice
+      // agent sends an utterance as a run of partial frames and then a final; a
+      // store that appended each one would replay a call as "how how how are
+      // you are are are you". A partial and the final that completes it are the
+      // same turn, so the later write replaces the line in place -- and nothing
+      // else about it moves.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      await store.appendTranscript("a1", [line({ seq: 0, text: "how are", finalized: false })]);
+      await store.appendTranscript("a1", [line({ seq: 0, text: "how are you today" })]);
+
+      const stored = await store.getTranscript("a1");
+      expect(stored).toHaveLength(1);
+      expect(stored[0]).toEqual(line({ seq: 0, text: "how are you today" }));
+    });
+
+    test("re-sending a line that has not changed is a no-op, not a second line", async () => {
+      // Idempotence, and the reason a client may retry a batch whose response it
+      // never saw. Without it, one lost response would double every line the
+      // batch carried.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      await store.appendTranscript("a1", [line()]);
+      expect(await store.appendTranscript("a1", [line()])).toBe(1);
+      expect(await store.getTranscript("a1")).toHaveLength(1);
+    });
+
+    test("keeps each appointment's lines apart", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+      await store.create(appointment("a2"));
+
+      await store.appendTranscript("a1", [line({ seq: 0, text: "mine" })]);
+      await store.appendTranscript("a2", [line({ seq: 0, text: "theirs" })]);
+
+      expect((await store.getTranscript("a1")).map((entry) => entry.text)).toEqual(["mine"]);
+      expect((await store.getTranscript("a2")).map((entry) => entry.text)).toEqual(["theirs"]);
+    });
+
+    test("hands out copies, so a caller cannot rewrite a stored line", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+      await store.appendTranscript("a1", [line()]);
+
+      const [first] = await store.getTranscript("a1");
+      first!.text = "something else entirely";
+      first!.at.setUTCFullYear(1999);
+
+      expect((await store.getTranscript("a1"))[0]!.text).toBe("I need to see a doctor about my eye.");
+      expect((await store.getTranscript("a1"))[0]!.at.toISOString()).toBe(
+        "2026-09-01T10:00:01.000Z",
+      );
+    });
+
+    test("stores a copy of what it was given", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      const sent = line();
+      await store.appendTranscript("a1", [sent]);
+      sent.text = "rewritten after the fact";
+
+      expect((await store.getTranscript("a1"))[0]!.text).toBe("I need to see a doctor about my eye.");
+    });
+
+    test("refuses a line it could not store honestly", async () => {
+      // Validated before the Map is touched, for the reason
+      // `assertValidAppointmentPatch` is: a line in a state nothing can compare
+      // against is a transcript that replays wrong, silently, forever.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      await expect(
+        store.appendTranscript("a1", [line({ seq: -1 })]),
+      ).rejects.toThrow(/position/i);
+      await expect(
+        store.appendTranscript("a1", [line({ seq: 1.5 })]),
+      ).rejects.toThrow(/position/i);
+      await expect(
+        store.appendTranscript("a1", [line({ role: "operator" as TranscriptLine["role"] })]),
+      ).rejects.toThrow(/role/i);
+      await expect(
+        store.appendTranscript("a1", [line({ text: "" })]),
+      ).rejects.toThrow(/text/i);
+      await expect(
+        store.appendTranscript("a1", [line({ at: new Date("nonsense") })]),
+      ).rejects.toThrow(/timestamp/i);
+    });
+
+    test("nothing is stored when a batch is partly invalid", async () => {
+      // Validated as a batch, before any write. Half a call is not a call.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      await expect(
+        store.appendTranscript("a1", [line({ seq: 0 }), line({ seq: -2 })]),
+      ).rejects.toThrow();
+      expect(await store.getTranscript("a1")).toEqual([]);
+    });
+
+    test("refuses a batch that names one position twice", async () => {
+      // Which of two texts is the record is the caller's decision to make
+      // explicitly, in two batches, not something a single write resolves for
+      // them. The durable store cannot express it either way.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      await expect(
+        store.appendTranscript("a1", [line({ seq: 0, text: "first" }), line({ seq: 0, text: "second" })]),
+      ).rejects.toThrow(/same position/i);
+      expect(await store.getTranscript("a1")).toEqual([]);
+    });
+  });
+
+  describe("getTranscript", () => {
+    test("is empty for an appointment that has one, and for one that has not", async () => {
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      expect(await store.getTranscript("a1")).toEqual([]);
+      expect(await store.getTranscript("missing")).toEqual([]);
+    });
+
+    test("keeps the most recent lines when it has to cap, oldest first", async () => {
+      // A cap that returned the *first* N lines would replay a call as its
+      // opening pleasantries and drop the booking, which is the part anyone
+      // actually wants. So the tail is what survives, returned in order.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+
+      for (let seq = 0; seq < 10; seq += 1) {
+        await store.appendTranscript("a1", [line({ seq, text: `line ${seq}` })]);
+      }
+
+      expect((await store.getTranscript("a1", 3)).map((entry) => entry.text)).toEqual([
+        "line 7",
+        "line 8",
+        "line 9",
+      ]);
+    });
+
+    test("refuses a cap nobody asked for", async () => {
+      // Negative limits are a bug, and a bug that silently returns zero lines
+      // reads as a patient who said nothing.
+      const store = new InMemoryAppointmentStore();
+      await store.create(appointment("a1"));
+      await store.appendTranscript("a1", [line()]);
+
+      expect(await store.getTranscript("a1", 0)).toEqual([]);
+      expect(await store.getTranscript("a1", -1)).toEqual([]);
+    });
+  });
 });
+

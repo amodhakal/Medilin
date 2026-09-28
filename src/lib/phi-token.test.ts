@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
+  appointmentIdForToken,
   openRecord,
   resolveRecord,
   sealForDelivery,
@@ -326,5 +327,45 @@ describe("resolveRecord", () => {
   ])("returns null for %s, from either format", async (_label, token) => {
     setAppointmentStore(new PostgresAppointmentStore(durableStore()));
     expect(await resolveRecord(token)).toBeNull();
+  });
+});
+
+describe("appointmentIdForToken", () => {
+  test("gives back the id a reference names", () => {
+    // What the transcript surfaces need (#57): a way to ask "which appointment
+    // is this link for?" without opening the record and without going through the
+    // store. `resolveRecord` answers with a patient's data, which is the wrong
+    // question to be asking on a path that only needs a key.
+    expect(appointmentIdForToken(`2.${APPOINTMENT_ID}`)).toBe(APPOINTMENT_ID);
+  });
+
+  test("a sealed token has no appointment behind it, and says so", () => {
+    // Version 1 is the record itself, ciphertext, in the URL. There is no id in
+    // it because there is no row: it resolves anywhere forever and is not
+    // deletable. A surface that needs an id -- a transcript, an export -- cannot
+    // address one, and returning null is the honest answer rather than
+    // inventing an identifier out of the ciphertext.
+    expect(appointmentIdForToken(sealRecord(record))).toBeNull();
+  });
+
+  test.each([
+    ["an empty string", ""],
+    ["a reference with no uuid", "2."],
+    ["a reference with a malformed uuid", "2.not-a-uuid"],
+    ["a reference with a trailing space", `2.${APPOINTMENT_ID} `],
+    ["a reference with a newline", `2.${APPOINTMENT_ID}\n`],
+    ["a version 3 reference", `3.${APPOINTMENT_ID}`],
+    ["a reference with a non-hex character in the uuid", `2.${APPOINTMENT_ID.slice(0, -1)}z`],
+    ["base64url that is not a token", "AAAA"],
+  ])("returns null for %s", (_label, token) => {
+    expect(appointmentIdForToken(token)).toBeNull();
+  });
+
+  test("reads nothing, decrypts nothing, and consults no store", () => {
+    // The value of a helper here rather than at each call site: it is a pure
+    // function over a string. No key is needed, no database is reached, and a
+    // caller cannot accidentally turn "which appointment" into "read the
+    // patient" by using it.
+    expect(() => appointmentIdForToken(`2.${APPOINTMENT_ID}`)).not.toThrow();
   });
 });

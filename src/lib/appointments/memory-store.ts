@@ -1,10 +1,13 @@
 import type { AppointmentRecord } from "@/lib/validation/intake";
 import {
   assertValidAppointmentPatch,
+  assertValidTranscriptBatch,
+  TRANSCRIPT_LINE_LIMIT,
   type ActionGrant,
   type Appointment,
   type AppointmentPatch,
   type AppointmentStore,
+  type TranscriptLine,
 } from "./store";
 
 /**
@@ -192,6 +195,72 @@ export class InMemoryAppointmentStore implements AppointmentStore {
     for (const keys of this.claims.values()) total += keys.size;
     return total;
   }
+
+  /* ------------------------------ transcript ----------------------------- */
+
+  /**
+   * Each appointment's lines, by position.
+   *
+   * A `Map` keyed by `seq` rather than an array, because the whole contract is
+   * "one line per position": the same `seq` written twice is a correction, and
+   * an array would have to be searched to know which element to replace. It is
+   * exactly as per-instance as everything else in this class -- a line written
+   * on one serverless instance is unknown to the next, and the call's transcript
+   * is truncated at the instance boundary. That is #17 rather than a new bug,
+   * and `PostgresAppointmentStore` is the answer to it.
+   */
+  private readonly transcripts = new Map<string, Map<number, TranscriptLine>>();
+
+  async appendTranscript(
+    appointmentId: string,
+    lines: readonly TranscriptLine[],
+  ): Promise<number> {
+    // The whole batch, before the first write, so a partly valid batch stores
+    // nothing at all. `assertValidAppointmentPatch` is called the same way.
+    assertValidTranscriptBatch(lines);
+
+    if (lines.length === 0) return 0;
+
+    // Checked before anything is written, so a refused write leaves no partial
+    // transcript behind for an appointment that does not exist.
+    if (!this.appointments.has(appointmentId)) return 0;
+
+    let stored = this.transcripts.get(appointmentId);
+    if (!stored) {
+      stored = new Map<number, TranscriptLine>();
+      this.transcripts.set(appointmentId, stored);
+    }
+
+    for (const line of lines) {
+      stored.set(line.seq, cloneLine(line));
+    }
+
+    return lines.length;
+  }
+
+  async getTranscript(appointmentId: string, limit?: number): Promise<TranscriptLine[]> {
+    const stored = this.transcripts.get(appointmentId);
+    if (!stored) return [];
+
+    // A negative cap is clamped to nothing rather than to everything. `slice`
+    // with a negative number counts from the end, which would turn a bug into
+    // "here is the whole conversation" -- the opposite of what a negative limit
+    // means anywhere else.
+    const cap = limit === undefined ? TRANSCRIPT_LINE_LIMIT : Math.max(0, limit);
+
+    const ordered = [...stored.values()].sort((a, b) => a.seq - b.seq);
+
+    // The tail, in order: see `getTranscript` on the interface for why a cap
+    // keeps the end of the conversation.
+    return (cap >= ordered.length ? ordered : ordered.slice(ordered.length - cap)).map(cloneLine);
+  }
+
+  /** Test seam. Not part of `AppointmentStore`. */
+  get transcriptCount(): number {
+    let total = 0;
+    for (const lines of this.transcripts.values()) total += lines.size;
+    return total;
+  }
 }
 
 /**
@@ -260,4 +329,16 @@ export function cloneGrant(grant: ActionGrant): ActionGrant {
     expiresAt: new Date(grant.expiresAt.getTime()),
     withdrawnAt: grant.withdrawnAt === null ? null : new Date(grant.withdrawnAt.getTime()),
   };
+}
+
+/**
+ * The same for a transcript line.
+ *
+ * A separate function rather than a generic deep copy because this is the one
+ * record in this file that is a long, patient-authored string: handing out the
+ * stored object would let a caller holding a replayed line rewrite the stored
+ * one, which is the whole defect `clone` above was written to remove.
+ */
+export function cloneLine(line: TranscriptLine): TranscriptLine {
+  return { ...line, at: new Date(line.at.getTime()) };
 }

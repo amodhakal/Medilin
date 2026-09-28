@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useAgentRelay, type AgentSide } from "@/hooks/useAgentRelay";
 import {
   createAgentSocketFactory,
@@ -15,6 +15,7 @@ import { SessionBadge, SessionNotice } from "@/components/spectate/SessionStatus
 import { PatientProfile } from "@/components/spectate/PatientProfile";
 import { SessionLink } from "@/components/spectate/SessionLink";
 import { Transcript } from "@/components/spectate/Transcript";
+import { pendingTranscriptLines, type RelayTranscriptEntry } from "./transcriptSync";
 
 /**
  * The fields this page renders and forwards to the voice agent.
@@ -45,6 +46,21 @@ export interface SpectatePatient {
 /** Where a browser asks this app's server for a signed conversation URL. */
 const SESSION_ENDPOINT = "/api/voice/session";
 
+/** Where a browser hands the finished lines of a call to be kept. */
+const TRANSCRIPT_ENDPOINT = "/api/transcript";
+
+/**
+ * How long to wait before sending a batch.
+ *
+ * Long enough that a call's rapid exchanges go out together, short enough that
+ * the last thing said before a tab is closed is not the thing that is lost. This
+ * is the only window in which a line can go missing: the relay finalises a line
+ * and the page can be closed before the next flush, and the alternative -- a
+ * request per line -- would put a round trip between the call and its record for
+ * every sentence in it.
+ */
+const TRANSCRIPT_FLUSH_MS = 750;
+
 /**
  * The spectate page.
  *
@@ -53,17 +69,32 @@ const SESSION_ENDPOINT = "/api/voice/session";
  * live in @/components/spectate. What is left here is the record this page was
  * given, the decision about what to say to each agent, and -- since #15 -- the
  * one socket factory that replaced a pair of agent ids.
+ *
+ * Since #57 it is also the only place the finished lines of a call leave the
+ * browser, which is why the effect that does it is here rather than in the hook:
+ * the hook is a state machine with no opinion about the network, and the page is
+ * where the page's own endpoints are already known.
  */
 export default function SpectateClient({
   patient,
   voiceAvailable,
   sessionToken,
+  transcriptAvailable,
 }: {
   patient: SpectatePatient;
   /** Whether this deployment has a voice credential at all. */
   voiceAvailable: boolean;
   /** The sealed spectate token, which is what authorises a voice session. */
   sessionToken: string;
+  /**
+   * Whether this link can address a stored transcript at all.
+   *
+   * Decided on the server, because deciding it in the browser would mean asking
+   * the server -- or worse, guessing. A version 1 token is the record sealed into
+   * the URL with nothing stored behind it, so there is no transcript to replay
+   * for it, and a link on the page that always 404s is worse than no link.
+   */
+  transcriptAvailable: boolean;
 }) {
   // Memoised so the relay's effect dependencies are stable. The strings are
   // built here rather than inside the hook so that everything derived from the
@@ -194,6 +225,102 @@ export default function SpectateClient({
   const reconnectReceptionist = useCallback(() => reconnect("receptionist"), [reconnect]);
 
   /**
+   * The lines the server has acknowledged, and the ones a request is carrying.
+   *
+   * Two sets rather than one, and the reason is the difference between losing a
+   * line and sending it twice. A line is only added to `sent` when the server has
+   * said it stored it, so a request that fails is retried on the next flush; and
+   * the store keys a line by its position, so a line that *is* sent twice corrects
+   * itself rather than appearing twice in a patient's record. Marking a line as
+   * sent before the request would have been simpler and would have dropped the
+   * lines whose response nobody saw -- which on a flaky connection is most of a
+   * call.
+   *
+   * Refs rather than state: this is bookkeeping for an effect, and putting it in
+   * state would re-render the whole page every time a line was acknowledged.
+   */
+  const sentLines = useRef<Set<number>>(new Set());
+  const linesInFlight = useRef<Set<number>>(new Set());
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * Hand the finished lines to the server.
+   *
+   * The failure path is quiet on purpose. A transcript that could not be saved is
+   * a problem, and a call operator watching a demo is not the person who can fix
+   * it -- so it is logged and the page says what it can honestly say ("this call
+   * is not being written down") rather than pretending. `clientLog` runs the same
+   * allowlist as the server logger, and the fields here are the appointment's
+   * absence and a count: there is no transcript text in this call, which is the
+   * redaction posture for a surface whose payload is the PHI.
+   */
+  const flushTranscript = useCallback(
+    async (entries: readonly RelayTranscriptEntry[]) => {
+      const pending = pendingTranscriptLines(entries, sentLines.current).filter(
+        (line) => !linesInFlight.current.has(line.seq),
+      );
+      if (pending.length === 0) return;
+
+      for (const line of pending) linesInFlight.current.add(line.seq);
+
+      try {
+        const response = await fetch(TRANSCRIPT_ENDPOINT, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: sessionToken, entries: pending }),
+        });
+
+        if (!response.ok) throw new Error(`transcript refused: ${response.status}`);
+
+        for (const line of pending) sentLines.current.add(line.seq);
+      } catch (error) {
+        // Left unsent on purpose, so the next flush tries again. A transient
+        // network failure should cost a line a moment, not a call.
+        clientLog("warn", "transcript.flush_failed", {
+          errorName: error instanceof Error ? error.name : "unknown",
+          count: pending.length,
+        });
+      } finally {
+        for (const line of pending) linesInFlight.current.delete(line.seq);
+      }
+    },
+    [sessionToken],
+  );
+
+  /**
+   * Flush on a short debounce, and immediately when the call is stopped.
+   *
+   * The debounce coalesces a burst of finalisations into one request; the
+   * immediate flush on `stopped` is what makes the last exchange of a call
+   * durable rather than dependent on a timer that is about to be cleared.
+   */
+  useEffect(() => {
+    if (transcript.length === 0) return;
+
+    if (phase === "stopped") {
+      if (flushTimer.current !== null) {
+        clearTimeout(flushTimer.current);
+        flushTimer.current = null;
+      }
+      void flushTranscript(transcript);
+      return;
+    }
+
+    if (flushTimer.current !== null) clearTimeout(flushTimer.current);
+    flushTimer.current = setTimeout(() => {
+      flushTimer.current = null;
+      void flushTranscript(transcript);
+    }, TRANSCRIPT_FLUSH_MS);
+
+    return () => {
+      if (flushTimer.current !== null) {
+        clearTimeout(flushTimer.current);
+        flushTimer.current = null;
+      }
+    };
+  }, [transcript, phase, flushTranscript]);
+
+  /**
    * What a card says when it has nothing on it.
    *
    * The relay knows which side owes it a reply, so the card says that rather
@@ -301,18 +428,45 @@ export default function SpectateClient({
             <p className="text-xs text-slate-400 mb-1">
               {transcript.length} {transcript.length === 1 ? "line" : "lines"} were exchanged.
             </p>
+            {/*
+              The copy here used to say the transcript "is not written to storage
+              and is gone on reload, because it is the patient's appointment and
+              somewhere else to keep it is a decision this page should not make".
+              #57 is that decision, taken deliberately rather than deferred: it is
+              envelope-encrypted per line, audited on every read and every
+              export, deleted with the appointment, and reachable only through
+              the same link this page already holds. So it says what is now true.
+            */}
             <p className="text-xs text-slate-500 mb-4">
-              The transcript stays in this tab&rsquo;s memory for the rest of the session. It is
-              not written to storage and it is gone on reload, because it is the
-              patient&rsquo;s appointment and somewhere else to keep it is a decision
-              this page should not make.
+              {transcriptAvailable
+                ? "The call has been written down, encrypted, and kept with the appointment. Open it again or take a copy with the links below."
+                : "This link cannot address a stored transcript, so the call is not being written down. That is the case for links minted before the clinic had a database."}
             </p>
-            <Link
-              href="/"
-              className="inline-block bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold px-6 py-2.5 rounded-xl transition-colors"
-            >
-              Start a new consultation
-            </Link>
+            <div className="flex flex-wrap items-center justify-center gap-3">
+              {transcriptAvailable && (
+                <>
+                  <Link
+                    href={`/transcript/${sessionToken}`}
+                    className="inline-block bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold px-5 py-2.5 rounded-xl text-sm transition-colors"
+                  >
+                    Open the transcript
+                  </Link>
+                  <a
+                    href={`/api/transcript/${sessionToken}/pdf`}
+                    rel="nofollow"
+                    className="inline-block bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold px-5 py-2.5 rounded-xl transition-colors"
+                  >
+                    Download as PDF
+                  </a>
+                </>
+              )}
+              <Link
+                href="/"
+                className="inline-block bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold px-6 py-2.5 rounded-xl transition-colors"
+              >
+                Start a new consultation
+              </Link>
+            </div>
           </div>
         )}
       </div>
