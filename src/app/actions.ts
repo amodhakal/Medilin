@@ -52,9 +52,21 @@ import { ConfirmationDeliveryError } from "@/app/api/_lib/deliver-confirmation";
  * already trusts, so it is also correct behind a proxy or a tunnel.
  */
 
+/**
+ * `spectateUrl` on a failure means the appointment EXISTS and only the
+ * confirmation email did not go out. That is a partial success, and it is the
+ * one case where the caller must still show the patient their link: dropping
+ * it strands someone who has a real booking and no way to reach it.
+ */
 export type SubmitIntakeResult =
   | { ok: true; spectateUrl: string; appointmentId: string }
-  | { ok: false; error: string; issues: FieldIssue[] };
+  | {
+      ok: false;
+      error: string;
+      issues: FieldIssue[];
+      spectateUrl?: string;
+      appointmentId?: string;
+    };
 
 export async function submitIntakeForm(formData: FormData): Promise<SubmitIntakeResult> {
   // Validate before spending anything. The form's `required` attributes are
@@ -72,12 +84,12 @@ export async function submitIntakeForm(formData: FormData): Promise<SubmitIntake
   const data: IntakeFormData = parsed.data;
 
   try {
-    const booking = await bookAppointment(data, "");
+    const result = await bookAppointment(data, "");
 
     return {
       ok: true,
-      spectateUrl: booking.spectateUrl,
-      appointmentId: booking.appointmentId,
+      spectateUrl: result.spectateUrl,
+      appointmentId: result.appointmentId,
     };
   } catch (error) {
     // Logged here because this path no longer goes through the route handler,
@@ -95,6 +107,11 @@ export async function submitIntakeForm(formData: FormData): Promise<SubmitIntake
         error:
           "Your appointment was created, but we could not send the confirmation email. Please contact the clinic.",
         issues: [],
+        // The booking is real, so the link travels with the warning. Absent
+        // only if a future caller throws before the record is stored, in which
+        // case there is nothing to link to and the warning stands alone.
+        spectateUrl: error.booking?.spectateUrl,
+        appointmentId: error.booking?.appointmentId,
       };
     }
 

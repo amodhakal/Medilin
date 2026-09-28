@@ -88,7 +88,10 @@ export async function bookAppointment(
   // email as undelivered instead of claiming a booking went through cleanly.
   if (!delivery.ok) {
     logError("intake.confirmation_failed", undefined, { language: sourceLanguage });
-    throw new ConfirmationDeliveryError(delivery.reason);
+    throw new ConfirmationDeliveryError(delivery.reason, {
+      appointmentId: appointment.id,
+      spectateUrl,
+    });
   }
 
   logInfo("intake.confirmation_sent", { language: sourceLanguage });

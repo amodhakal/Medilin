@@ -190,6 +190,38 @@ describe("submitIntakeForm", () => {
     expect(result.ok).toBe(false);
   });
 
+  test("hands the patient the link to a booking whose email failed", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ message: "domain not verified" }), {
+        status: 422,
+      })) as unknown as typeof fetch;
+
+    const result = await submitIntakeForm(form());
+
+    if (result.ok) throw new Error("expected a partial success");
+    // The record is stored before the email is sent, so the link has to
+    // travel with the warning. Without it a patient holding a real booking has
+    // no way to reach it.
+    expect(result.spectateUrl).toBeTruthy();
+    expect(result.spectateUrl).toContain("/spectate/");
+    expect(result.appointmentId).toBeTruthy();
+  });
+
+  test("does not leak the record into the link it hands back", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ message: "domain not verified" }), {
+        status: 422,
+      })) as unknown as typeof fetch;
+
+    const result = await submitIntakeForm(form());
+    if (result.ok) throw new Error("expected a partial success");
+
+    // The link is a sealed token, so nothing patient-shaped rides along with
+    // it, even on the path where we are being as helpful as possible.
+    expect(result.spectateUrl).not.toContain("patientInfo");
+    expect(result.spectateUrl).not.toContain("?");
+  });
+
   test("says the appointment exists, so the patient does not book twice", async () => {
     globalThis.fetch = (async () =>
       new Response(JSON.stringify({ message: "domain not verified" }), {

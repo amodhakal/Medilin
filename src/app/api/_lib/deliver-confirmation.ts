@@ -48,7 +48,19 @@ export type DeliveryFailure = "translation_failed" | "email_failed";
  * contain the payload it failed on.
  */
 export class ConfirmationDeliveryError extends Error {
-  constructor(readonly reason: DeliveryFailure) {
+  constructor(
+    readonly reason: DeliveryFailure,
+    /**
+     * The booking that exists without its confirmation.
+     *
+     * The record is stored before the email is sent, so at the point this is
+     * thrown the patient genuinely has an appointment. Carrying the reference
+     * means the caller can hand them the link to it instead of only a warning,
+     * which is the difference between a partial success the patient can act on
+     * and one that strands them.
+     */
+    readonly booking?: { appointmentId: string; spectateUrl: string },
+  ) {
     super(`Confirmation email was not delivered: ${reason}`);
     this.name = "ConfirmationDeliveryError";
   }

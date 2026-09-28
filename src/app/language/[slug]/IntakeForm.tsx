@@ -145,6 +145,27 @@ export default function IntakeForm({
       // submission looked identical to a booking until the page silently did
       // nothing.
       if (!result.ok) {
+        // A partial success is not a rejection. The appointment was stored and
+        // only the confirmation email failed, so the patient still needs the
+        // link to reach it. Showing only the warning would strand someone
+        // holding a real booking, and telling them it failed would invite a
+        // resubmission that books twice.
+        if (result.spectateUrl && result.appointmentId) {
+          clientLog("warn", "intake.confirmation_undelivered", {
+            language: slug,
+          });
+          setErrors({});
+          setUnattached([result.error]);
+          toast.error(t.submitFailed);
+          setBooked({
+            url: result.spectateUrl,
+            appointmentId: result.appointmentId,
+          });
+          setRemaining(REDIRECT_SECONDS);
+          setStaying(false);
+          return;
+        }
+
         const collected = collectIssues(result.issues);
         setErrors(collected.byField);
         setUnattached(
