@@ -8,6 +8,7 @@ import { internalHeaders } from "@/lib/auth/internal";
 import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
 import { logError, logInfo } from "@/lib/logger";
 import { sealRecord } from "@/lib/phi-token";
+import { negotiateAppointmentTime } from "../_lib/schedule";
 
 const INTAKE_LIMIT = 5;
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -43,9 +44,12 @@ export async function POST(request: NextRequest) {
 
     const mockHospitalResponse = {
       patientInfo: translatedData,
-      agreedDateTime: new Date(
-        Date.now() + Math.floor(Math.random() * 86400000),
-      ).toISOString(),
+      // Was `now + random(0, 24h)`, which ignored the slot the patient asked
+      // for and could confirm a time earlier than the one in the form. The
+      // clinic now negotiates forward from the request; see _lib/schedule.
+      agreedDateTime: negotiateAppointmentTime(
+        translatedData.appointmentDateTime,
+      ),
       confirmed: true,
       hospitalName: getClinicName(),
       referenceNumber: `HOSP-${appointment.id}`,
