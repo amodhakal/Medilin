@@ -84,7 +84,10 @@ export const appointmentRecordSchema = z
     insurance: z.enum(["yes", "no"]),
     phone: z.string().trim().min(5).max(40),
     appointmentDateTime: z.string().min(1),
-    medical_department: z.string().trim().min(1).max(100),
+    // Constrained to the same enum as the form. The model translates a
+    // department label from the patient's language into English, and that
+    // translation has to land on one of the values the form actually offers.
+    medical_department: z.enum(MEDICAL_DEPARTMENTS),
     additionalInfo: z.string().max(2000),
     language: z.enum(SUPPORTED_LANGUAGES),
   })
