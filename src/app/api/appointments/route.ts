@@ -1,16 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createAppointment, getAppointment } from "@/lib/appointments";
+import { appointmentRequestSchema } from "@/lib/validation/intake";
+import { parseJsonBody } from "@/lib/validation/parse";
 
 export async function POST(request: NextRequest) {
-  const patientInfo = await request.json();
+  const parsed = await parseJsonBody(request, appointmentRequestSchema);
+  if (!parsed.ok) return parsed.response;
 
-  if (!patientInfo || Object.keys(patientInfo).length === 0) {
-    return NextResponse.json(
-      { error: "Patient information is required" },
-      { status: 400 }
-    );
-  }
-
+  const patientInfo = parsed.data;
   const appointment = createAppointment(patientInfo);
 
   const { email, language, ...doctorInfo } = patientInfo;

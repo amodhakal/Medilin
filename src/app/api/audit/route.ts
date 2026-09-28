@@ -1,15 +1,14 @@
 import { NextResponse } from 'next/server';
 import { auditLogger } from '@/lib/audit';
+import { auditEntrySchema } from '@/lib/validation/intake';
+import { parseJsonBody } from '@/lib/validation/parse';
 
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-    const { actor, action, resource, details } = body;
+    const parsed = await parseJsonBody(request, auditEntrySchema);
+    if (!parsed.ok) return parsed.response;
 
-    if (!actor || !action || !resource) {
-      return NextResponse.json({ error: 'Missing required fields: actor, action, resource' }, { status: 400 });
-    }
-
+    const { actor, action, resource, details } = parsed.data;
     const entry = auditLogger.log(actor, action, resource, details);
     return NextResponse.json({ success: true, entry });
   } catch (error) {

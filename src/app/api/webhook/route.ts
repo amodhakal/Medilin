@@ -3,21 +3,15 @@ import { translateFromEnglish } from "@/lib/translateFromEnglish";
 import { Resend } from "resend";
 import { getEmailFrom } from "@/config";
 import { getServerEnv } from "@/lib/env";
+import { parseJsonBody } from "@/lib/validation/parse";
+import { webhookPayloadSchema } from "@/lib/validation/intake";
 
 export async function POST(request: NextRequest) {
   try {
-    const requestBody = await request.json();
-    const { email, language, info } = requestBody;
+    const parsed = await parseJsonBody(request, webhookPayloadSchema);
+    if (!parsed.ok) return parsed.response;
 
-    if (!email || !language || !info) {
-      return NextResponse.json(
-        {
-          error:
-            "Missing required fields: email, language, and info are required",
-        },
-        { status: 401 },
-      );
-    }
+    const { email, language, info } = parsed.data;
 
     console.log(
       `Webhook original: `,

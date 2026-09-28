@@ -108,6 +108,23 @@ export const webhookPayloadSchema = z
 export const appointmentRequestSchema = intakeSchema;
 
 /**
+ * Payload accepted by the audit write endpoint.
+ *
+ * Note that the caller supplies `actor`, which means a caller can attribute
+ * an entry to anyone. Constraining it to a string bounds the damage but does
+ * not solve it; the actor has to come from an authenticated identity, which
+ * is what makes the audit trail worth having.
+ */
+export const auditEntrySchema = z
+  .object({
+    actor: z.string().trim().min(1).max(200),
+    action: z.string().trim().min(1).max(100),
+    resource: z.string().trim().min(1).max(200),
+    details: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict();
+
+/**
  * Read a submission out of FormData.
  *
  * FormData is a string map, so every value arrives as a string or a File.

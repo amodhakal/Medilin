@@ -2,11 +2,16 @@ import { NextRequest, NextResponse } from "next/server";
 import { translateToEnglish } from "@/lib/translateToEnglish";
 import { createAppointment } from "@/lib/appointments";
 import { getClinicName } from "@/config";
+import { intakeSchema } from "@/lib/validation/intake";
+import { parseJsonBody } from "@/lib/validation/parse";
 
 export async function POST(request: NextRequest) {
   try {
-    const data = await request.json();
-    const sourceLanguage = (data.language as string) || "english";
+    const parsed = await parseJsonBody(request, intakeSchema);
+    if (!parsed.ok) return parsed.response;
+
+    const data = parsed.data;
+    const sourceLanguage = data.language;
     console.log("Processing intake form from:", sourceLanguage, data);
 
     const translatedData = await translateToEnglish(data, sourceLanguage);

@@ -98,13 +98,19 @@ export default function LanguagePage({ params }: PageProps) {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
     formData.append("language", lang);
-    const response = await submitIntakeForm(formData);
+    const result = await submitIntakeForm(formData);
+
+    // The previous version showed a success toast unconditionally and then
+    // redirected only if a spectateUrl happened to be present, so a rejected
+    // submission looked identical to a booking until the page silently did
+    // nothing.
+    if (!result.ok) {
+      toast.error(result.error);
+      return;
+    }
 
     toast.success(t.toastProcessing);
-    
-    if (response.spectateUrl) {
-      window.location.href = response.spectateUrl;
-    }
+    window.location.href = result.spectateUrl;
   };
 
   return (
