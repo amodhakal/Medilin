@@ -19,8 +19,8 @@ export default function HomePage() {
             Medilin
           </span>
         </div>
-        <div className="text-xs font-medium text-cyan-700 bg-cyan-50 border border-cyan-200 px-3.5 py-1.5 rounded-full">
-          HIPAA Compliant Voice Bridge
+        <div className="text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 px-3.5 py-1.5 rounded-full">
+          Prototype &mdash; not for clinical use
         </div>
       </header>
 
@@ -32,7 +32,7 @@ export default function HomePage() {
         </h1>
 
         <p className="text-slate-600 text-lg sm:text-xl max-w-2xl mx-auto mb-12 font-normal leading-relaxed">
-          Streamline patient intake with autonomous AI voice agents. Select your preferred language to begin your secure consultation.
+          Streamline patient intake with autonomous AI voice agents. Select your preferred language to begin.
         </p>
 
         {/* Language Cards Grid */}
