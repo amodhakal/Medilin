@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so a push that lands mid-review does
+# not leave a stale green sitting on the PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      # --frozen-lockfile fails if bun.lock is out of sync with package.json,
+      # which is the failure mode a plain install would hide.
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      # The encryption and audit chain checks, which are otherwise only
+      # reachable by running a script by hand.
+      - name: Verify encryption and audit chain
+        run: bun run verify:hipaa
+
+      # Required env vars, with throwaway values. Anything that reaches for a
+      # real credential at build time is the bug this catches.
+      - name: Build
+        run: bun run build
+        env:
+          GEMINI_KEY: ci-placeholder
+          RESEND_KEY: ci-placeholder
+          HIPAA_MASTER_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+          ELEVENLABS_AGENT_PATIENT_ID: ci-placeholder
+          ELEVENLABS_AGENT_RECEPTIONIST_ID: ci-placeholder
