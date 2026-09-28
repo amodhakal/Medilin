@@ -6,6 +6,7 @@ import { getServerEnv } from "@/lib/env";
 import { logError, logInfo } from "@/lib/logger";
 import { translateFromEnglish } from "@/lib/translateFromEnglish";
 import type { SupportedLanguage } from "@/lib/validation/intake";
+import { buildAppointmentIcs, buildIcsEvent, parseAppointmentDetails } from "./ics";
 
 /**
  * Sending the patient's confirmation email.
@@ -31,6 +32,20 @@ export interface ConfirmationRequest {
   language: SupportedLanguage;
   /** The hospital's response, serialised. Translated into `language`. */
   info: string;
+  /**
+   * Explicit appointment details for the calendar invite.
+   *
+   * When omitted, the invite is derived from `info` (which carries the
+   * negotiated `agreedDateTime`): the booking path needs no changes to get
+   * the attachment, and callers that already know the slot can pass it
+   * directly instead.
+   */
+  appointment?: {
+    startIso: string;
+    summary?: string;
+    description?: string;
+    durationMinutes?: number;
+  };
 }
 
 export type DeliveryResult =
@@ -92,11 +107,45 @@ export async function deliverConfirmation(
   try {
     const resend = new Resend(getServerEnv().RESEND_KEY);
 
+    // The calendar invite (#58): a hand-rolled VCALENDAR attached as
+    // `appointment.ics`, so the patient can add the negotiated slot to their
+    // diary straight from the email. Built after translation so a broken
+    // invite can never fail the delivery: no invite means "send without the
+    // attachment", never "do not send".
+    let attachments:
+      | { filename: string; content: Buffer; contentType: string }[]
+      | undefined;
+    try {
+      const ics = request.appointment
+        ? buildIcsEvent({
+            startIso: request.appointment.startIso,
+            durationMinutes: request.appointment.durationMinutes,
+            summary: request.appointment.summary ?? "Medical appointment",
+            description: request.appointment.description,
+          })
+        : (() => {
+            const details = parseAppointmentDetails(request.info);
+            return details ? buildAppointmentIcs(details) : null;
+          })();
+      if (ics) {
+        attachments = [
+          {
+            filename: "appointment.ics",
+            content: Buffer.from(ics, "utf-8"),
+            contentType: "text/calendar; method=PUBLISH",
+          },
+        ];
+      }
+    } catch (error) {
+      logError("webhook.ics_failed", error, { language: request.language });
+    }
+
     const { error } = await resend.emails.send({
       from: getEmailFrom(),
       to: [request.email],
       subject,
       html: body,
+      ...(attachments ? { attachments } : {}),
     });
 
     if (error) {
