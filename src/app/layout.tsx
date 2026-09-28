@@ -15,6 +15,8 @@ import "react-toastify/dist/ReactToastify.css";
 import "./globals.css";
 
 import { rootMetadata } from "@/i18n/metadata";
+import { DisplayPreferences } from "@/i18n/display-preferences";
+import { DEFAULT_LANGUAGE, messagesFor } from "@/i18n/registry";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -58,6 +60,17 @@ export default function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
+        {/*
+          The first thing in the tab order on every page. The language page is
+          one form and the home page is a short list, so the alternative is
+          tabbing through the chrome to reach either.
+        */}
+        <a className="skip-link" href="#main">
+          {messagesFor(DEFAULT_LANGUAGE).skipToForm}
+        </a>
+        {/* Applies the low-bandwidth preference to the document. Renders
+            nothing; see the file for why it is a component and not a script. */}
+        <DisplayPreferences />
         {children}
       </body>
     </html>

@@ -17,17 +17,17 @@ export default function LanguageNotFound() {
   const t = messagesFor("english");
 
   return (
-    <main className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-6">
+    <main id="main" className="min-h-screen bg-paper text-ink flex items-center justify-center p-6">
       <div className="w-full max-w-xl text-center">
-        <p className="font-mono text-xs uppercase tracking-widest text-cyan-700">
+        <p className="font-mono text-xs uppercase tracking-widest text-accent">
           404
         </p>
-        <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mt-2 mb-3">
+        <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-ink mt-2 mb-3">
           {t.notFoundTitle}
         </h1>
-        <p className="text-sm text-slate-600 leading-relaxed mb-8">{t.notFoundBody}</p>
+        <p className="text-sm text-ink-muted leading-relaxed mb-8">{t.notFoundBody}</p>
 
-        <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
+        <h2 className="text-xs font-semibold text-ink-muted uppercase tracking-wider mb-3">
           {t.pickLanguage}
         </h2>
         <ul className="flex flex-wrap justify-center gap-3">
@@ -39,7 +39,7 @@ export default function LanguageNotFound() {
                   href={`/language/${slug}`}
                   lang={language.locale}
                   dir={language.direction}
-                  className="inline-flex items-center gap-2 bg-white border border-slate-200 hover:border-cyan-500 rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-800 hover:text-cyan-700 transition-colors"
+                  className="inline-flex items-center gap-2 bg-surface border border-rule hover:border-accent rounded-xl px-4 py-2.5 text-sm font-semibold text-ink hover:text-accent transition-colors"
                 >
                   <span aria-hidden="true">{language.flag}</span>
                   {language.name}
@@ -52,7 +52,7 @@ export default function LanguageNotFound() {
         <p className="mt-8">
           <Link
             href="/"
-            className="text-xs font-semibold text-cyan-700 hover:text-cyan-800"
+            className="text-xs font-semibold text-accent hover:text-accent-strong tap-target"
           >
             &larr; {t.back}
           </Link>

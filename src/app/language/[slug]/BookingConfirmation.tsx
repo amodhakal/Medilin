@@ -45,7 +45,7 @@ export function BookingConfirmation({
   return (
     <div className="text-center">
       <div
-        className="mx-auto mb-6 flex h-12 w-12 items-center justify-center rounded-full border-2 border-cyan-700 text-cyan-700"
+        className="mx-auto mb-6 flex h-12 w-12 items-center justify-center rounded-full border-2 border-accent text-accent"
         aria-hidden="true"
       >
         <svg
@@ -62,11 +62,11 @@ export function BookingConfirmation({
       <h1
         ref={headingRef}
         tabIndex={-1}
-        className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mb-2"
+        className="text-2xl sm:text-3xl font-bold tracking-tight text-ink mb-2"
       >
         {t.bookedTitle}
       </h1>
-      <p className="text-sm text-slate-600 leading-relaxed mb-8 max-w-sm mx-auto">
+      <p className="text-sm text-ink-muted leading-relaxed mb-8 max-w-sm mx-auto">
         {t.bookedBody}
       </p>
 
@@ -76,12 +76,12 @@ export function BookingConfirmation({
       */}
       <a
         href={url}
-        className="w-full inline-flex items-center justify-center bg-cyan-700 hover:bg-cyan-800 text-white font-semibold py-4 rounded-xl shadow-md transition-colors text-sm tracking-wide"
+        className="w-full inline-flex items-center justify-center bg-accent hover:bg-accent-strong text-white font-semibold py-4 rounded-xl shadow-md transition-colors text-sm tracking-wide"
       >
         {t.joinCall}
       </a>
 
-      <p className="mt-6 font-mono text-xs text-slate-500 break-all">
+      <p className="mt-6 font-mono text-xs text-ink-muted break-all">
         {t.reference}: {appointmentId}
       </p>
 
@@ -92,10 +92,10 @@ export function BookingConfirmation({
         for the person who needs to open the consultation somewhere else.
       */}
       <details className="mt-4 text-start">
-        <summary className="cursor-pointer text-xs font-semibold text-cyan-700 hover:text-cyan-800">
+        <summary className="cursor-pointer text-xs font-semibold text-accent hover:text-accent-strong tap-target">
           {t.showLink}
         </summary>
-        <p className="mt-2 font-mono text-xs text-slate-600 break-all select-all">
+        <p className="mt-2 font-mono text-xs text-ink-muted break-all select-all">
           {url}
         </p>
       </details>
@@ -108,24 +108,24 @@ export function BookingConfirmation({
         immediately as a link and a button.
       */}
       {!staying ? (
-        <p aria-hidden="true" className="mt-6 text-xs text-slate-500">
+        <p aria-hidden="true" className="mt-6 text-xs text-ink-muted">
           {remaining === 1
             ? t.redirectingInOne
             : formatMessage(t.redirectingIn, { seconds: remaining })}{" "}
           <button
             type="button"
             onClick={onStay}
-            className="font-semibold text-cyan-700 hover:text-cyan-800 underline"
+            className="font-semibold text-accent hover:text-accent-strong underline tap-target"
           >
             {t.stayHere}
           </button>
         </p>
       ) : (
-        <p className="mt-6 text-xs text-slate-500">
+        <p className="mt-6 text-xs text-ink-muted">
           <button
             type="button"
             onClick={onResume}
-            className="font-semibold text-cyan-700 hover:text-cyan-800 underline"
+            className="font-semibold text-accent hover:text-accent-strong underline tap-target"
           >
             {t.resumeRedirect}
           </button>

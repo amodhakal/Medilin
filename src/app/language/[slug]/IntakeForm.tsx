@@ -6,6 +6,7 @@ import { submitIntakeForm } from "@/app/actions";
 import { clientLog } from "@/lib/logger/client";
 import Link from "next/link";
 
+import { LowBandwidthToggle } from "@/i18n/display-preferences";
 import {
   DEPARTMENT_OPTIONS,
   htmlLang,
@@ -61,17 +62,17 @@ interface Booking {
 }
 
 const LABEL =
-  "block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5";
+  "block text-xs font-semibold text-ink-soft uppercase tracking-wider mb-1.5";
 const CONTROL =
-  "w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-colors";
+  "w-full bg-surface-sunken border border-rule rounded-xl px-4 py-3 text-sm text-ink placeholder-slate-400 focus:border-accent focus:ring-2 focus:ring-accent/20 transition-colors";
 /** Same control, marked as rejected. A border colour change alone would not be
  *  enough: it is a hue shift, and hue is not the only thing a screen reader or
  *  a monochrome display has to go on. `aria-invalid` and a message carry the
  *  state; the colour is a second signal, not the only one. */
 const CONTROL_INVALID =
-  "border-red-500 border-2 focus:border-red-600 focus:ring-red-600/20 bg-white";
-const ERROR_TEXT = "mt-1.5 text-xs font-medium text-red-700";
-const ERROR_BORDER = "border-red-400";
+  "border-danger-rule border-2 focus:border-danger focus:ring-danger/20 bg-surface";
+const ERROR_TEXT = "mt-1.5 text-xs font-medium text-danger";
+const ERROR_BORDER = "border-danger-rule";
 
 export default function IntakeForm({
   slug,
@@ -192,34 +193,41 @@ export default function IntakeForm({
   const showError = (field: IntakeFieldName) => Boolean(errors[field]);
 
   return (
-    <div
+    // `main` with an id, because the skip link in the root layout points here
+    // and because this is the page's only content: one form, on a page whose
+    // whole interactive surface is that form.
+    <main
+      id="main"
       // The document's language, declared on the part of the document that is
       // in it. A screen reader uses this to pick a voice and, for `dir`, to
       // read punctuation and numbers the right way round; without it this form
       // is announced in English with Spanish text in it.
       lang={htmlLang(language)}
       dir={language.direction}
-      className="min-h-screen bg-slate-50 text-slate-900 flex flex-col items-center justify-center p-6"
+      className="min-h-screen bg-paper text-ink flex flex-col items-center justify-center p-6"
     >
       <div className="w-full max-w-xl my-8">
-        <Link
-          href="/"
-          className="inline-flex items-center gap-2 text-xs text-cyan-700 hover:text-cyan-800 mb-6 font-semibold transition-colors"
-        >
-          {/* The arrow points back the way the page reads. */}
-          <span className="flow-arrow" aria-hidden="true">
-            &larr;
-          </span>{" "}
-          {t.back}
-        </Link>
+        <div className="mb-6 flex items-center justify-between gap-4">
+          <Link
+            href="/"
+            className="inline-flex items-center gap-2 text-xs text-accent hover:text-accent-strong font-semibold transition-colors tap-target"
+          >
+            {/* The arrow points back the way the page reads. */}
+            <span className="flow-arrow" aria-hidden="true">
+              &larr;
+            </span>{" "}
+            {t.back}
+          </Link>
+          <LowBandwidthToggle label={t.lowBandwidth} />
+        </div>
 
-        <div className="bg-white border border-slate-200 rounded-3xl p-8 shadow-xl">
+        <div className="bg-surface border border-rule rounded-3xl p-8 shadow-xl">
           {!booked && (
             <div className="mb-8 text-center">
-              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mb-2">
+              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-ink mb-2">
                 {t.title}
               </h1>
-              <p className="text-sm text-slate-600">{t.subtitle}</p>
+              <p className="text-sm text-ink-muted">{t.subtitle}</p>
             </div>
           )}
 
@@ -234,18 +242,18 @@ export default function IntakeForm({
               ref={summaryRef}
               tabIndex={-1}
               role="alert"
-              className="mb-6 rounded-2xl border-2 border-red-400 bg-red-50 p-4 text-start"
+              className="mb-6 rounded-2xl border-2 border-danger-rule bg-danger-soft p-4 text-start"
             >
-              <h2 className="text-sm font-bold text-red-800">
+              <h2 className="text-sm font-bold text-danger-ink">
                 {t.fixErrors}
               </h2>
               {hasFieldErrors(errors) && (
-                <ul className="mt-2 space-y-1 text-sm text-red-800 list-disc ps-5">
+                <ul className="mt-2 space-y-1 text-sm text-danger-ink list-disc ps-5">
                   {summaryEntries(errors, t).map((entry) => (
                     <li key={entry.field}>
                       <a
                         href={entry.href}
-                        className="underline font-semibold hover:text-red-900"
+                        className="underline font-semibold hover:text-danger-ink"
                       >
                         {entry.label}
                       </a>
@@ -256,7 +264,7 @@ export default function IntakeForm({
                 </ul>
               )}
               {unattached.map((message) => (
-                <p key={message} className="mt-2 text-sm text-red-800">
+                <p key={message} className="mt-2 text-sm text-danger-ink">
                   {message}
                 </p>
               ))}
@@ -403,27 +411,27 @@ export default function IntakeForm({
                 showError("insurance") ? ERROR_BORDER : "border-transparent"
               }`}
             >
-              <legend className="text-xs font-semibold text-slate-700 uppercase tracking-wider mb-2 px-0">
+              <legend className="text-xs font-semibold text-ink-soft uppercase tracking-wider mb-2 px-0">
                 {t.insurance}
               </legend>
-              <div className="flex flex-wrap gap-6 bg-slate-50 border border-slate-300 rounded-xl p-3.5">
-                <label className="flex items-center cursor-pointer text-sm font-medium text-slate-800">
+              <div className="flex flex-wrap gap-6 bg-surface-sunken border border-rule rounded-xl p-3.5">
+                <label className="flex items-center cursor-pointer text-sm font-medium text-ink">
                   <input
                     type="radio"
                     id="insurance"
                     name="insurance"
                     value="yes"
                     required
-                    className="me-2 accent-cyan-600 w-4 h-4"
+                    className="me-2 accent-accent w-4 h-4"
                   />
                   {t.yes}
                 </label>
-                <label className="flex items-center cursor-pointer text-sm font-medium text-slate-800">
+                <label className="flex items-center cursor-pointer text-sm font-medium text-ink">
                   <input
                     type="radio"
                     name="insurance"
                     value="no"
-                    className="me-2 accent-cyan-600 w-4 h-4"
+                    className="me-2 accent-accent w-4 h-4"
                   />
                   {t.no}
                 </label>
@@ -526,7 +534,7 @@ export default function IntakeForm({
               type="submit"
               disabled={pending}
               aria-disabled={pending}
-              className="w-full bg-cyan-700 hover:bg-cyan-800 disabled:bg-cyan-700/60 disabled:shadow-none text-white font-semibold py-4 rounded-xl shadow-md transition-colors cursor-pointer disabled:cursor-progress text-center text-sm tracking-wide inline-flex items-center justify-center gap-2.5"
+              className="w-full bg-accent hover:bg-accent-strong disabled:bg-accent/60 disabled:shadow-none text-white font-semibold py-4 rounded-xl shadow-md transition-colors cursor-pointer disabled:cursor-progress text-center text-sm tracking-wide inline-flex items-center justify-center gap-2.5"
             >
               {pending && (
                 // `motion-reduce:animate-none` so the spinner stops for anyone
@@ -582,6 +590,6 @@ export default function IntakeForm({
           )}
         </div>
       </div>
-    </div>
+    </main>
   );
 }

@@ -59,6 +59,8 @@ const ENGLISH = {
   toastProcessing: "Processing intake & spinning up AI Agent...",
   back: "Back to Languages",
   notFoundTitle: "That language is not available",
+  skipToForm: "Skip to the form",
+  lowBandwidth: "Reduce data use",
   notFoundBody:
     "This address does not match a language we offer. Pick one of the languages below to start.",
   pickLanguage: "Choose a language",
@@ -220,6 +222,8 @@ const DEFINITIONS = {
       toastProcessing: "Procesando admisión y conectando Agente IA...",
       back: "Volver a Idiomas",
       notFoundTitle: "Ese idioma no está disponible",
+      skipToForm: "Ir al formulario",
+      lowBandwidth: "Reducir el uso de datos",
       notFoundBody:
         "Esta dirección no corresponde a ningún idioma que ofrezcamos. Elige uno de los idiomas siguientes para comenzar.",
       pickLanguage: "Elegir un idioma",
@@ -281,6 +285,8 @@ const DEFINITIONS = {
       toastProcessing: "Processando admissão e iniciando Agente de Voz...",
       back: "Voltar para Idiomas",
       notFoundTitle: "Esse idioma não está disponível",
+      skipToForm: "Ir para o formulário",
+      lowBandwidth: "Reduzir o uso de dados",
       notFoundBody:
         "Este endereço não corresponde a nenhum idioma que oferecemos. Escolha um dos idiomas abaixo para começar.",
       pickLanguage: "Escolher um idioma",

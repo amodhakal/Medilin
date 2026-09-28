@@ -1,6 +1,7 @@
 import Link from "next/link";
 
 import { PROTOTYPE_NOTICE, homeMetadata } from "@/i18n/metadata";
+import { LowBandwidthToggle } from "@/i18n/display-preferences";
 import {
   DEFAULT_LANGUAGE,
   LANGUAGE_SLUGS,
@@ -18,30 +19,33 @@ const t = messagesFor(DEFAULT_LANGUAGE);
 
 export default function HomePage() {
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col justify-between p-6 sm:p-10">
+    <div className="min-h-screen bg-paper text-ink flex flex-col justify-between p-6 sm:p-10">
       {/* Header */}
       <header className="w-full max-w-6xl mx-auto flex items-center justify-between py-4">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-cyan-600 flex items-center justify-center font-bold text-xl text-white shadow-sm">
+          <div className="w-10 h-10 rounded-xl bg-accent flex items-center justify-center font-bold text-xl text-white shadow-sm">
             M
           </div>
-          <span className="text-xl font-bold tracking-tight text-slate-900">
+          <span className="text-xl font-bold tracking-tight text-ink">
             Medilin
           </span>
         </div>
-        <div className="text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 px-3.5 py-1.5 rounded-full">
-          {PROTOTYPE_NOTICE}
+        <div className="flex items-center gap-4">
+          <LowBandwidthToggle label={t.lowBandwidth} />
+          <div className="text-xs font-medium text-notice-ink bg-notice-soft border border-notice-rule px-3.5 py-1.5 rounded-full">
+            {PROTOTYPE_NOTICE}
+          </div>
         </div>
       </header>
 
       {/* Main Hero Content */}
-      <main className="w-full max-w-4xl mx-auto text-center my-auto py-12">
-        <h1 className="text-4xl sm:text-6xl font-extrabold tracking-tight mb-6 text-slate-900 leading-tight">
+      <main id="main" className="w-full max-w-4xl mx-auto text-center my-auto py-12">
+        <h1 className="text-4xl sm:text-6xl font-extrabold tracking-tight mb-6 text-ink leading-tight">
           Intelligent Medical <br />
-          <span className="text-cyan-600">Voice Assistant</span>
+          <span className="text-accent">Voice Assistant</span>
         </h1>
 
-        <p className="text-slate-600 text-lg sm:text-xl max-w-2xl mx-auto mb-12 font-normal leading-relaxed">
+        <p className="text-ink-soft text-lg sm:text-xl max-w-2xl mx-auto mb-12 font-normal leading-relaxed">
           Streamline patient intake with autonomous AI voice agents. Select your preferred language to begin.
         </p>
 
@@ -62,7 +66,7 @@ export default function HomePage() {
               <h2
                 lang={language.locale}
                 dir={language.direction}
-                className="text-lg font-bold text-slate-900 transition-colors"
+                className="text-lg font-bold text-ink transition-colors"
               >
                 {language.name}
               </h2>
@@ -84,20 +88,20 @@ export default function HomePage() {
                 <div
                   key={slug}
                   aria-disabled="true"
-                  className="bg-slate-100 border border-slate-200 rounded-2xl p-6 flex flex-col justify-between"
+                  className="bg-surface-sunken border border-rule rounded-2xl p-6 flex flex-col justify-between"
                 >
                   <div>
                     <div className="text-3xl mb-4 opacity-60" aria-hidden="true">
                       {language.flag}
                     </div>
                     {endonym}
-                    <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+                    <p className="text-xs text-ink-muted mt-1.5 leading-relaxed">
                       {t.notYetBookable}
                     </p>
                   </div>
 
                   <div className="mt-8 flex items-center">
-                    <span className="inline-flex items-center rounded-full border border-slate-300 px-2.5 py-1 text-[0.6875rem] font-semibold uppercase tracking-wider text-slate-600">
+                    <span className="inline-flex items-center rounded-full border border-rule px-2.5 py-1 text-[0.6875rem] font-semibold uppercase tracking-wider text-ink-soft">
                       {t.comingSoon}
                     </span>
                   </div>
@@ -109,19 +113,19 @@ export default function HomePage() {
               <Link
                 key={slug}
                 href={`/language/${slug}`}
-                className="group bg-white border border-slate-200 hover:border-cyan-600 rounded-2xl p-6 shadow-sm hover:shadow-md transition-all duration-200 flex flex-col justify-between"
+                className="group bg-surface border border-rule hover:border-accent rounded-2xl p-6 shadow-sm hover:shadow-md transition-all duration-200 flex flex-col justify-between"
               >
                 <div>
                   <div className="text-3xl mb-4" aria-hidden="true">
                     {language.flag}
                   </div>
-                  <div className="group-hover:text-cyan-700">{endonym}</div>
-                  <p className="text-xs text-slate-600 mt-1.5 leading-relaxed">
+                  <div className="group-hover:text-accent">{endonym}</div>
+                  <p className="text-xs text-ink-muted mt-1.5 leading-relaxed">
                     {language.description}
                   </p>
                 </div>
 
-                <div className="mt-8 flex items-center text-xs font-semibold text-cyan-700">
+                <div className="mt-8 flex items-center text-xs font-semibold text-accent">
                   {t.startIntake}{" "}
                   {/* The arrow points the way the page reads. */}
                   <span className="flow-arrow" aria-hidden="true">
@@ -135,7 +139,7 @@ export default function HomePage() {
       </main>
 
       {/* Footer */}
-      <footer className="w-full max-w-6xl mx-auto py-6 text-center text-xs text-slate-500 border-t border-slate-200">
+      <footer className="w-full max-w-6xl mx-auto py-6 text-center text-xs text-ink-muted border-t border-rule">
         &copy; {new Date().getFullYear()} Medilin Systems. Powered by ElevenLabs Conversational AI & Gemini.
       </footer>
     </div>
