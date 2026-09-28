@@ -39,7 +39,13 @@ export type AgentSide = "patient" | "receptionist";
  * a claim the page could not support: it went true when both `open` events
  * had fired and stayed true when one of them had closed.
  */
-export type SocketStatus = "idle" | "connecting" | "open" | "closed" | "failed";
+export type SocketStatus =
+  | "idle"
+  | "connecting"
+  | "open"
+  | "reconnecting"
+  | "closed"
+  | "failed";
 
 /**
  * Session-level state.
@@ -200,6 +206,19 @@ export const DEFAULT_SEND_GIVE_UP_MS = 30_000;
 export const DEFAULT_DEDUPE_WINDOW_MS = 2_000;
 
 /**
+ * Backoff before each automatic reconnect attempt, then give up.
+ *
+ * `open` at the first entry, so a socket that dropped the instant it opened is
+ * retried immediately. The tail is bounded: a vendor that is refusing
+ * connections should be told so, not hammered, and a demo that has silently
+ * been retrying for ten minutes is worse than one that says it is broken.
+ */
+export const RECONNECT_DELAYS_MS = [0, 1_000, 2_000, 4_000, 8_000] as const;
+
+/** How many finished transcript lines a reconnected agent is re-told. */
+export const RESUME_CONTEXT_LINES = 4;
+
+/**
  * Ceiling on the `pong` delay.
  *
  * `ping_ms` arrives from the network. Passed straight to a timer, a value of
@@ -347,6 +366,27 @@ export class AgentRelay {
    */
   private readonly timers = new Set<number>();
   private readonly connectTimers: Partial<PerSide<number>> = {};
+  private readonly reconnectTimers: Partial<PerSide<number>> = {};
+  private readonly reconnectAttempt: PerSide<number> = { patient: 0, receptionist: 0 };
+
+  /**
+   * Whether a side has connected at least once this session.
+   *
+   * Distinguishes a first connection from a re-open, which is the difference
+   * between sending the agent its opening brief and telling it the call is
+   * already under way.
+   */
+  private readonly connectedBefore: PerSide<boolean> = { patient: false, receptionist: false };
+
+  /**
+   * Set while we are closing a socket we have already given up on.
+   *
+   * Closing a socket that is still CONNECTING makes the browser fire `error`
+   * and `close` for it. Without this, abandoning a slow reconnect attempt
+   * would be reported as a failed connection, and `fail` tears down the whole
+   * session — so giving up on one attempt would end the call.
+   */
+  private readonly abandoning: PerSide<boolean> = { patient: false, receptionist: false };
   private readonly holdTimers: Partial<PerSide<number>> = {};
   private readonly streamTimers: Partial<PerSide<number>> = {};
   private responseTimer: number | null = null;
@@ -500,9 +540,42 @@ export class AgentRelay {
       }
     }
 
+    this.connectedBefore.patient = false;
+    this.connectedBefore.receptionist = false;
+    this.reconnectAttempt.patient = 0;
+    this.reconnectAttempt.receptionist = 0;
+
     this.openSide("patient");
     this.openSide("receptionist");
   }
+
+  /**
+   * Re-open one side's socket.
+   *
+   * The transcript is deliberately left alone. It is the only record of the
+   * call, and a dropped connection is not a reason to throw it away — but it
+   * does mean the vendor's conversation on that side is new, so
+   * `resumeContext` tells the agent what was already said.
+   */
+  reconnect(side: AgentSide): void {
+    if (this.disposed || this.stopping) return;
+    this.clearReconnectTimer(side);
+    this.reconnectAttempt[side] = 0;
+    this.patch({
+      error: null,
+      notice: null,
+      socket: { ...this.state.socket, [side]: "connecting" },
+    });
+    this.openSide(side);
+  }
+
+  /** Re-open whichever sides are not up. */
+  reconnectAll(): void {
+    for (const side of ["patient", "receptionist"] as const) {
+      if (this.state.socket[side] !== "open") this.reconnect(side);
+    }
+  }
+
   /** End the call deliberately. */
   stop(): void {
     if (this.disposed) return;
@@ -541,6 +614,58 @@ export class AgentRelay {
 
   /* -------------------------------- sockets ------------------------------ */
 
+  /**
+   * Try this side again, on a bounded backoff.
+   *
+   * Automatic, because the common case is a laptop lid closing and a demo that
+   * needs a person to notice and press a button. Bounded, because a vendor
+   * that is refusing connections should be reported rather than retried
+   * forever; the last attempt leaves the card saying it gave up, and the
+   * operator can still press Reconnect by hand.
+   */
+  private scheduleReconnect(side: AgentSide): void {
+    const attempt = this.reconnectAttempt[side];
+    if (attempt >= RECONNECT_DELAYS_MS.length) {
+      this.log("warn", "spectate.reconnect_exhausted", { resource: resourceFor(side) });
+      this.patch({
+        socket: { ...this.state.socket, [side]: "failed" },
+        notice: `Could not reconnect the ${label(side)} agent.`,
+      });
+      return;
+    }
+
+    const delay = RECONNECT_DELAYS_MS[attempt] ?? 0;
+    this.reconnectAttempt[side] = attempt + 1;
+    this.patch({ socket: { ...this.state.socket, [side]: "reconnecting" } });
+
+    this.reconnectTimers[side] = this.schedule(() => {
+      delete this.reconnectTimers[side];
+      if (this.disposed || this.stopping) return;
+      this.openSide(side);
+    }, delay);
+  }
+
+  /**
+   * Close a socket we are done with, and swallow the events it fires doing it.
+   *
+   * `close` on a CONNECTING socket produces `error` and `close`, both of which
+   * the handlers below would otherwise read as a real failure.
+   */
+  private abandonAttempt(side: AgentSide, socket: RelaySocket): void {
+    this.abandoning[side] = true;
+    this.sockets[side] = null;
+    socket.close();
+    this.abandoning[side] = false;
+  }
+
+  private clearReconnectTimer(side: AgentSide): void {
+    const handle = this.reconnectTimers[side];
+    if (handle === undefined) return;
+    this.clock.clearTimeout(handle);
+    this.timers.delete(handle);
+    delete this.reconnectTimers[side];
+  }
+
   private agentIdFor(side: AgentSide): string | undefined {
     return side === "patient" ? this.config.patientAgentId : this.config.receptionistAgentId;
   }
@@ -558,7 +683,12 @@ export class AgentRelay {
     this.sockets[side] = socket;
     this.settled[side] = false;
     this.opened[side] = false;
-    this.patch({ socket: { ...this.state.socket, [side]: "connecting" } });
+    this.patch({
+      socket: {
+        ...this.state.socket,
+        [side]: this.connectedBefore[side] ? "reconnecting" : "connecting",
+      },
+    });
 
     this.attach(side, socket);
 
@@ -566,7 +696,14 @@ export class AgentRelay {
       this.timers.delete(handle);
       delete this.connectTimers[side];
       this.log("warn", "spectate.agent_open_timeout", { resource: resourceFor(side) });
-      socket.close();
+      this.abandonAttempt(side, socket);
+      if (this.connectedBefore[side]) {
+        // A re-open that never opened is a failed attempt, not a failed call.
+        // The session carries on and the backoff gets another go.
+        this.patch({ socket: { ...this.state.socket, [side]: "closed" } });
+        this.scheduleReconnect(side);
+        return;
+      }
       this.fail(side, `The ${label(side)} agent took too long to connect.`);
     }, this.config.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
     this.timers.add(handle);
@@ -586,6 +723,7 @@ export class AgentRelay {
       // A WebSocket `error` event carries no detail in any engine and is not
       // an `Error`, so there is nothing honest to put in the log. Which side
       // of `open` it landed on is the useful part.
+      if (this.abandoning[side]) return;
       if (this.opened[side]) {
         this.log("warn", "spectate.agent_socket_error", { resource: resourceFor(side) });
         return;
@@ -595,6 +733,7 @@ export class AgentRelay {
     };
 
     socket.onclose = (event) => {
+      if (this.abandoning[side]) return;
       if (!this.opened[side]) {
         this.fail(
           side,
@@ -619,12 +758,15 @@ export class AgentRelay {
         statusCode: event.code,
       });
 
-      if (this.state.phase === "live") {
+      if (this.state.phase === "live" || this.state.phase === "degraded") {
         this.patch({
           phase: "degraded",
           notice: `The ${label(side)} agent's connection dropped.`,
         });
         this.requeueUnanswered(side);
+        this.scheduleReconnect(side);
+      } else {
+        this.patch({ socket: { ...this.state.socket, [side]: "closed" } });
       }
     };
   }
@@ -640,7 +782,16 @@ export class AgentRelay {
       return;
     }
 
-    this.log("info", "spectate.agent_connected", { resource: resourceFor(side) });
+    const resumed = this.connectedBefore[side];
+    this.connectedBefore[side] = true;
+    this.reconnectAttempt[side] = 0;
+    this.clearReconnectTimer(side);
+
+    this.log(
+      "info",
+      resumed ? "spectate.agent_reconnected" : "spectate.agent_connected",
+      { resource: resourceFor(side) }
+    );
     this.patch({ socket: { ...this.state.socket, [side]: "open" } });
 
     const init: Record<string, unknown> = {
@@ -714,10 +865,11 @@ export class AgentRelay {
 
     switch (frame.type) {
       case "conversation_initiation_client_data": {
-        const context =
-          (side === "patient"
-            ? this.config.patientOpeningContext
-            : this.config.receptionistOpeningContext) ?? "";
+        // A fresh vendor conversation on this socket. The first one gets the
+        // agent's brief; a re-open gets the conversation so far, because
+        // otherwise the agent opens with its greeting again and the operator
+        // is watching a booking call restart halfway through.
+        const context = this.contextFor(side);
         const delay = this.config.contextDelayMs ?? DEFAULT_CONTEXT_DELAY_MS;
         this.schedule(() => {
           this.sockets[side]?.send(
@@ -759,6 +911,41 @@ export class AgentRelay {
   }
 
   /* ------------------------------ turn taking ---------------------------- */
+
+  /**
+   * The brief a socket's agent gets when its conversation opens.
+   *
+   * A reconnected socket gets a short recap of the finished lines instead of
+   * the opening brief. The recap is bounded: the whole transcript would grow
+   * without limit and would eventually be larger than the agent's context.
+   */
+  private contextFor(side: AgentSide): string {
+    const opening =
+      (side === "patient"
+        ? this.config.patientOpeningContext
+        : this.config.receptionistOpeningContext) ?? "";
+
+    const spoken = this.connectedBefore[side] ? this.resumeContext() : "";
+    return [opening, spoken].filter(Boolean).join("\n\n");
+  }
+
+  private resumeContext(): string {
+    const recent = this.state.transcript
+      .filter((entry) => entry.finalized)
+      .slice(-RESUME_CONTEXT_LINES);
+    if (recent.length === 0) return "";
+
+    const lines = recent
+      .map((entry) => `${entry.role === "patient" ? "Patient" : "Receptionist"}: ${entry.text}`)
+      .join("\n");
+
+    return (
+      "The connection dropped and has been re-established. This call is already " +
+      "under way, so do not greet again and do not ask who you are speaking to. " +
+      "The conversation so far:\n" +
+      lines
+    );
+  }
 
   /**
    * One utterance from one side.
@@ -1137,6 +1324,8 @@ export class AgentRelay {
     this.timers.clear();
     this.connectTimers.patient = undefined;
     this.connectTimers.receptionist = undefined;
+    this.reconnectTimers.patient = undefined;
+    this.reconnectTimers.receptionist = undefined;
     this.holdTimers.patient = undefined;
     this.holdTimers.receptionist = undefined;
     this.streamTimers.patient = undefined;
@@ -1191,6 +1380,10 @@ export interface UseAgentRelayResult {
   state: RelayState;
   start: () => void;
   stop: () => void;
+  /** Re-open one side's socket without ending the call. */
+  reconnect: (side: AgentSide) => void;
+  /** Re-open whichever sides are not up. */
+  reconnectAll: () => void;
 }
 
 /**
@@ -1299,5 +1492,16 @@ export function useAgentRelay(options: UseAgentRelayOptions): UseAgentRelayResul
     relay.stop();
   }, [relay]);
 
-  return { state, start, stop };
+  const reconnect = useCallback(
+    (side: AgentSide) => {
+      relay.reconnect(side);
+    },
+    [relay]
+  );
+
+  const reconnectAll = useCallback(() => {
+    relay.reconnectAll();
+  }, [relay]);
+
+  return { state, start, stop, reconnect, reconnectAll };
 }

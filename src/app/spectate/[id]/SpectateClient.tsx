@@ -1,12 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import { useAgentRelay } from "@/hooks/useAgentRelay";
 import { AgentCard } from "@/components/spectate/AgentCard";
 import { CallControls } from "@/components/spectate/CallControls";
 import { SessionBadge, SessionNotice } from "@/components/spectate/SessionStatus";
 import { PatientProfile } from "@/components/spectate/PatientProfile";
+import { SessionLink } from "@/components/spectate/SessionLink";
 import { Transcript } from "@/components/spectate/Transcript";
 
 /**
@@ -87,7 +88,7 @@ export default function SpectateClient({
     [patient]
   );
 
-  const { state, start, stop } = useAgentRelay({
+  const { state, start, stop, reconnect, reconnectAll } = useAgentRelay({
     patientAgentId,
     receptionistAgentId,
     patientOpeningContext,
@@ -97,6 +98,12 @@ export default function SpectateClient({
 
   const { phase, error, notice, transcript, speaking, currentText, socket, stalled, awaiting } =
     state;
+
+  // The relay exposes one `reconnect` for both sides; the cards each know
+  // which agent they are, so the handlers are made here rather than the
+  // machine taking a component's concerns.
+  const reconnectPatient = useCallback(() => reconnect("patient"), [reconnect]);
+  const reconnectReceptionist = useCallback(() => reconnect("receptionist"), [reconnect]);
 
   /**
    * What a card says when it has nothing on it.
@@ -162,9 +169,12 @@ export default function SpectateClient({
             notice={notice}
             stalled={stalled && phase !== "degraded"}
             socket={socket}
+            onReconnect={reconnectAll}
             onDismiss={stop}
           />
         )}
+
+        <SessionLink />
 
         <PatientProfile patient={patient} />
 
@@ -177,6 +187,7 @@ export default function SpectateClient({
             speaking={speaking.patient}
             currentText={currentText.patient}
             idleHint={idleHint("patient")}
+            onReconnect={reconnectPatient}
           />
           <AgentCard
             side="receptionist"
@@ -186,6 +197,7 @@ export default function SpectateClient({
             speaking={speaking.receptionist}
             currentText={currentText.receptionist}
             idleHint={idleHint("receptionist")}
+            onReconnect={reconnectReceptionist}
           />
         </div>
 
@@ -198,9 +210,14 @@ export default function SpectateClient({
         {phase === "stopped" && (
           <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 text-center backdrop-blur-xl">
             <h3 className="text-lg font-bold text-white mb-1">Call ended</h3>
-            <p className="text-xs text-slate-400 mb-4">
+            <p className="text-xs text-slate-400 mb-1">
               {transcript.length} {transcript.length === 1 ? "line" : "lines"} were exchanged.
-              Reload the page to run it again.
+            </p>
+            <p className="text-xs text-slate-500 mb-4">
+              The transcript stays in this tab&rsquo;s memory for the rest of the session. It is
+              not written to storage and it is gone on reload, because it is the
+              patient&rsquo;s appointment and somewhere else to keep it is a decision
+              this page should not make.
             </p>
             <Link
               href="/"

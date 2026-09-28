@@ -67,12 +67,14 @@ export function SessionNotice({
   notice,
   stalled,
   socket,
+  onReconnect,
   onDismiss,
 }: {
   notice: string;
   /** True when a turn was lost but the call is still going. */
   stalled: boolean;
   socket: { patient: SocketStatus; receptionist: SocketStatus };
+  onReconnect: () => void;
   onDismiss: () => void;
 }) {
   if (stalled) {
@@ -97,15 +99,25 @@ export function SessionNotice({
       className="mb-6 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-5 py-4 text-sm text-amber-100 flex flex-wrap items-center justify-between gap-3"
     >
       <span>
-        {notice} Nothing the {down} agent says will reach the other side from here.
+        {notice} Nothing the {down} agent says will reach the other side until it is
+        back.
       </span>
-      <button
-        type="button"
-        onClick={onDismiss}
-        className="rounded-lg bg-amber-400/90 hover:bg-amber-300 text-slate-950 text-xs font-semibold px-4 py-2 transition-colors cursor-pointer"
-      >
-        End call
-      </button>
+      <span className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onReconnect}
+          className="rounded-lg border border-amber-400/40 bg-amber-400/10 hover:bg-amber-400/20 text-amber-200 text-xs font-semibold px-4 py-2 transition-colors cursor-pointer"
+        >
+          Reconnect now
+        </button>
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="rounded-lg bg-amber-400/90 hover:bg-amber-300 text-slate-950 text-xs font-semibold px-4 py-2 transition-colors cursor-pointer"
+        >
+          End call
+        </button>
+      </span>
     </div>
   );
 }

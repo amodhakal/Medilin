@@ -137,8 +137,10 @@ interface Harness {
   relay: AgentRelay;
   clock: FakeClock;
   sockets: { patient: FakeSocket; receptionist: FakeSocket };
-  /** The socket created for a given agent id. */
+  /** The current socket for a given agent id. */
   socketFor(agentId: string): FakeSocket;
+  /** Every socket ever created, oldest first. */
+  socketsOpened: FakeSocket[];
   openBoth(): void;
   logs: { level: string; message: string; fields?: Record<string, unknown> }[];
 }
@@ -147,11 +149,13 @@ function makeRelay(overrides: Partial<AgentRelayConfig> = {}): Harness {
   const clock = new FakeClock();
   const logs: Harness["logs"] = [];
   const byAgentId = new Map<string, FakeSocket>();
+  const socketsOpened: FakeSocket[] = [];
 
   const createSocket = (url: string): RelaySocket => {
     const agentId = new URL(url).searchParams.get("agent_id") ?? "";
     const socket = new FakeSocket();
     byAgentId.set(agentId, socket);
+    socketsOpened.push(socket);
     return socket;
   };
 
@@ -169,6 +173,13 @@ function makeRelay(overrides: Partial<AgentRelayConfig> = {}): Harness {
     ...overrides,
   });
 
+  /**
+   * The current socket for an agent.
+   *
+   * Reconnect replaces it, so this returns the most recent rather than the
+   * first. Tests that want to simulate a reconnect hold the reference across
+   * the event that causes one.
+   */
   const socketFor = (agentId: string): FakeSocket => {
     const socket = byAgentId.get(agentId);
     if (!socket) throw new Error(`no socket was opened for ${agentId}`);
@@ -180,6 +191,7 @@ function makeRelay(overrides: Partial<AgentRelayConfig> = {}): Harness {
     clock,
     logs,
     socketFor,
+    socketsOpened,
     sockets: {
       get patient() {
         return socketFor("agent_patient_1");
@@ -877,17 +889,187 @@ describe("turn recovery", () => {
 
     // The socket dies before it can answer. The turn goes back to the outbox
     // rather than being counted against a socket that can never reply.
-    harness.sockets.receptionist.emitClose(1006);
+    const before = harness.sockets.receptionist;
+    before.emitClose(1006);
     expect(harness.relay.getState().awaiting).toBeNull();
 
-    harness.sockets.receptionist.readyState = 1;
+    // The reconnect fires on the first backoff step, which is immediate.
+    harness.clock.advance(0);
+    const after = harness.socketFor("agent_receptionist_1");
+    expect(after).not.toBe(before);
+    after.emitOpen();
     harness.clock.advance(1_500);
+
     // Delivered once before the drop and once after it. At-least-once is the
     // right call here: a duplicated `user_message` makes the other agent say
     // something twice, whereas dropping the turn loses the call. The vendor's
     // own dedupe, if any, is a better place to settle that than this relay is.
-    expect(harness.sockets.receptionist.ofType("user_message")).toHaveLength(2);
+    expect(after.ofType("user_message")).toHaveLength(1);
+    expect(before.ofType("user_message")).toHaveLength(1);
     expect(harness.relay.getState().awaiting).toBe("receptionist");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Reconnect                                                                   */
+/* -------------------------------------------------------------------------- */
+
+describe("reconnect", () => {
+  test("re-opens a dropped socket on the first backoff step", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    const before = harness.sockets.receptionist;
+
+    before.emitClose(1006);
+    expect(harness.relay.getState().socket.receptionist).toBe("reconnecting");
+
+    harness.clock.advance(0);
+    const after = harness.socketFor("agent_receptionist_1");
+    expect(after).not.toBe(before);
+    // A re-open reads as "reconnecting" until it is actually open, which is
+    // the honest thing to show: the card should not claim to be fine.
+    expect(harness.relay.getState().socket.receptionist).toBe("reconnecting");
+
+    after.emitOpen();
+    expect(harness.relay.getState().phase).toBe("live");
+    expect(harness.relay.getState().notice).toBeNull();
+  });
+
+  test("backs off further on each failed attempt", () => {
+    const harness = makeRelay({ connectTimeoutMs: 10_000 });
+    harness.openBoth();
+    harness.sockets.receptionist.emitClose(1006);
+
+    // Attempt 1 is immediate, then 1s, 2s, 4s, 8s. Each attempt never opens,
+    // so each one times out and asks for another.
+    const delays = [0, 1_000, 2_000, 4_000, 8_000];
+    for (const delay of delays) {
+      const openedBefore = harness.socketsOpened.length;
+      harness.clock.advance(delay);
+      // A connect attempt is now in flight; let it time out.
+      harness.clock.advance(10_000);
+      expect(harness.socketsOpened.length).toBe(openedBefore + 1);
+    }
+  });
+
+  test("gives up after a bounded number of attempts and says so", () => {
+    const harness = makeRelay({ connectTimeoutMs: 1_000 });
+    harness.openBoth();
+    harness.sockets.receptionist.emitClose(1006);
+
+    harness.clock.advance(120_000);
+
+    const state = harness.relay.getState();
+    expect(state.socket.receptionist).toBe("failed");
+    expect(state.notice).toContain("Could not reconnect");
+    // The patient agent is still there. One side failing is not the session.
+    expect(state.socket.patient).toBe("open");
+    expect(harness.logs.some((l) => l.message === "spectate.reconnect_exhausted")).toBe(true);
+  });
+
+  test("does not reconnect after the operator ends the call", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    const before = harness.socketsOpened.length;
+
+    harness.relay.stop();
+    harness.clock.advance(120_000);
+
+    expect(harness.socketsOpened.length).toBe(before);
+    expect(harness.relay.getState().phase).toBe("stopped");
+  });
+
+  test("a manual reconnect overrides a pending backoff", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    harness.sockets.receptionist.emitClose(1006);
+    expect(harness.clock.pending).toBeGreaterThan(0);
+
+    harness.relay.reconnect("receptionist");
+    const attempt = harness.socketsOpened.length;
+    expect(attempt).toBe(3);
+
+    // The scheduled backoff attempt was cancelled, so nothing opens a second
+    // competing socket behind the one the operator just asked for. This socket
+    // is left unopened, so once its connect timeout runs the normal backoff
+    // resumes — that is a different timer, deliberately still armed.
+    harness.clock.advance(1_000);
+    expect(harness.socketsOpened.length).toBe(attempt);
+  });
+
+  test("reconnectAll skips the side that is still up", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    const before = harness.socketsOpened.length;
+    harness.sockets.receptionist.emitClose(1006);
+
+    harness.relay.reconnectAll();
+    expect(harness.socketsOpened.length).toBe(before + 1);
+  });
+
+  /**
+   * The "persisted transcript" half of #50.
+   *
+   * Deliberately in memory. The transcript is the patient's appointment, and
+   * localStorage or sessionStorage would put it on disk, survive the tab, and
+   * be readable by anything with the same origin. Losing it on reload is a
+   * better trade than keeping it there.
+   */
+  test("keeps the transcript across a reconnect", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    exchange(harness, "I need a dentist", "What time works?");
+
+    const before = harness.relay.getState().transcript;
+    expect(before).toHaveLength(2);
+
+    harness.sockets.patient.emitClose(1006);
+    harness.clock.advance(0);
+    harness.socketFor("agent_patient_1").emitOpen();
+
+    const after = harness.relay.getState().transcript;
+    expect(after).toHaveLength(2);
+    expect(after.map((entry) => entry.text)).toEqual([
+      "I need a dentist",
+      "What time works?",
+    ]);
+  });
+
+  test("keeps the transcript after the call is ended", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    exchange(harness, "I need a dentist", "What time works?");
+
+    harness.relay.stop();
+    expect(harness.relay.getState().transcript).toHaveLength(2);
+  });
+
+  test("tells a reconnected agent the call is under way, not to greet again", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    exchange(harness, "I need a dentist", "What time works?");
+
+    // The vendor sends its init frame again on the new conversation.
+    harness.sockets.patient.emitClose(1006);
+    harness.clock.advance(0);
+    const reconnected = harness.socketFor("agent_patient_1");
+    reconnected.emitOpen();
+    reconnected.emitFrame({ type: "conversation_initiation_client_data" });
+    harness.clock.advance(500);
+
+    const context = reconnected.ofType("contextual_update")[0]?.text ?? "";
+    expect(context).toContain("do not greet again");
+    expect(context).toContain("I need a dentist");
+  });
+
+  test("a first connection still gets the opening brief, not a recap", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    harness.clock.advance(500);
+
+    const context = harness.sockets.patient.ofType("contextual_update")[0]?.text ?? "";
+    expect(context).toBe("You are the patient.");
+    expect(context).not.toContain("do not greet again");
   });
 });
 
@@ -904,7 +1086,8 @@ describe("disconnect", () => {
     const state = harness.relay.getState();
     expect(state.phase).toBe("degraded");
     expect(state.notice).toContain("receptionist");
-    expect(state.socket.receptionist).toBe("closed");
+    // Not `closed`: the relay is already trying to get it back.
+    expect(state.socket.receptionist).toBe("reconnecting");
     expect(state.socket.patient).toBe("open");
   });
 

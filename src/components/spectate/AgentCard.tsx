@@ -48,6 +48,7 @@ const STATUS_TEXT: Record<SocketStatus, string> = {
   idle: "Not connected",
   connecting: "Connecting",
   open: "Connected",
+  reconnecting: "Reconnecting",
   closed: "Disconnected",
   failed: "Connection failed",
 };
@@ -56,6 +57,7 @@ const STATUS_CLASS: Record<SocketStatus, string> = {
   idle: "bg-slate-800 text-slate-400 border-slate-700",
   connecting: "bg-sky-500/10 text-sky-300 border-sky-500/20",
   open: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+  reconnecting: "bg-amber-500/10 text-amber-300 border-amber-500/20",
   closed: "bg-amber-500/10 text-amber-300 border-amber-500/20",
   failed: "bg-red-500/10 text-red-300 border-red-500/20",
 };
@@ -64,9 +66,13 @@ const STATUS_DOT: Record<SocketStatus, string> = {
   idle: "bg-slate-500",
   connecting: "bg-sky-400 animate-pulse",
   open: "bg-emerald-400",
+  reconnecting: "bg-amber-400 animate-pulse",
   closed: "bg-amber-400",
   failed: "bg-red-400",
 };
+
+/** A card the operator can act on, rather than one they can only read. */
+const RECOVERABLE: SocketStatus[] = ["closed", "failed"];
 
 export interface AgentCardProps {
   side: AgentSide;
@@ -77,6 +83,8 @@ export interface AgentCardProps {
   currentText: string;
   /** Shown in place of a line, once a line is not there. */
   idleHint: string;
+  /** Omitted while there is nothing for the operator to do. */
+  onReconnect?: () => void;
 }
 
 export function AgentCard({
@@ -87,12 +95,14 @@ export function AgentCard({
   speaking,
   currentText,
   idleHint,
+  onReconnect,
 }: AgentCardProps) {
   const accent = ACCENT[side];
+  const canRetry = onReconnect !== undefined && RECOVERABLE.includes(status);
 
   return (
     <div
-      className={`rounded-2xl p-6 transition-all duration-300 backdrop-blur-xl border ${
+      className={`flex flex-col rounded-2xl p-6 transition-all duration-300 backdrop-blur-xl border ${
         speaking ? accent.card : "bg-slate-900/60 border-slate-800"
       }`}
     >
@@ -125,6 +135,16 @@ export function AgentCard({
           )}
         </div>
       </div>
+
+      {canRetry && (
+        <button
+          type="button"
+          onClick={onReconnect}
+          className={`-mt-3 mb-5 self-start rounded-lg border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200 text-xs font-semibold px-3 py-1.5 transition-colors cursor-pointer`}
+        >
+          Reconnect the {side === "patient" ? "patient" : "receptionist"} agent
+        </button>
+      )}
 
       <div className="min-h-[100px] bg-slate-950/50 rounded-xl p-4 border border-slate-800/80 flex flex-col justify-center">
         {currentText ? (
