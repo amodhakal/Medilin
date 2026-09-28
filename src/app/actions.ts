@@ -8,6 +8,7 @@ import {
 import { parseWith, type FieldIssue } from "@/lib/validation/parse";
 import { logError } from "@/lib/logger";
 import { bookAppointment } from "@/app/api/_lib/book-appointment";
+import { ConfirmationDeliveryError } from "@/app/api/_lib/deliver-confirmation";
 
 /**
  * The intake server action.
@@ -84,6 +85,18 @@ export async function submitIntakeForm(formData: FormData): Promise<SubmitIntake
     // truncated by the logger, so a vendor error echoing the request payload
     // cannot carry symptom text into a log drain.
     logError("intake.failed", error);
+
+    if (error instanceof ConfirmationDeliveryError) {
+      // The appointment exists. The confirmation does not. Saying "we could not
+      // book that appointment" would be a different lie, and a patient who
+      // resubmits on the strength of it books twice.
+      return {
+        ok: false,
+        error:
+          "Your appointment was created, but we could not send the confirmation email. Please contact the clinic.",
+        issues: [],
+      };
+    }
 
     // Deliberately not the error. A failure here is a translation failure, and
     // a Gemini SDK error message can echo the request payload, which for this

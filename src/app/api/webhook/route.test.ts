@@ -71,7 +71,7 @@ beforeEach(() => {
       : new Response(JSON.stringify({ message: "domain not verified" }), {
           status: resendStatus,
         });
-  }) as typeof fetch;
+  }) as unknown as typeof fetch;
 });
 
 afterEach(() => {

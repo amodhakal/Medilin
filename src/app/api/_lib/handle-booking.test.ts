@@ -63,9 +63,14 @@ beforeEach(() => {
   outboundCalls = [];
   setRateLimitStore(null);
 
+  // Both prompts on the booking path: the intake translation and the
+  // confirmation email. The booking only succeeds if the second one is answered.
   setLlmClient({
-    async generateJson() {
-      return { additionalInfo: "headache", medical_department: "Doctor" };
+    async generateJson({ prompt }) {
+      if (prompt.includes("medical intake form translator")) {
+        return { additionalInfo: "headache", medical_department: "Doctor" };
+      }
+      return { subject: "Su cita", body: "<p>Martes 09:30</p>" };
     },
   });
 
@@ -74,7 +79,7 @@ beforeEach(() => {
   globalThis.fetch = (async (input: unknown) => {
     outboundCalls.push(input);
     return new Response(JSON.stringify({ id: "resend-1" }), { status: 200 });
-  }) as typeof fetch;
+  }) as unknown as typeof fetch;
 });
 
 afterEach(() => {
@@ -117,14 +122,73 @@ describe("the two booking routes", () => {
     expect(JSON.stringify(body)).not.toContain("dolor de cabeza");
   });
 
+  test("reports the confirmation as sent when it was", async () => {
+    const body = await (await handleBooking(post("/api/intake", submission))).json();
+
+    expect(body.confirmationEmailSent).toBe(true);
+  });
+
   test("makes no HTTP request to itself", async () => {
     // The booking path used to POST to this application's own /api/webhook, at
     // a URL built from the request's Host header, and then ignore what came
-    // back. There is no self-call left on the path: not to the webhook, and not
-    // anywhere else.
+    // back. No self-call is left on the path; the only outbound request is to
+    // the mail provider.
     await (await handleBooking(post("/api/intake", submission))).json();
 
-    expect(outboundCalls).toEqual([]);
+    expect(outboundCalls.filter((url) => String(url).includes("/api/"))).toEqual([]);
+  });
+});
+
+describe("an undelivered confirmation is not a successful booking (#20)", () => {
+  test("answers 502 and says the email did not go out", async () => {
+    // The stubbed transport returns 200 for everything, so the send has to be
+    // failed deliberately: a 200 to Resend, and a rejection from it.
+    setLlmClient({
+      async generateJson({ prompt }) {
+        if (prompt.includes("medical intake form translator")) {
+          return { additionalInfo: "headache", medical_department: "Doctor" };
+        }
+        return { subject: "Su cita", body: "<p>Martes 09:30</p>" };
+      },
+    });
+    globalThis.fetch = (async (...args: Parameters<typeof fetch>) =>
+      new Response(
+        JSON.stringify({ message: "domain not verified" }),
+        { status: 422, headers: { "x-called-with": String(args[0]) } },
+      )) as unknown as typeof fetch;
+
+    const response = await handleBooking(post("/api/intake", submission));
+    const body = (await response.json()) as {
+      success: boolean;
+      confirmationEmailSent: boolean;
+      error: string;
+    };
+
+    expect(response.status).toBe(502);
+    expect(body.success).toBe(false);
+    expect(body.confirmationEmailSent).toBe(false);
+    // Says which half worked. A caller that retries on this has to know whether
+    // it is booking twice.
+    expect(body.error).toContain("appointment was created");
+    expect(body.error).not.toContain("domain not verified");
+  });
+
+  test("does not report an undelivered confirmation as a booking", async () => {
+    setLlmClient({
+      async generateJson({ prompt }) {
+        if (prompt.includes("medical intake form translator")) {
+          return { additionalInfo: "headache", medical_department: "Doctor" };
+        }
+        throw new Error("Translation failed after 1 attempt: unavailable");
+      },
+    });
+
+    const response = await handleBooking(post("/api/intake", submission));
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.ok).toBe(false);
+    expect(body.success).toBe(false);
+    expect(body).not.toHaveProperty("spectateUrl");
   });
 });
 

@@ -4,6 +4,7 @@ import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
 import { intakeSchema } from "@/lib/validation/intake";
 import { parseJsonBody } from "@/lib/validation/parse";
 import { bookAppointment } from "./book-appointment";
+import { ConfirmationDeliveryError } from "./deliver-confirmation";
 
 /**
  * The booking endpoint.
@@ -38,9 +39,30 @@ export async function handleBooking(request: NextRequest): Promise<NextResponse>
 
     const booking = await bookAppointment(parsed.data, request.nextUrl.origin);
 
-    return NextResponse.json({ success: true, ...booking });
+    return NextResponse.json({
+      success: true,
+      confirmationEmailSent: true,
+      ...booking,
+    });
   } catch (error) {
     logError("intake.failed", error);
+
+    if (error instanceof ConfirmationDeliveryError) {
+      // The record is stored; the confirmation is not on its way. Answering 200
+      // with `success: true` here is what #20 was about, so the flag and the
+      // status both say what happened, and the message says which half of the
+      // booking went wrong.
+      return NextResponse.json(
+        {
+          success: false,
+          confirmationEmailSent: false,
+          error:
+            "The appointment was created but the confirmation email could not be sent",
+        },
+        { status: 502 },
+      );
+    }
+
     return NextResponse.json(
       { success: false, error: "Failed to process form" },
       { status: 500 },

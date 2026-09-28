@@ -35,7 +35,24 @@ export interface ConfirmationRequest {
 
 export type DeliveryResult =
   | { ok: true; subject: string }
-  | { ok: false; reason: "translation_failed" | "email_failed" };
+  | { ok: false; reason: DeliveryFailure };
+
+export type DeliveryFailure = "translation_failed" | "email_failed";
+
+/**
+ * A booking whose confirmation did not go out.
+ *
+ * Thrown by the booking path, not by the delivery itself: the delivery reports,
+ * the orchestrator decides. The reason is a closed union, never a message,
+ * because this crosses into a response body and a vendor error string can
+ * contain the payload it failed on.
+ */
+export class ConfirmationDeliveryError extends Error {
+  constructor(readonly reason: DeliveryFailure) {
+    super(`Confirmation email was not delivered: ${reason}`);
+    this.name = "ConfirmationDeliveryError";
+  }
+}
 
 /**
  * Translate the confirmation and send it.

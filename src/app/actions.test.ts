@@ -57,8 +57,11 @@ beforeEach(() => {
   outboundCalls = [];
 
   setLlmClient({
-    async generateJson() {
-      return { additionalInfo: "headache", medical_department: "Doctor" };
+    async generateJson({ prompt }) {
+      if (prompt.includes("medical intake form translator")) {
+        return { additionalInfo: "headache", medical_department: "Doctor" };
+      }
+      return { subject: "Su cita", body: "<p>Martes 09:30</p>" };
     },
   });
 
@@ -68,7 +71,7 @@ beforeEach(() => {
   globalThis.fetch = (async (input: unknown) => {
     outboundCalls.push(input);
     return new Response(JSON.stringify({ success: true }), { status: 200 });
-  }) as typeof fetch;
+  }) as unknown as typeof fetch;
 });
 
 afterEach(() => {
@@ -80,6 +83,13 @@ afterAll(() => {
   resetServerEnvCache();
 });
 
+/** Anything aimed at this application rather than at a third party. */
+function selfCalls(calls: unknown[]): unknown[] {
+  return calls.filter(
+    (url) => typeof url === "string" && url.includes("/api/"),
+  );
+}
+
 describe("submitIntakeForm", () => {
   test("books a valid submission and returns the spectate URL", async () => {
     const result = await submitIntakeForm(form());
@@ -90,12 +100,13 @@ describe("submitIntakeForm", () => {
     expect(result.appointmentId).toMatch(/^[0-9a-f-]{36}$/);
   });
 
-  test("makes no HTTP request at all", async () => {
-    // The self-fetch is deleted, not hardened. There is no Host header to trust
+  test("makes no HTTP request to its own origin", async () => {
+    // The self-fetch is deleted, not hardened: there is no Host header to trust
     // and no NODE_ENV-derived scheme to get wrong, because there is no request.
+    // The only outbound call is the mail provider, which is a different thing.
     await submitIntakeForm(form());
 
-    expect(outboundCalls).toEqual([]);
+    expect(selfCalls(outboundCalls)).toEqual([]);
   });
 
   test("the spectate URL carries a sealed token, not the record", async () => {
@@ -165,5 +176,32 @@ describe("submitIntakeForm", () => {
     const result = await submitIntakeForm(form());
 
     expect(() => structuredClone(result)).not.toThrow();
+  });
+
+  test("does not tell a patient their confirmation was sent when it was not", async () => {
+    // #20, from the user's side. The mail provider rejects the send.
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ message: "domain not verified" }), {
+        status: 422,
+      })) as unknown as typeof fetch;
+
+    const result = await submitIntakeForm(form());
+
+    expect(result.ok).toBe(false);
+  });
+
+  test("says the appointment exists, so the patient does not book twice", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ message: "domain not verified" }), {
+        status: 422,
+      })) as unknown as typeof fetch;
+
+    const result = await submitIntakeForm(form());
+
+    if (result.ok) throw new Error("expected a failure");
+    expect(result.error).toContain("appointment was created");
+    expect(result.error).not.toContain("could not book");
+    // The provider's message can quote the payload it rejected.
+    expect(result.error).not.toContain("domain not verified");
   });
 });
