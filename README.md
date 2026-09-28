@@ -86,6 +86,8 @@ In a production deployment, the AI agent would:
      lives in the source tree.
    - `ELEVENLABS_AGENT_PATIENT_ID` - Conversational AI agent for the patient
    - `ELEVENLABS_AGENT_RECEPTIONIST_ID` - Conversational AI agent for reception
+   - `INTERNAL_API_SECRET` - shared secret for this app's internal calls to
+     the webhook and audit endpoints (32+ characters, `openssl rand -hex 32`)
 
    `ELEVENLABS_API_KEY` is listed in `.env.example` but is not yet read by any
    code. The rest of the optional variables each gate one feature.

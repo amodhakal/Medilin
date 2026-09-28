@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
+import type { AppointmentRecord } from "@/lib/validation/intake";
 
 
 interface TranscriptMessage {
@@ -11,18 +12,13 @@ interface TranscriptMessage {
   timestamp: Date;
 }
 
-interface PatientInfo {
-  email: string;
-  dob: string;
-  insurance: string;
-  phone: string;
-  appointmentDateTime: string;
-  language: string;
-  firstName: string;
-  lastName: string;
-  medical_department: string;
-  additionalInfo: string;
-}
+/**
+ * Was a hand-copied interface listing the same ten fields as the intake
+ * form, in a different order, with `insurance` widened to `string`. The
+ * shared record type replaces it so a renamed field is a compile error here
+ * rather than an `undefined` at runtime.
+ */
+type PatientInfo = AppointmentRecord;
 
 export default function SpectateClient({
   searchParams,

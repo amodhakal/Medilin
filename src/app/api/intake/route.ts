@@ -2,11 +2,27 @@ import { NextRequest, NextResponse } from "next/server";
 import { translateToEnglish } from "@/lib/translateToEnglish";
 import { createAppointment } from "@/lib/appointments";
 import { getClinicName } from "@/config";
+import { intakeSchema } from "@/lib/validation/intake";
+import { parseJsonBody } from "@/lib/validation/parse";
+import { internalHeaders } from "@/lib/auth/internal";
+import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
+
+const INTAKE_LIMIT = 5;
+const RATE_LIMIT_WINDOW_MS = 60_000;
 
 export async function POST(request: NextRequest) {
+  // Each accepted request costs a Gemini call and a Resend email, and the
+  // translation helpers retry up to ten times on failure, so an unthrottled
+  // client can burn the whole budget in a loop.
+  const limited = await enforceRateLimit(callerKey(request, "intake"), INTAKE_LIMIT, RATE_LIMIT_WINDOW_MS);
+  if (limited) return limited;
+
   try {
-    const data = await request.json();
-    const sourceLanguage = (data.language as string) || "english";
+    const parsed = await parseJsonBody(request, intakeSchema);
+    if (!parsed.ok) return parsed.response;
+
+    const data = parsed.data;
+    const sourceLanguage = data.language;
     console.log("Processing intake form from:", sourceLanguage, data);
 
     const translatedData = await translateToEnglish(data, sourceLanguage);
@@ -37,7 +53,7 @@ export async function POST(request: NextRequest) {
     const webhookUrl = `${request.nextUrl.origin}/api/webhook`;
     await fetch(webhookUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: internalHeaders(),
       body: JSON.stringify({
         email: translatedData.email,
         language: sourceLanguage,

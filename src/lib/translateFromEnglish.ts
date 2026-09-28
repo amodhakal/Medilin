@@ -1,5 +1,7 @@
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { getServerEnv } from "@/lib/env";
+import { buildEmailTranslationPrompt } from "@/lib/llm/prompt";
+import type { SupportedLanguage } from "@/lib/validation/intake";
 
 /**
  * Constructed lazily.
@@ -28,22 +30,13 @@ function calculateDelayWithJitter(attempt: number): number {
 
 export async function translateFromEnglish(
   text: string,
-  targetLanguage: string,
+  targetLanguage: SupportedLanguage,
 ): Promise<{ subject: string; body: string }> {
   if (!text || text.trim() === "") {
     return { subject: "", body: "" };
   }
 
-  const prompt = `You are a medical appointment translator. Translate the following appointment confirmation message from English to ${targetLanguage}. Translate it as a professional email confirmation.
-
-Original English message:
-${text}
-
-Return ONLY a JSON object with the following structure (no other text):
-{
-  "subject": "The email subject line in ${targetLanguage}",
-  "body": "The email body in ${targetLanguage}, using HTML tags like <p>, <strong>, <ul>, <li> for formatting"
-}`;
+  const prompt = buildEmailTranslationPrompt(text, targetLanguage);
 
   let lastError: Error | null = null;
 

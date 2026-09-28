@@ -3,21 +3,22 @@ import { translateFromEnglish } from "@/lib/translateFromEnglish";
 import { Resend } from "resend";
 import { getEmailFrom } from "@/config";
 import { getServerEnv } from "@/lib/env";
+import { parseJsonBody } from "@/lib/validation/parse";
+import { webhookPayloadSchema } from "@/lib/validation/intake";
+import { requireInternalSecret } from "@/lib/auth/internal";
 
 export async function POST(request: NextRequest) {
-  try {
-    const requestBody = await request.json();
-    const { email, language, info } = requestBody;
+  // Authenticate before anything else. Without this the endpoint is an open
+  // mail relay: anyone could POST an address and a message and have the app
+  // send it through Resend.
+  const guard = requireInternalSecret(request);
+  if (!guard.ok) return guard.response;
 
-    if (!email || !language || !info) {
-      return NextResponse.json(
-        {
-          error:
-            "Missing required fields: email, language, and info are required",
-        },
-        { status: 401 },
-      );
-    }
+  try {
+    const parsed = await parseJsonBody(request, webhookPayloadSchema);
+    if (!parsed.ok) return parsed.response;
+
+    const { email, language, info } = parsed.data;
 
     console.log(
       `Webhook original: `,
@@ -56,9 +57,10 @@ export async function POST(request: NextRequest) {
   }
 }
 
+/**
+ * Liveness only. Deliberately reports nothing about configuration or
+ * upstream services, since this is reachable without a credential.
+ */
 export async function GET() {
-  return NextResponse.json({
-    status: "ok",
-    message: "Webhook endpoint working",
-  });
+  return NextResponse.json({ status: "ok" });
 }

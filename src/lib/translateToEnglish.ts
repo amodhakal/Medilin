@@ -1,5 +1,12 @@
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { getServerEnv } from "@/lib/env";
+import {
+  appointmentRecordSchema,
+  type AppointmentRecord,
+  type IntakeFormData,
+  type SupportedLanguage,
+} from "@/lib/validation/intake";
+import { buildIntakeTranslationPrompt } from "@/lib/llm/prompt";
 
 /**
  * Constructed lazily.
@@ -26,36 +33,37 @@ function calculateDelayWithJitter(attempt: number): number {
   return Math.min(jitter, MAX_DELAY_MS);
 }
 
+/**
+ * The only fields the model is allowed to change.
+ *
+ * Everything else in a patient record is either a name, a date of birth, or a
+ * contact detail that was typed into a form, and none of it needs
+ * translating. Constraining the model to these two is what prevents a
+ * response from rewriting the rest of the record.
+ */
+const TRANSLATABLE_FIELDS = ["additionalInfo", "medical_department"] as const;
+
+type TranslatableField = (typeof TRANSLATABLE_FIELDS)[number];
+
 export async function translateToEnglish(
-  data: Record<string, unknown>,
-  sourceLanguage: string,
-): Promise<Record<string, unknown>> {
-  const textFieldsToTranslate = [
-    "additionalInfo",
-    "medical_department",
-  ];
+  data: IntakeFormData,
+  sourceLanguage: SupportedLanguage,
+): Promise<AppointmentRecord> {
+  const fieldsToTranslate: Partial<Record<TranslatableField, string>> = {};
 
-  const fieldsToTranslate: Record<string, string> = {};
-  const nonTextFields: Record<string, unknown> = {};
-
-  for (const [key, value] of Object.entries(data)) {
-    if (textFieldsToTranslate.includes(key) && typeof value === "string") {
+  for (const key of TRANSLATABLE_FIELDS) {
+    const value = data[key];
+    if (typeof value === "string" && value.length > 0) {
       fieldsToTranslate[key] = value;
-    } else {
-      nonTextFields[key] = value;
     }
   }
 
+  const base: AppointmentRecord = data;
   if (Object.keys(fieldsToTranslate).length === 0) {
-    return data;
+    return base;
   }
 
-  const prompt = `You are a medical intake form translator. Translate the following text fields from ${sourceLanguage} to English. Only translate the values, not the field names or other data.
-
-Fields to translate:
-${JSON.stringify(fieldsToTranslate, null, 2)}
-
-Return ONLY a valid JSON object with the same structure, but with values translated to English. Do not include any explanation or additional text.`;
+  const prompt = buildIntakeTranslationPrompt(fieldsToTranslate, sourceLanguage);
 
   let lastError: Error | null = null;
 
@@ -78,18 +86,17 @@ Return ONLY a valid JSON object with the same structure, but with values transla
 
       const content = response.text?.trim() || "{}";
 
-      let translatedFields: Record<string, string>;
+      let parsed: unknown;
       try {
         const jsonMatch =
           content.match(/```json\n?([\s\S]*?)\n?```/) ||
           content.match(/(\{[\s\S]*\})/);
-        const jsonString = jsonMatch ? jsonMatch[1] : content;
-        translatedFields = JSON.parse(jsonString);
+        parsed = JSON.parse(jsonMatch ? jsonMatch[1] : content);
       } catch {
-        translatedFields = JSON.parse(content);
+        parsed = JSON.parse(content);
       }
 
-      return { ...nonTextFields, ...translatedFields };
+      return applyTranslation(base, parsed);
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
       console.error(
@@ -108,4 +115,45 @@ Return ONLY a valid JSON object with the same structure, but with values transla
   throw new Error(
     `Translation failed after ${MAX_RETRIES} attempts: ${lastError?.message}`,
   );
+}
+
+/**
+ * Merge the model's response into the submitted record.
+ *
+ * Only the two translatable fields are taken from the response, and only when
+ * the response is a non-empty string. Every other key the model returns is
+ * discarded, so a response carrying `{"email": "attacker@example.test"}` is
+ * ignored rather than merged.
+ */
+export function applyTranslation(
+  base: AppointmentRecord,
+  translated: unknown,
+): AppointmentRecord {
+  if (typeof translated !== "object" || translated === null || Array.isArray(translated)) {
+    return base;
+  }
+
+  const response = translated as Record<string, unknown>;
+  const merged: Record<string, unknown> = { ...base };
+
+  for (const key of TRANSLATABLE_FIELDS) {
+    if (!Object.hasOwn(response, key)) continue;
+
+    const value = response[key];
+    if (typeof value !== "string") continue;
+
+    const trimmed = value.trim();
+    if (trimmed.length === 0) continue;
+
+    merged[key] = trimmed.slice(0, 2000);
+  }
+
+  // Re-validate rather than cast: the model can still return a department
+  // string that does not match anything the form offers.
+  const parsed = appointmentRecordSchema.safeParse(merged);
+  if (!parsed.success) {
+    return base;
+  }
+
+  return parsed.data;
 }
