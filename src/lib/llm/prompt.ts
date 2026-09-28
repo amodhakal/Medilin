@@ -20,6 +20,11 @@ import type { SupportedLanguage } from "@/lib/validation/intake";
  *      instructions state that the fenced region is data. Fences alone are
  *      not a guarantee, so callers must still validate model output; see
  *      applyTranslation.
+ *
+ * The reply shape is not requested in prose. It is requested from the API with
+ * `responseMimeType` and `responseSchema`; see ./schema. Where this text and
+ * the schema overlap -- the department enum -- the two have to agree, or the
+ * prompt would be asking for a value the decoder is not allowed to produce.
  */
 
 const BEGIN_DATA = "<<<UNTRUSTED_PATIENT_INPUT";
@@ -73,8 +78,9 @@ export function buildIntakeTranslationPrompt(
     "- Do not translate the field names.",
     "- Do not add, remove, or rename fields.",
     `- Keep the department under "medical_department" as one of: Doctor, Eye Doctor,`,
-    "  Dentist, Pediatrician, Psychiatrist, Other. If no listed value fits, repeat",
-    "  the value you were given.",
+    "  Dentist, Pediatrician, Psychiatrist, Other. This list is a hard constraint:",
+    "  reply with the closest listed value even if the patient's own wording is",
+    "  not on the list. Never reply with a value that is not listed.",
     "- Reply with a JSON object and nothing else.",
     "",
     "Fenced values:",

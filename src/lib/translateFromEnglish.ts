@@ -2,6 +2,12 @@ import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { getServerEnv } from "@/lib/env";
 import { logInfo, logWarn } from "@/lib/logger";
 import { buildEmailTranslationPrompt } from "@/lib/llm/prompt";
+import {
+  EMAIL_RESPONSE_SCHEMA,
+  emailTranslationSchema,
+  parseJsonResponse,
+  type EmailTranslation,
+} from "@/lib/llm/schema";
 import type { SupportedLanguage } from "@/lib/validation/intake";
 
 /**
@@ -32,7 +38,7 @@ function calculateDelayWithJitter(attempt: number): number {
 export async function translateFromEnglish(
   text: string,
   targetLanguage: SupportedLanguage,
-): Promise<{ subject: string; body: string }> {
+): Promise<EmailTranslation> {
   if (!text || text.trim() === "") {
     return { subject: "", body: "" };
   }
@@ -49,6 +55,10 @@ export async function translateFromEnglish(
           thinkingConfig: {
             thinkingLevel: ThinkingLevel.HIGH,
           },
+          // The model emits the object and nothing else, so there is no fence
+          // to strip and no prose to skip past before the JSON starts.
+          responseMimeType: "application/json",
+          responseSchema: EMAIL_RESPONSE_SCHEMA,
         },
         contents: [
           {
@@ -58,18 +68,16 @@ export async function translateFromEnglish(
         ],
       });
 
-      const content = response.text?.trim() || "";
+      // Was `content.match(/\{[\s\S]*\}/)` followed by an unchecked
+      // `JSON.parse`, whose result was returned as `{subject, body}` with both
+      // fields implicitly `any`. A subject of `undefined` was handed straight
+      // to Resend. Constrained decoding plus a parse is a document; this is the
+      // point where it is checked to be an email.
+      const parsed = emailTranslationSchema.parse(
+        parseJsonResponse(response.text),
+      );
 
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error("Failed to parse JSON response from translation");
-      }
-
-      const parsed = JSON.parse(jsonMatch[0]);
-      return {
-        subject: parsed.subject,
-        body: parsed.body,
-      };
+      return parsed;
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
       // The message is redacted and truncated by the logger: a Gemini SDK

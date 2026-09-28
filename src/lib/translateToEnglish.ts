@@ -8,6 +8,11 @@ import {
   type SupportedLanguage,
 } from "@/lib/validation/intake";
 import { buildIntakeTranslationPrompt } from "@/lib/llm/prompt";
+import {
+  TRANSLATABLE_FIELD_NAMES,
+  parseJsonResponse,
+  translationResponseSchema,
+} from "@/lib/llm/schema";
 
 /**
  * Constructed lazily.
@@ -42,7 +47,7 @@ function calculateDelayWithJitter(attempt: number): number {
  * translating. Constraining the model to these two is what prevents a
  * response from rewriting the rest of the record.
  */
-const TRANSLATABLE_FIELDS = ["additionalInfo", "medical_department"] as const;
+const TRANSLATABLE_FIELDS = TRANSLATABLE_FIELD_NAMES;
 
 type TranslatableField = (typeof TRANSLATABLE_FIELDS)[number];
 
@@ -60,11 +65,15 @@ export async function translateToEnglish(
   }
 
   const base: AppointmentRecord = data;
-  if (Object.keys(fieldsToTranslate).length === 0) {
+  const requested = Object.keys(fieldsToTranslate) as TranslatableField[];
+  if (requested.length === 0) {
     return base;
   }
 
   const prompt = buildIntakeTranslationPrompt(fieldsToTranslate, sourceLanguage);
+  // The reply is constrained to these fields, so the decoder cannot invent a
+  // key and the response never has to be mined out of prose.
+  const responseSchema = translationResponseSchema(requested);
 
   let lastError: Error | null = null;
 
@@ -76,6 +85,8 @@ export async function translateToEnglish(
           thinkingConfig: {
             thinkingLevel: ThinkingLevel.HIGH,
           },
+          responseMimeType: "application/json",
+          responseSchema,
         },
         contents: [
           {
@@ -85,19 +96,7 @@ export async function translateToEnglish(
         ],
       });
 
-      const content = response.text?.trim() || "{}";
-
-      let parsed: unknown;
-      try {
-        const jsonMatch =
-          content.match(/```json\n?([\s\S]*?)\n?```/) ||
-          content.match(/(\{[\s\S]*\})/);
-        parsed = JSON.parse(jsonMatch ? jsonMatch[1] : content);
-      } catch {
-        parsed = JSON.parse(content);
-      }
-
-      return applyTranslation(base, parsed);
+      return applyTranslation(base, parseJsonResponse(response.text));
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
       // The message is redacted and truncated by the logger: a Gemini SDK
