@@ -1,14 +1,18 @@
-import { getPatientAgentId, getReceptionistAgentId } from "@/config";
 import { resolveRecord } from "@/lib/phi-token";
+import { isVoiceConfigured } from "@/lib/voice/elevenlabs";
 import { notFound } from "next/navigation";
 import SpectateClient, { type SpectatePatient } from "./SpectateClient";
 
 /**
  * Server wrapper for the spectate session.
  *
- * The agent identifiers are configuration and must not be hardcoded, so they
- * are read here rather than in the client bundle where they previously sat as
- * literals anyone could read off the shipped JavaScript.
+ * The agent identifiers used to be read here and passed down, which moved them
+ * out of the source and into the RSC payload, where they were exactly as
+ * readable as the literals they replaced: anyone could read an id off the
+ * shipped page and dial the vendor with it for as long as the agent existed
+ * (#15). This page now passes a boolean instead -- whether this deployment can
+ * open a voice session at all -- and the client asks the server for a
+ * short-lived signed URL when it wants one. Nothing here is a credential.
  *
  * The route segment is a token, not a record. The page used to read the record
  * out of a `?patientInfo=` query parameter in the browser, which meant the
@@ -55,8 +59,11 @@ export default async function SpectatePage({
   return (
     <SpectateClient
       patient={patient}
-      patientAgentId={getPatientAgentId()}
-      receptionistAgentId={getReceptionistAgentId()}
+      voiceAvailable={isVoiceConfigured()}
+      // The token this URL already is. It is what the session endpoint checks,
+      // and it is not a new disclosure: the visitor has it in their address bar
+      // either way.
+      sessionToken={id}
     />
   );
 }

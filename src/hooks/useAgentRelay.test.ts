@@ -7,6 +7,7 @@ import {
   initialRelayState,
   otherSide,
   MAX_PING_DELAY_MS,
+  type AgentSide,
 } from "./useAgentRelay";
 
 /**
@@ -16,6 +17,12 @@ import {
  * constructor options precisely so that this file exists: every assertion
  * below is about logic that was previously reachable only by opening two real
  * sockets to a paid third-party API and waiting on real time.
+ *
+ * The factory is keyed by *side* and takes no identifier (#15). It used to
+ * receive a vendor URL assembled from an agent id the page had been handed, and
+ * this file used to read the id back out of that URL to find the socket it had
+ * just created. There is no id to read now, and the last test in this file
+ * reads this module's own source to keep it that way.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -137,8 +144,8 @@ interface Harness {
   relay: AgentRelay;
   clock: FakeClock;
   sockets: { patient: FakeSocket; receptionist: FakeSocket };
-  /** The current socket for a given agent id. */
-  socketFor(agentId: string): FakeSocket;
+  /** The current socket for a given side. */
+  socketFor(side: AgentSide): FakeSocket;
   /** Every socket ever created, oldest first. */
   socketsOpened: FakeSocket[];
   openBoth(): void;
@@ -148,20 +155,19 @@ interface Harness {
 function makeRelay(overrides: Partial<AgentRelayConfig> = {}): Harness {
   const clock = new FakeClock();
   const logs: Harness["logs"] = [];
-  const byAgentId = new Map<string, FakeSocket>();
+  const bySide = new Map<AgentSide, FakeSocket>();
   const socketsOpened: FakeSocket[] = [];
 
-  const createSocket = (url: string): RelaySocket => {
-    const agentId = new URL(url).searchParams.get("agent_id") ?? "";
+  // The side is all the machine gets. There is no id to pass and no URL to read,
+  // because the machine has no idea what a vendor is.
+  const createSocket = (side: AgentSide): RelaySocket => {
     const socket = new FakeSocket();
-    byAgentId.set(agentId, socket);
+    bySide.set(side, socket);
     socketsOpened.push(socket);
     return socket;
   };
 
   const relay = new AgentRelay({
-    patientAgentId: "agent_patient_1",
-    receptionistAgentId: "agent_receptionist_1",
     patientOpeningContext: "You are the patient.",
     receptionistOpeningContext: "You are the receptionist.",
     createSocket,
@@ -180,9 +186,9 @@ function makeRelay(overrides: Partial<AgentRelayConfig> = {}): Harness {
    * first. Tests that want to simulate a reconnect hold the reference across
    * the event that causes one.
    */
-  const socketFor = (agentId: string): FakeSocket => {
-    const socket = byAgentId.get(agentId);
-    if (!socket) throw new Error(`no socket was opened for ${agentId}`);
+  const socketFor = (side: AgentSide): FakeSocket => {
+    const socket = bySide.get(side);
+    if (!socket) throw new Error(`no socket was opened for ${side}`);
     return socket;
   };
 
@@ -194,10 +200,10 @@ function makeRelay(overrides: Partial<AgentRelayConfig> = {}): Harness {
     socketsOpened,
     sockets: {
       get patient() {
-        return socketFor("agent_patient_1");
+        return socketFor("patient");
       },
       get receptionist() {
-        return socketFor("agent_receptionist_1");
+        return socketFor("receptionist");
       },
     },
     /**
@@ -206,8 +212,8 @@ function makeRelay(overrides: Partial<AgentRelayConfig> = {}): Harness {
      */
     openBoth() {
       relay.start();
-      for (const agentId of ["agent_patient_1", "agent_receptionist_1"]) {
-        const socket = socketFor(agentId);
+      for (const side of ["patient", "receptionist"] as const) {
+        const socket = socketFor(side);
         socket.emitOpen();
         socket.emitFrame({ type: "conversation_initiation_client_data" });
       }
@@ -232,6 +238,26 @@ function exchange(harness: Harness, patientLine: string, receptionistLine: strin
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                     */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * A source file with its whole-line comments removed.
+ *
+ * Prose about a vendor is not a leak -- this file and its neighbours are full of
+ * it, deliberately, because the reasoning is the point -- so the assertion below
+ * is about code. Whole lines starting with `*`, `//`, or `/*` are comments in
+ * this codebase's style; a trailing comment at the end of a line of code is not
+ * filtered, which does not matter because none of the patterns being looked for
+ * are English.
+ */
+function codeOnly(source: string): string {
+  return source
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trimStart();
+      return !trimmed.startsWith("*") && !trimmed.startsWith("//") && !trimmed.startsWith("/*");
+    })
+    .join("\n");
+}
 
 describe("otherSide", () => {
   test("maps each side to the other", () => {
@@ -895,7 +921,7 @@ describe("turn recovery", () => {
 
     // The reconnect fires on the first backoff step, which is immediate.
     harness.clock.advance(0);
-    const after = harness.socketFor("agent_receptionist_1");
+    const after = harness.socketFor("receptionist");
     expect(after).not.toBe(before);
     after.emitOpen();
     harness.clock.advance(1_500);
@@ -924,7 +950,7 @@ describe("reconnect", () => {
     expect(harness.relay.getState().socket.receptionist).toBe("reconnecting");
 
     harness.clock.advance(0);
-    const after = harness.socketFor("agent_receptionist_1");
+    const after = harness.socketFor("receptionist");
     expect(after).not.toBe(before);
     // A re-open reads as "reconnecting" until it is actually open, which is
     // the honest thing to show: the card should not claim to be fine.
@@ -1025,7 +1051,7 @@ describe("reconnect", () => {
 
     harness.sockets.patient.emitClose(1006);
     harness.clock.advance(0);
-    harness.socketFor("agent_patient_1").emitOpen();
+    harness.socketFor("patient").emitOpen();
 
     const after = harness.relay.getState().transcript;
     expect(after).toHaveLength(2);
@@ -1052,7 +1078,7 @@ describe("reconnect", () => {
     // The vendor sends its init frame again on the new conversation.
     harness.sockets.patient.emitClose(1006);
     harness.clock.advance(0);
-    const reconnected = harness.socketFor("agent_patient_1");
+    const reconnected = harness.socketFor("patient");
     reconnected.emitOpen();
     reconnected.emitFrame({ type: "conversation_initiation_client_data" });
     harness.clock.advance(500);
@@ -1122,10 +1148,34 @@ describe("reconfigure", () => {
     harness.sockets.receptionist.emitOpen();
     harness.relay.stop();
 
-    harness.relay.reconfigure({ patientAgentId: "agent_patient_2" });
+    // The factory is the machine's whole notion of "which agent this is", so
+    // replacing it is the reconfiguration case. A machine that read an id from
+    // configuration would instead be swapping one string for another here.
+    const replacement: string[] = [];
+    harness.relay.reconfigure({
+      createSocket: (side) => {
+        replacement.push(side);
+        return new FakeSocket();
+      },
+    });
     harness.relay.start();
 
-    expect(() => harness.socketFor("agent_patient_2")).not.toThrow();
+    expect(replacement).toEqual(["patient", "receptionist"]);
+  });
+
+  test("reports a machine that lost its sockets rather than dialling nothing", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    // A page that cannot open a socket -- no voice deployment, or a session
+    // that could not be issued -- says so as one stated failure. It does not
+    // open a socket against no configuration and let the far end decide.
+    harness.relay.stop();
+    harness.relay.reconfigure({ createSocket: undefined });
+    harness.relay.start();
+
+    expect(harness.relay.getState().phase).toBe("failed");
+    expect(harness.relay.getState().error).toContain("No patient caller agent is configured");
   });
 
   test("does not change an in-flight conversation", () => {
@@ -1160,17 +1210,17 @@ describe("construction", () => {
    */
   test("constructing a relay touches nothing", () => {
     const clock = new FakeClock();
-    const urls: string[] = [];
+    const opened: AgentSide[] = [];
 
     const relay = new AgentRelay({
-      createSocket: (url) => {
-        urls.push(url);
+      createSocket: (side) => {
+        opened.push(side);
         return new FakeSocket();
       },
       clock,
     });
 
-    expect(urls).toEqual([]);
+    expect(opened).toEqual([]);
     expect(clock.pending).toBe(0);
     expect(relay.getState()).toEqual(initialRelayState());
     expect(relay.getState().phase).toBe("idle");
@@ -1178,47 +1228,70 @@ describe("construction", () => {
 
   test("a machine with no configuration says so rather than opening a blank socket", () => {
     const clock = new FakeClock();
-    const urls: string[] = [];
+    const opened: AgentSide[] = [];
     const relay = new AgentRelay({
-      createSocket: (url) => {
-        urls.push(url);
+      createSocket: (side) => {
+        opened.push(side);
         return new FakeSocket();
       },
       clock,
       log: () => {},
     });
 
+    relay.reconfigure({ createSocket: undefined });
     relay.start();
 
-    expect(urls).toEqual([]);
+    expect(opened).toEqual([]);
     expect(relay.getState().phase).toBe("failed");
     expect(relay.getState().error).toContain("No patient caller agent is configured");
   });
 
   test("picks up configuration handed over after construction", () => {
-    const harness = makeRelay();
     const clock = new FakeClock();
-    const urls: string[] = [];
-    const relay = new AgentRelay({
-      createSocket: (url) => {
-        urls.push(url);
-        return new FakeSocket();
-      },
-      clock,
-      log: () => {},
-    });
+    const opened: AgentSide[] = [];
+    const relay = new AgentRelay({ clock, log: () => {} });
 
     relay.reconfigure({
-      patientAgentId: "agent_patient_1",
-      receptionistAgentId: "agent_receptionist_1",
+      createSocket: (side) => {
+        opened.push(side);
+        return new FakeSocket();
+      },
     });
     relay.start();
 
-    expect(urls).toHaveLength(2);
-    expect(urls[0]).toContain("agent_patient_1");
-    expect(urls[1]).toContain("agent_receptionist_1");
+    expect(opened).toEqual(["patient", "receptionist"]);
     expect(relay.getState().socket.patient).toBe("connecting");
-    expect(harness.relay).toBeDefined();
+  });
+});
+
+describe("what this machine is capable of putting in a URL (#15)", () => {
+  test("names no vendor and holds no identifier", async () => {
+    // The strongest statement of the fix is not a behaviour but an absence: this
+    // module has no vendor URL to build, so there is nothing here for a future
+    // change to leak. The socket factory in src/lib/voice/agent-socket.ts is
+    // the only thing that knows what a URL is now.
+    const source = codeOnly(
+      await Bun.file(new URL("./useAgentRelay.ts", import.meta.url).pathname).text(),
+    );
+
+    expect(source).not.toMatch(/elevenlabs/i);
+    expect(source).not.toMatch(/agent_id/);
+    expect(source).not.toMatch(/AgentId/);
+  });
+
+  test("is handed a side and nothing else", () => {
+    const sides: unknown[] = [];
+    const relay = new AgentRelay({
+      log: () => {},
+      createSocket: (...args) => {
+        sides.push(...args);
+        return new FakeSocket();
+      },
+    });
+
+    relay.start();
+
+    expect(sides).toEqual(["patient", "receptionist"]);
   });
 });
 

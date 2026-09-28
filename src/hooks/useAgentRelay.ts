@@ -19,10 +19,20 @@ import { clientLog } from "@/lib/logger/client";
  * a hand-advanced clock standing in for `setTimeout`. See
  * `useAgentRelay.test.ts`.
  *
- * Deliberately not fixed here: the two agent ids arrive as props from the
- * server component and are read from configuration there (#15 moves the
- * sockets server-side). What stays is that this module is the only place that
- * knows the vendor URL, which is the part that is worth testing.
+ * #15 is done, and it changed this file's contract rather than adding to it.
+ * The machine used to be handed two agent ids and used them to build
+ * `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=X` itself, so the
+ * page handed the ids down from the server component and the browser dialled the
+ * vendor with a credential that never expired. The machine is now handed a
+ * *side* and a socket to use, and the question of what that socket connects to
+ * lives in @/lib/voice/agent-socket, which asks this app's server for a
+ * short-lived signed URL first.
+ *
+ * The result is that this file -- the one file every reader of the spectate
+ * page already had to understand -- contains no vendor name, no agent id, and no
+ * way to build a URL. `what this machine is capable of putting in a URL` in the
+ * test file reads this file to keep it that way, which is the only kind of
+ * assertion that survives someone adding a field in a hurry.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -284,17 +294,6 @@ function clampDelay(ms: number): number {
   return Math.min(Math.max(ms, 0), MAX_PING_DELAY_MS);
 }
 
-/**
- * The vendor conversation endpoint.
- *
- * Kept as a literal because the browser has to open it directly today. The
- * agent ids are configuration and are passed in; they are not in this string.
- * Relocating the sockets server-side is #15 and is out of scope here.
- */
-function conversationUrl(agentId: string): string {
-  return `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${agentId}`;
-}
-
 /* -------------------------------------------------------------------------- */
 /* The machine                                                                 */
 /* -------------------------------------------------------------------------- */
@@ -302,23 +301,30 @@ function conversationUrl(agentId: string): string {
 /**
  * All of it optional.
  *
- * The four identity fields are optional because a machine is constructed
- * before it has any configuration, and deliberately so: see the note on
- * `useAgentRelay`. A missing agent id is reported as a failed connect at
- * `start` rather than being papered over with a placeholder, because
- * connecting to `agent_id=` is a request that either fails confusingly at the
- * vendor or, worse, is not obviously not the configured agent.
+ * A machine is constructed before it has any configuration, and deliberately so:
+ * see the note on `useAgentRelay`. The only thing it needs to know to open a
+ * call is a socket factory, and its absence is reported as a failed connect at
+ * `start` rather than papered over with a placeholder -- a page with no working
+ * session should say so once, rather than open something and let the far end
+ * decide what that means.
  */
 export interface AgentRelayConfig {
-  patientAgentId?: string;
-  receptionistAgentId?: string;
   /** Sent to the patient agent to open the call. May contain PHI. */
   patientOpeningContext?: string;
   /** Sent to the receptionist agent to open the call. */
   receptionistOpeningContext?: string;
   /** Merged into the patient socket's conversation init payload. */
   patientDynamicVariables?: Record<string, unknown>;
-  createSocket?: (url: string) => RelaySocket;
+  /**
+   * Opens one side's socket.
+   *
+   * The whole of what this machine knows about the far end. It is given a side
+   * and returns a socket that may be connecting for a while -- the real
+   * implementation waits on a request to this app's own server before it has
+   * anything to connect to (#15) -- and everything below is written to cope with
+   * that, because it was written to cope with a socket that has not opened yet.
+   */
+  createSocket?: (side: AgentSide) => RelaySocket;
   clock?: RelayClock;
   connectTimeoutMs?: number;
   holdMs?: number;
@@ -343,7 +349,6 @@ export interface AgentRelayConfig {
 export class AgentRelay {
   private config: AgentRelayConfig;
   private pendingConfig: Partial<AgentRelayConfig> = {};
-  private readonly createSocket: (url: string) => RelaySocket;
   private readonly clock: RelayClock;
   private readonly log: RelayLog;
   private readonly now: () => number;
@@ -461,7 +466,6 @@ export class AgentRelay {
    */
   constructor(config: AgentRelayConfig = {}) {
     this.config = config;
-    this.createSocket = config.createSocket ?? ((url) => new WebSocket(url) as RelaySocket);
     this.clock = config.clock ?? realClock;
     this.log = config.log ?? defaultLog;
     this.now = config.now ?? (() => Date.now());
@@ -530,14 +534,12 @@ export class AgentRelay {
       stalled: false,
     });
 
-    // Checked up front, so a missing configuration is one stated failure
-    // rather than whichever side happened to be opened last overwriting the
-    // other's message.
-    for (const side of ["patient", "receptionist"] as const) {
-      if (!this.agentIdFor(side)) {
-        this.fail(side, `No ${label(side)} agent is configured.`);
-        return;
-      }
+    // Checked up front, so a page that cannot open a voice session says so once
+    // and clearly. Opening a socket to find out would be the alternative, and it
+    // costs a request to the vendor to learn nothing.
+    if (!this.config.createSocket) {
+      this.fail("patient", `No ${label("patient")} agent is configured.`);
+      return;
     }
 
     this.connectedBefore.patient = false;
@@ -666,20 +668,19 @@ export class AgentRelay {
     delete this.reconnectTimers[side];
   }
 
-  private agentIdFor(side: AgentSide): string | undefined {
-    return side === "patient" ? this.config.patientAgentId : this.config.receptionistAgentId;
-  }
-
   private openSide(side: AgentSide): void {
-    // Checked in `start` as well. Belt and braces: an id that vanished between
-    // the preflight and here would otherwise open a socket against nothing.
-    const agentId = this.agentIdFor(side);
-    if (!agentId) {
+    // Read from the live configuration rather than captured at construction,
+    // because `reconfigure` is how a page hands this machine its sockets and it
+    // may do so after the machine was built. Checked in `start` as well; belt
+    // and braces, because a factory that disappeared between the preflight and
+    // here would otherwise open a socket against nothing.
+    const create = this.config.createSocket;
+    if (!create) {
       this.fail(side, `No ${label(side)} agent is configured.`);
       return;
     }
 
-    const socket = this.createSocket(conversationUrl(agentId));
+    const socket = create(side);
     this.sockets[side] = socket;
     this.settled[side] = false;
     this.opened[side] = false;
@@ -1362,8 +1363,15 @@ function label(side: AgentSide): string {
 /* -------------------------------------------------------------------------- */
 
 export interface UseAgentRelayOptions {
-  patientAgentId: string;
-  receptionistAgentId: string;
+  /**
+   * Opens one side's socket.
+   *
+   * Omitted when this deployment cannot open a voice session at all, which the
+   * machine reports as a failed connect rather than as an empty call. The page
+   * decides this from the server-rendered `voiceAvailable` flag rather than by
+   * asking the vendor, so a page can render the right thing on the first paint.
+   */
+  createSocket?: (side: AgentSide) => RelaySocket;
   /**
    * The opening line handed to the patient agent, built from the record.
    *
@@ -1412,8 +1420,7 @@ export interface UseAgentRelayResult {
  */
 export function useAgentRelay(options: UseAgentRelayOptions): UseAgentRelayResult {
   const {
-    patientAgentId,
-    receptionistAgentId,
+    createSocket,
     patientOpeningContext,
     receptionistOpeningContext,
     patientDynamicVariables,
@@ -1465,16 +1472,14 @@ export function useAgentRelay(options: UseAgentRelayOptions): UseAgentRelayResul
 
   useEffect(() => {
     relay.reconfigure({
-      patientAgentId,
-      receptionistAgentId,
+      createSocket,
       patientOpeningContext,
       receptionistOpeningContext,
       patientDynamicVariables,
     });
   }, [
     relay,
-    patientAgentId,
-    receptionistAgentId,
+    createSocket,
     patientOpeningContext,
     receptionistOpeningContext,
     patientDynamicVariables,
