@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "react-toastify";
 import { submitIntakeForm } from "@/app/actions";
 import { clientLog } from "@/lib/logger/client";
@@ -20,6 +20,7 @@ import {
   summaryEntries,
   type FieldErrors,
 } from "./formIssues";
+import { BookingConfirmation } from "./BookingConfirmation";
 import { createSubmitGate } from "./submitGate";
 
 /**
@@ -31,6 +32,33 @@ import { createSubmitGate } from "./submitGate";
  * `page.tsx` resolves the slug and calls `notFound()` for anything it does
  * not recognise, so a bad URL never reaches here.
  */
+
+/**
+ * How long the confirmation stays up before the patient is taken to the
+ * consultation.
+ *
+ * The redirect is kept, because the point of the flow is to get someone into a
+ * voice call, but it no longer happens instantly: an immediate
+ * `location.assign` meant the success toast was raised on a document that was
+ * already being torn down, so nobody ever saw it, and the only evidence a
+ * booking had happened was the page changing. Long enough to read, short
+ * enough that most people are not still reading when it goes.
+ */
+const REDIRECT_SECONDS = 20;
+
+/**
+ * A completed booking.
+ *
+ * The URL is the sealed spectate token, not a record: `spectateUrl` used to
+ * carry the patient's name, email, date of birth, and symptoms in a query
+ * parameter, and it is now an opaque ciphertext that the server can open and
+ * nobody else can. That is what makes it safe to put on the page and behind a
+ * disclosure rather than in a console.
+ */
+interface Booking {
+  url: string;
+  appointmentId: string;
+}
 
 const LABEL =
   "block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5";
@@ -52,11 +80,48 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
   const [errors, setErrors] = useState<FieldErrors>({});
   const [unattached, setUnattached] = useState<string[]>([]);
   const [pending, setPending] = useState(false);
+  const [booked, setBooked] = useState<Booking | null>(null);
+  const [staying, setStaying] = useState(false);
+  const [remaining, setRemaining] = useState(REDIRECT_SECONDS);
   const summaryRef = useRef<HTMLDivElement | null>(null);
+  const confirmationRef = useRef<HTMLHeadingElement | null>(null);
   // The gate refuses a second submission synchronously, which a state flag
   // cannot: two clicks in one frame both read `pending === false`. The state
   // alongside it is what renders the disabled button.
   const gate = useRef(createSubmitGate());
+
+  /**
+   * The countdown to the consultation.
+   *
+   * This schedules the timer and nothing else. `staying` is in the dependency
+   * list so that choosing to stay tears the timer down through the same
+   * cleanup, rather than clearing it in a second place that can be forgotten.
+   * The counter is not reset here: setting state in an effect body is a
+   * cascading render, and the counter starts where it should in the handler
+   * that opened the confirmation, where the new value is known.
+   */
+  useEffect(() => {
+    if (!booked || staying) return;
+
+    const countdown = setInterval(() => {
+      setRemaining((value) => Math.max(0, value - 1));
+    }, 1000);
+    const redirect = setTimeout(() => {
+      window.location.assign(booked.url);
+    }, REDIRECT_SECONDS * 1000);
+
+    return () => {
+      clearInterval(countdown);
+      clearTimeout(redirect);
+    };
+  }, [booked, staying]);
+
+  // The form is replaced by the confirmation, so focus would otherwise be
+  // dropped onto the body and a keyboard or screen reader user would be
+  // returned to the top of the document with no announcement.
+  useEffect(() => {
+    if (booked) confirmationRef.current?.focus();
+  }, [booked]);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -95,11 +160,12 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
       setUnattached([]);
       clientLog("info", "intake.submit_accepted", { language: slug });
       toast.success(t.toastProcessing);
-      // assign() rather than `window.location.href = url`, which the React
-      // compiler's immutability rule rejects as a write to a global. Same
-      // navigation, and a full document load rather than a client-side one,
-      // which is what a page opening two WebSockets wants.
-      window.location.assign(result.spectateUrl);
+      // Show what happened, then go there. `setBooked` replaces the form with
+      // the confirmation; the effect above does the navigating, on a timer the
+      // patient can cancel.
+      setBooked({ url: result.spectateUrl, appointmentId: result.appointmentId });
+      setRemaining(REDIRECT_SECONDS);
+      setStaying(false);
     } catch (error) {
       // A server action can throw before it returns its union: a dropped
       // connection, a platform error, a serialization failure. Previously that
@@ -139,12 +205,14 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
         </Link>
 
         <div className="bg-white border border-slate-200 rounded-3xl p-8 shadow-xl">
-          <div className="mb-8 text-center">
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mb-2">
-              {t.title}
-            </h1>
-            <p className="text-sm text-slate-600">{t.subtitle}</p>
-          </div>
+          {!booked && (
+            <div className="mb-8 text-center">
+              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mb-2">
+                {t.title}
+              </h1>
+              <p className="text-sm text-slate-600">{t.subtitle}</p>
+            </div>
+          )}
 
           {/*
             The error summary. `role="alert"` so it is announced when it
@@ -152,7 +220,7 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
             reader user has to go looking for is not a summary, it is a
             decoration. Each entry links to the control it is about.
           */}
-          {(hasFieldErrors(errors) || unattached.length > 0) && (
+          {!booked && (hasFieldErrors(errors) || unattached.length > 0) && (
             <div
               ref={summaryRef}
               tabIndex={-1}
@@ -186,6 +254,7 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
             </div>
           )}
 
+          {!booked && (
           <form
             onSubmit={handleSubmit}
             aria-busy={pending}
@@ -480,6 +549,28 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
               {pending ? t.submitting : ""}
             </p>
           </form>
+          )}
+
+          {/*
+            The confirmation replaces the form, and the redirect that used to
+            happen instantly now happens on a timer this can cancel. See
+            BookingConfirmation for the reasoning.
+          */}
+          {booked && (
+            <BookingConfirmation
+              url={booked.url}
+              appointmentId={booked.appointmentId}
+              remaining={remaining}
+              staying={staying}
+              onStay={() => setStaying(true)}
+              onResume={() => {
+                setRemaining(REDIRECT_SECONDS);
+                setStaying(false);
+              }}
+              messages={t}
+              headingRef={confirmationRef}
+            />
+          )}
         </div>
       </div>
     </div>

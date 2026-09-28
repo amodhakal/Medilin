@@ -9,6 +9,7 @@ import {
   LANGUAGE_SLUGS,
   getLanguage,
   htmlLang,
+  formatMessage,
   isLanguageSlug,
   messagesFor,
   resolveLanguage,
@@ -121,8 +122,7 @@ describe("language metadata", () => {
   });
 });
 
-describe("department options", () => {
-  test("cover exactly the departments the intake schema accepts", () => {
+describe("department options", () => {  test("cover exactly the departments the intake schema accepts", () => {
     expect(DEPARTMENT_OPTIONS.map((option) => option.value)).toEqual([
       ...MEDICAL_DEPARTMENTS,
     ]);
@@ -136,5 +136,62 @@ describe("department options", () => {
 
   test("the placeholder is not offered as a department", () => {
     expect(DEPARTMENT_OPTIONS.map((option) => option.value)).not.toContain("");
+  });
+});
+
+describe("formatMessage", () => {
+  test("fills a placeholder", () => {
+    expect(formatMessage("Redirecting in {seconds} seconds.", { seconds: 20 })).toBe(
+      "Redirecting in 20 seconds.",
+    );
+  });
+
+  test("fills the same placeholder more than once", () => {
+    expect(formatMessage("{n} of {n}", { n: 3 })).toBe("3 of 3");
+  });
+
+  test("fills several placeholders", () => {
+    expect(formatMessage("{a} then {b}", { a: "one", b: "two" })).toBe("one then two");
+  });
+
+  test("leaves a string with no placeholders alone", () => {
+    expect(formatMessage("No placeholders here.", {})).toBe("No placeholders here.");
+  });
+
+  test("leaves an unsupplied placeholder visible rather than guessing", () => {
+    // A missing argument should be obvious on the page, not silently replaced
+    // with a word from the wrong language.
+    expect(formatMessage("in {seconds}", {})).toBe("in {seconds}");
+  });
+
+  test("does not read a placeholder off the prototype chain", () => {
+    expect(formatMessage("{constructor} {toString}", {})).toBe(
+      "{constructor} {toString}",
+    );
+  });
+
+  test("renders a number, not a digit soup", () => {
+    expect(formatMessage("{n}", { n: 0 })).toBe("0");
+  });
+
+  test("every countdown string in every language is fillable", () => {
+    for (const slug of LANGUAGE_SLUGS) {
+      const { messages } = getLanguage(slug);
+      const filled = formatMessage(messages.redirectingIn, { seconds: 20 });
+      expect(filled).not.toContain("{");
+      expect(filled).toContain("20");
+      expect(messages.redirectingInOne).not.toContain("{");
+    }
+  });
+
+  test("no message is left with a placeholder nobody supplies", () => {
+    const known = ["seconds"];
+    for (const slug of LANGUAGE_SLUGS) {
+      for (const value of Object.values(getLanguage(slug).messages)) {
+        for (const match of value.matchAll(/\{(\w+)\}/g)) {
+          expect(known).toContain(match[1]);
+        }
+      }
+    }
   });
 });

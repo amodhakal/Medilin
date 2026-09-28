@@ -64,6 +64,18 @@ const ENGLISH = {
   pickLanguage: "Choose a language",
   fixErrors: "Check these fields",
   submitting: "Starting your consultation",
+  bookedTitle: "Your appointment is booked",
+  bookedBody:
+    "The voice receptionist is ready for you. Your details are confirmed and a copy is on its way to your email.",
+  joinCall: "Join the voice consultation",
+  reference: "Reference",
+  showLink: "Show the link",
+  stayHere: "Stay on this page",
+  redirectingIn: "Taking you to the consultation in {seconds} seconds.",
+  redirectingInOne: "Taking you to the consultation in one second.",
+  resumeRedirect: "Go to the consultation automatically",
+  redirectingNotice:
+    "You will be taken to the voice consultation automatically. Use the link above, or stay on this page.",
   submitFailed: "Your details could not be sent. Nothing has been booked.",
   firstNamePlaceholder: "Jordan",
   lastNamePlaceholder: "Reyes",
@@ -78,6 +90,29 @@ export const ENGLISH_MESSAGES = ENGLISH;
 export type MessageKey = keyof typeof ENGLISH;
 
 export type Messages = { readonly [K in MessageKey]: string };
+
+/**
+ * Fill `{name}` placeholders in a translated string.
+ *
+ * Deliberately not a template language. A message is a sentence with a number
+ * in it, and the only thing that has to be true of the translation is that it
+ * can put the number where its language puts it, which the placeholder
+ * position in the string decides. Anything more expressive is a thing to
+ * translate badly rather than a thing to translate well.
+ *
+ * An unknown placeholder is left as written rather than replaced with the
+ * parameter's name, so a visible `{countdown}` on a page is a missing
+ * argument in the calling code, which is findable, instead of a sentence with
+ * a word in the wrong language in it.
+ */
+export function formatMessage(
+  template: string,
+  params: Readonly<Record<string, string | number>>,
+): string {
+  return template.replace(/\{(\w+)\}/g, (match, name: string) =>
+    Object.hasOwn(params, name) ? String(params[name]) : match,
+  );
+}
 
 export type TextDirection = "ltr" | "rtl";
 
@@ -142,6 +177,18 @@ const DEFINITIONS = {
       pickLanguage: "Elegir un idioma",
       fixErrors: "Revisa estos campos",
       submitting: "Iniciando tu consulta",
+      bookedTitle: "Tu cita está reservada",
+      bookedBody:
+        "La recepcionista de IA está lista para atenderte. Tus datos están confirmados y recibirás una copia por correo electrónico.",
+      joinCall: "Entrar en la consulta por voz",
+      reference: "Referencia",
+      showLink: "Mostrar el enlace",
+      stayHere: "Quedarme en esta página",
+      redirectingIn: "Te llevaremos a la consulta en {seconds} segundos.",
+      redirectingInOne: "Te llevaremos a la consulta en un segundo.",
+      resumeRedirect: "Ir a la consulta automáticamente",
+      redirectingNotice:
+        "Entrarás automáticamente en la consulta por voz. Usa el enlace de arriba o quédate en esta página.",
       submitFailed: "No se pudieron enviar tus datos. No se ha reservado nada.",
       firstNamePlaceholder: "Jordan",
       lastNamePlaceholder: "Reyes",
@@ -187,6 +234,18 @@ const DEFINITIONS = {
       pickLanguage: "Escolher um idioma",
       fixErrors: "Verifique estes campos",
       submitting: "Iniciando sua consulta",
+      bookedTitle: "Sua consulta está agendada",
+      bookedBody:
+        "A recepcionista de voz está pronta para atender você. Seus dados estão confirmados e uma cópia chegará por e-mail.",
+      joinCall: "Entrar na consulta por voz",
+      reference: "Referência",
+      showLink: "Mostrar o link",
+      stayHere: "Ficar nesta página",
+      redirectingIn: "Levaremos você à consulta em {seconds} segundos.",
+      redirectingInOne: "Levaremos você à consulta em um segundo.",
+      resumeRedirect: "Ir para a consulta automaticamente",
+      redirectingNotice:
+        "Você será levado à consulta por voz automaticamente. Use o link acima ou fique nesta página.",
       submitFailed: "Não foi possível enviar seus dados. Nada foi agendado.",
       firstNamePlaceholder: "Jordan",
       lastNamePlaceholder: "Reyes",
