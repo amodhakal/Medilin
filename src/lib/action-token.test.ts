@@ -90,16 +90,22 @@ describe("mintActionToken", () => {
   test("is never a tracking token, in either of that file's two formats", () => {
     // phi-token seals with version byte 1, whose low two bits are 01, so its
     // tokens always begin "AQ"; ours is byte 3, whose low two bits are 11, so
-    // the second character is always one of "wxyz0-9_" and never "Q". The
+    // the second character is always one of "wxyz0-9-_" and never "Q". The
     // reference format is the literal "2.". The two families therefore dispatch
     // on the first two characters in either direction, deterministically, and
     // no format ever reaches the wrong parser.
+    //
+    // The set is all sixteen base64url characters from index 48: the second
+    // character carries the low two bits of the version byte in its high four
+    // bits, and the top four bits of the first random IV byte in its low four,
+    // so every one of them is reachable. Leaving "-" out of the class failed
+    // one run in sixteen.
     const { token } = mint();
 
     expect(token.startsWith("A")).toBe(true);
     expect(token.startsWith("AQ")).toBe(false);
     expect(token.startsWith("2.")).toBe(false);
-    expect(token[1]).toMatch(/[wxyz0-9_]/);
+    expect(token[1]).toMatch(/[wxyz0-9_-]/);
   });
 
   test("stores capabilities in the closed set's order, whatever order it was given", () => {
