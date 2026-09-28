@@ -61,21 +61,79 @@ export const DEFAULT_SIGNED_URL_TTL_SECONDS = 60;
 export const MIN_SIGNED_URL_TTL_SECONDS = 15;
 export const MAX_SIGNED_URL_TTL_SECONDS = 300;
 
-/** The body and headers of one vendor call. */
+/** Speech-to-text. The intake path's recording arrives here. */
+export const STT_ENDPOINT = "https://api.elevenlabs.io/v1/speech-to-text";
+
+/** Text-to-speech. One voice per line of the intake review, read back. */
+export const SPEECH_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
+
+/**
+ * Which models do the work.
+ *
+ * Constants rather than configuration, because a model id that can be wrong is a
+ * deployment that transcribes nobody's speech correctly and says it worked. The
+ * voice is the exception: which voice reads a patient's own words back to them
+ * is a per-deployment choice about who is speaking to whom, and there is an
+ * optional variable for it in src/lib/env.ts.
+ */
+export const TRANSCRIPTION_MODEL = "scribe_v1";
+export const TTS_MODEL = "eleven_multilingual_v2";
+
+/**
+ * The voice used when none is configured.
+ *
+ * One of the vendor's published default voices, chosen because it is a stock
+ * voice rather than a cloned one: this is a healthcare intake, and the
+ * alternative reading a patient's own words back to them in a borrowed voice is
+ * a decision nobody should make by accident. Override with
+ * ELEVENLABS_TTS_VOICE_ID.
+ */
+export const DEFAULT_TTS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM";
+
+/**
+ * Ceiling on an uploaded recording, in bytes.
+ *
+ * 15 MB is about an hour of compressed speech, which is far longer than any
+ * intake answer, and the point is to bound what a single request can make the
+ * server hold in memory and then forward. Checked before the upload, not after:
+ * the useful time to refuse a 200 MB body is before it has been read.
+ */
+export const MAX_AUDIO_BYTES = 15 * 1024 * 1024;
+
+/**
+ * Ceiling on text handed to speech-to-speech, in characters.
+ *
+ * A confirmation read back to a patient is a sentence or two. Anything longer
+ * is a caller trying to make this endpoint a general text-to-speech service on
+ * a metered account, and the route caps it again on the way in.
+ */
+export const MAX_SPEECH_CHARACTERS = 600;
+
+/**
+ * The body and headers of one vendor call.
+ *
+ * `FormData` for the endpoints that take a file. A recording is not a string,
+ * and base64-encoding it into JSON would add a third to every upload and then
+ * need decoding on the way in; the vendor takes multipart, so this does too.
+ */
 export interface VendorRequestInit {
   method: string;
   headers: Record<string, string>;
-  body: string;
+  body: string | FormData;
 }
 
 /** One vendor call, as this client made it. What a test reads. */
 export type VendorCall = VendorRequestInit & { url: string };
 
 /** The slice of `fetch` this client depends on. */
-export type VendorFetch = (url: string, init: VendorRequestInit) => Promise<{
+export type VendorFetch = (
+  url: string,
+  init: VendorRequestInit,
+) => Promise<{
   ok: boolean;
   status: number;
   json(): Promise<unknown>;
+  arrayBuffer(): Promise<ArrayBuffer>;
 }>;
 
 export interface SignedConversation {
@@ -93,6 +151,28 @@ export interface SignedConversation {
   expiresAt: number;
 }
 
+/** A recording on its way to the vendor, as bytes rather than as a form. */
+export interface VoiceAudio {
+  /**
+   * `Uint8Array<ArrayBuffer>` rather than any `Uint8Array`, because that is what
+   * a `BlobPart` accepts and a view onto a `SharedArrayBuffer` is not one. Both
+   * callers -- the vendor response and the multipart upload -- start from an
+   * `ArrayBuffer`, so the narrower type costs nothing and stops the upload from
+   * being unbuildable.
+   */
+  bytes: Uint8Array<ArrayBuffer>;
+  mimeType: string;
+  /** A name for the multipart part. Not a path, and never used as one. */
+  filename: string;
+}
+
+export interface Transcription {
+  /** What was said, verbatim. May be in any language the vendor recognised. */
+  text: string;
+  /** The vendor's own language guess, when it made one. */
+  languageCode: string | null;
+}
+
 export interface ElevenLabsClient {
   /**
    * Mint a short-lived signed conversation URL for one agent.
@@ -103,6 +183,25 @@ export interface ElevenLabsClient {
    * the API key, or the agent id in the message.
    */
   mintConversationUrl(request: { agentId: string; ttlSeconds?: number }): Promise<SignedConversation>;
+
+  /**
+   * Transcribe a recording.
+   *
+   * Throws rather than returning an empty transcript. Silence, a failed
+   * transcription, and a vendor that changed its response shape are three
+   * different things and the caller cannot tell them apart from `""`; the first
+   * of them is a person holding a phone and saying nothing yet.
+   */
+  transcribe(audio: VoiceAudio, options: { languageCode?: string }): Promise<Transcription>;
+
+  /**
+   * Read text aloud. Returns the encoded audio the browser will play.
+   *
+   * `Uint8Array<ArrayBuffer>` for the same reason `VoiceAudio.bytes` is: a
+   * `Response` body accepts an `ArrayBuffer` view over a real `ArrayBuffer` and
+   * nothing else, and both the vendor's reply and this response start as one.
+   */
+  speak(text: string): Promise<Uint8Array<ArrayBuffer>>;
 }
 
 class HttpElevenLabsClient implements ElevenLabsClient {
@@ -146,6 +245,84 @@ class HttpElevenLabsClient implements ElevenLabsClient {
 
     return { url, expiresAt: this.now() + expiresInSecs * 1000 };
   }
+
+  async transcribe(
+    { bytes, mimeType, filename }: VoiceAudio,
+    { languageCode }: { languageCode?: string },
+  ): Promise<Transcription> {
+    if (bytes.byteLength > MAX_AUDIO_BYTES) {
+      throw new VendorRequestError("The recording is too long to transcribe");
+    }
+
+    const form = new FormData();
+    form.set("file", new File([bytes], filename, { type: mimeType }));
+    form.set("model_id", TRANSCRIPTION_MODEL);
+    // Off by default in some accounts and on by default in others. A transcript
+    // with `[laughs]` in it is a transcript nobody can extract fields from.
+    form.set("tag_audio_events", "false");
+    if (languageCode) form.set("language_code", languageCode);
+
+    const response = await this.doFetch(STT_ENDPOINT, {
+      method: "POST",
+      headers: { "xi-api-key": this.apiKey },
+      body: form,
+    });
+
+    if (!response.ok) {
+      throw new VendorRequestError("The voice vendor refused the recording", response.status);
+    }
+
+    return readTranscription(await response.json());
+  }
+
+  async speak(text: string): Promise<Uint8Array<ArrayBuffer>> {
+    if (text.trim().length === 0 || text.length > MAX_SPEECH_CHARACTERS) {
+      throw new VendorRequestError("That is not something to read aloud");
+    }
+
+    const response = await this.doFetch(`${SPEECH_ENDPOINT}/${this.voiceId()}`, {
+      method: "POST",
+      headers: { "xi-api-key": this.apiKey, "content-type": "application/json" },
+      body: JSON.stringify({ text, model_id: TTS_MODEL }),
+    });
+
+    if (!response.ok) {
+      throw new VendorRequestError("The voice vendor refused the request", response.status);
+    }
+
+    return new Uint8Array(await response.arrayBuffer()) as Uint8Array<ArrayBuffer>;
+  }
+
+  /** The configured voice, or a well-known default when none is set. */
+  private voiceId(): string {
+    return getServerEnv().ELEVENLABS_TTS_VOICE_ID || DEFAULT_TTS_VOICE_ID;
+  }
+}
+
+/**
+ * Read a transcription out of a vendor response.
+ *
+ * `text` is the only field that matters, and its absence is a failure. An empty
+ * transcript is not an answer this app can use: it produces a review step with
+ * nothing in it, and the next thing the patient is told is that no fields could
+ * be extracted, which is both true and useless.
+ */
+function readTranscription(body: unknown): Transcription {
+  if (typeof body !== "object" || body === null) {
+    throw new VendorRequestError("The voice vendor returned an unexpected response");
+  }
+
+  const source = body as Record<string, unknown>;
+  const text = source.text;
+  if (typeof text !== "string" || text.trim().length === 0) {
+    throw new VendorRequestError("The voice vendor returned no transcript");
+  }
+
+  const language = source.language_code;
+  return {
+    text: text.trim(),
+    languageCode: typeof language === "string" && language.length > 0 ? language : null,
+  };
 }
 
 /**
@@ -220,9 +397,23 @@ export function createElevenLabsClient({
   return new HttpElevenLabsClient(apiKey, fetchImpl, now);
 }
 
-/** Stands in for the client when there is no key, and refuses every request. */
+/**
+ * Stands in for the client when there is no key, and refuses every request.
+ *
+ * All three, not just the one the spectate page needs. A voice feature that
+ * mints nothing but will happily upload a patient's recording to a vendor with
+ * no credential is worse than one that is off.
+ */
 class UnconfiguredElevenLabsClient implements ElevenLabsClient {
   mintConversationUrl(): Promise<SignedConversation> {
+    return Promise.reject(new VoiceNotConfiguredError());
+  }
+
+  transcribe(): Promise<Transcription> {
+    return Promise.reject(new VoiceNotConfiguredError());
+  }
+
+  speak(): Promise<Uint8Array<ArrayBuffer>> {
     return Promise.reject(new VoiceNotConfiguredError());
   }
 }

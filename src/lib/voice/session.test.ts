@@ -64,6 +64,12 @@ function stubClient(
       asked.push(request.agentId);
       return behaviour(request);
     },
+    transcribe: async () => {
+      throw new Error("not used here");
+    },
+    speak: async () => {
+      throw new Error("not used here");
+    },
   });
   return { asked };
 }

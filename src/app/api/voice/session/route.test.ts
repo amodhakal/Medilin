@@ -72,6 +72,12 @@ function stubVendor(behaviour?: ElevenLabsClient["mintConversationUrl"]): void {
       mintCalls.push(request);
       return behaviour ? behaviour(request) : minted;
     },
+    transcribe: async () => {
+      throw new Error("not used by this route");
+    },
+    speak: async () => {
+      throw new Error("not used by this route");
+    },
   });
 }
 

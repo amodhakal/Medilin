@@ -3,15 +3,23 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { resetServerEnvCache } from "@/lib/env";
 import {
   DEFAULT_SIGNED_URL_TTL_SECONDS,
+  MAX_AUDIO_BYTES,
+  MAX_SPEECH_CHARACTERS,
   MAX_SIGNED_URL_TTL_SECONDS,
   MIN_SIGNED_URL_TTL_SECONDS,
   SIGNED_CONVERSATION_ENDPOINT,
+  SPEECH_ENDPOINT,
+  STT_ENDPOINT,
+  TRANSCRIPTION_MODEL,
+  TTS_MODEL,
   VendorRequestError,
   VoiceNotConfiguredError,
   createElevenLabsClient,
   getElevenLabsClient,
+  type ElevenLabsClient,
   isVoiceConfigured,
   setElevenLabsClient,
+  type VoiceAudio,
   type VendorCall,
   type VendorFetch,
 } from "./elevenlabs";
@@ -55,9 +63,10 @@ function recordingFetch(
   body: unknown = {
     url: "wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_patient&signature=abc&expires=1",
   },
-  init: { ok?: boolean; status?: number } = {},
+  init: { ok?: boolean; status?: number; bytes?: Uint8Array } = {},
 ): { fetchImpl: VendorFetch; calls: VendorCall[] } {
   const calls: VendorCall[] = [];
+  const bytes = init.bytes ?? new Uint8Array([0xff, 0xfb, 0x90, 0x00]);
   const fetchImpl: VendorFetch = async (url, request) => {
     calls.push({ url, ...request });
     const status = init.status ?? 200;
@@ -65,10 +74,22 @@ function recordingFetch(
       ok: init.ok ?? status < 400,
       status,
       json: async () => body,
+      arrayBuffer: async () =>
+        bytes.buffer.slice(
+          bytes.byteOffset,
+          bytes.byteOffset + bytes.byteLength,
+        ) as ArrayBuffer,
     };
   };
   return { fetchImpl, calls };
 }
+
+/** A recording as the client accepts one. */
+const CLIP: VoiceAudio = {
+  bytes: new Uint8Array([1, 2, 3, 4]),
+  mimeType: "audio/webm",
+  filename: "clip.webm",
+};
 
 /** The rejection, typed. Every use of it is asserting on a failure. */
 async function rejection(promise: Promise<unknown>): Promise<unknown> {
@@ -103,7 +124,7 @@ describe("mintConversationUrl", () => {
     // The API key is a server secret. It is in the header and nowhere else.
     expect(calls[0].headers["xi-api-key"]).toBe("sk-elevenlabs-test");
     expect(calls[0].headers.authorization).toBeUndefined();
-    expect(calls[0].body).toContain('"agent_id":"agent_patient"');
+    expect(calls[0].body).toBe('{"agent_id":"agent_patient","expires_in_secs":60}');
     expect(minted.url).toContain("signature=");
   });
 
@@ -115,7 +136,7 @@ describe("mintConversationUrl", () => {
 
     const minted = await client.mintConversationUrl({ agentId: "agent_patient" });
 
-    const body = JSON.parse(calls[0].body) as { expires_in_secs: number };
+    const body = JSON.parse(calls[0].body as string) as { expires_in_secs: number };
     // A URL that is good for hours is a long-lived credential with an expiry
     // printed on it. The whole point of minting per session is that the window
     // is small enough to be useless once the session is over.
@@ -131,7 +152,7 @@ describe("mintConversationUrl", () => {
 
     await client.mintConversationUrl({ agentId: "agent_patient", ttlSeconds: 86_400 });
 
-    const body = JSON.parse(calls[0].body) as { expires_in_secs: number };
+    const body = JSON.parse(calls[0].body as string) as { expires_in_secs: number };
     expect(body.expires_in_secs).toBe(MAX_SIGNED_URL_TTL_SECONDS);
   });
 
@@ -142,7 +163,7 @@ describe("mintConversationUrl", () => {
 
     await client.mintConversationUrl({ agentId: "agent_patient", ttlSeconds: 1 });
 
-    const body = JSON.parse(calls[0].body) as { expires_in_secs: number };
+    const body = JSON.parse(calls[0].body as string) as { expires_in_secs: number };
     expect(body.expires_in_secs).toBe(MIN_SIGNED_URL_TTL_SECONDS);
   });
 
@@ -248,7 +269,15 @@ describe("getElevenLabsClient", () => {
     const first = getElevenLabsClient();
     expect(getElevenLabsClient()).toBe(first);
 
-    const stub = { mintConversationUrl: async () => ({ url: "", expiresAt: 0 }) };
+    const stub: ElevenLabsClient = {
+      mintConversationUrl: async () => ({ url: "", expiresAt: 0 }),
+      transcribe: async () => {
+        throw new Error("unused");
+      },
+      speak: async () => {
+        throw new Error("unused");
+      },
+    };
     setElevenLabsClient(stub);
     expect(getElevenLabsClient()).toBe(stub);
   });
@@ -260,5 +289,139 @@ describe("getElevenLabsClient", () => {
     // check is at the call, not at the constructor.
     setEnv({ ELEVENLABS_API_KEY: undefined });
     expect(() => getElevenLabsClient()).not.toThrow();
+  });
+});
+
+describe("transcribe", () => {
+  test("uploads the audio as multipart form data, authenticated server-side", async () => {
+    setEnv({});
+    const { fetchImpl, calls } = recordingFetch({ text: "me llamo Ada" });
+    const client = createElevenLabsClient({ fetchImpl });
+
+    const transcript = await client.transcribe(CLIP, { languageCode: "es" });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(STT_ENDPOINT);
+    expect(calls[0].headers["xi-api-key"]).toBe("sk-elevenlabs-test");
+    // The API key must not be smuggled into the body as well as the header,
+    // and a JSON body cannot carry a recording at all.
+    expect(calls[0].body).toBeInstanceOf(FormData);
+
+    const form = calls[0].body as FormData;
+    expect(form.get("model_id")).toBe(TRANSCRIPTION_MODEL);
+    expect(form.get("language_code")).toBe("es");
+    expect((form.get("file") as File).name).toBe("clip.webm");
+    expect(transcript.text).toBe("me llamo Ada");
+  });
+
+  test("leaves the language out when the caller has none", async () => {
+    setEnv({});
+    const { fetchImpl, calls } = recordingFetch({ text: "hello" });
+    const client = createElevenLabsClient({ fetchImpl });
+
+    await client.transcribe(CLIP, {});
+
+    const form = calls[0].body as FormData;
+    // A guessed language is worse than none: the vendor's own detection is
+    // better than a wrong guess, and a wrong guess silently mis-transcribes a
+    // name.
+    expect(form.has("language_code")).toBe(false);
+  });
+
+  test("does not ask for audio event tags nobody wants", async () => {
+    setEnv({});
+    const { fetchImpl, calls } = recordingFetch({ text: "hola" });
+    const client = createElevenLabsClient({ fetchImpl });
+
+    await client.transcribe(CLIP, {});
+
+    const form = calls[0].body as FormData;
+    expect(form.get("tag_audio_events")).toBe("false");
+  });
+
+  test("refuses a recording larger than the cap, without uploading it", async () => {
+    setEnv({});
+    const { fetchImpl, calls } = recordingFetch({ text: "" });
+    const client = createElevenLabsClient({ fetchImpl });
+
+    await expect(
+      client.transcribe({ ...CLIP, bytes: new Uint8Array(MAX_AUDIO_BYTES + 1) }, {}),
+    ).rejects.toBeInstanceOf(VendorRequestError);
+    expect(calls).toEqual([]);
+  });
+
+  test("treats a vendor answer with no text as a failure, not as silence", async () => {
+    setEnv({});
+
+    for (const body of [{}, { text: "" }, { text: 42 }, null, "ok"]) {
+      const { fetchImpl } = recordingFetch(body);
+      const client = createElevenLabsClient({ fetchImpl });
+
+      // An empty transcript that looked like success would send a patient
+      // through a review step with nothing in it, and the next error would be
+      // "no fields could be extracted", which is a much worse thing to say.
+      await expect(client.transcribe(CLIP, {})).rejects.toBeInstanceOf(VendorRequestError);
+    }
+  });
+
+  test("refuses without a key rather than sending an unauthenticated recording", async () => {
+    setEnv({ ELEVENLABS_API_KEY: undefined });
+    const { fetchImpl, calls } = recordingFetch({ text: "hola" });
+    const client = createElevenLabsClient({ fetchImpl });
+
+    await expect(client.transcribe(CLIP, {})).rejects.toBeInstanceOf(VoiceNotConfiguredError);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("speak", () => {
+  test("asks for audio and returns the bytes", async () => {
+    setEnv({});
+    const { fetchImpl, calls } = recordingFetch(undefined, {
+      bytes: new Uint8Array([0x49, 0x44, 0x33]),
+    });
+    const client = createElevenLabsClient({ fetchImpl });
+
+    const audio = await client.speak("Su cita es el martes");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain(SPEECH_ENDPOINT);
+    expect(calls[0].url).toContain("/v1/text-to-speech/");
+    expect(calls[0].headers["xi-api-key"]).toBe("sk-elevenlabs-test");
+
+    const body = JSON.parse(calls[0].body as string) as { text: string; model_id: string };
+    expect(body.text).toBe("Su cita es el martes");
+    expect(body.model_id).toBe(TTS_MODEL);
+    expect([...audio]).toEqual([0x49, 0x44, 0x33]);
+  });
+
+  test("refuses text longer than the cap rather than paying for it", async () => {
+    setEnv({});
+    const { fetchImpl, calls } = recordingFetch(undefined);
+    const client = createElevenLabsClient({ fetchImpl });
+
+    await expect(client.speak("x".repeat(MAX_SPEECH_CHARACTERS + 1))).rejects.toBeInstanceOf(
+      VendorRequestError,
+    );
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses empty text", async () => {
+    setEnv({});
+    const { fetchImpl, calls } = recordingFetch(undefined);
+    const client = createElevenLabsClient({ fetchImpl });
+
+    await expect(client.speak("   ")).rejects.toBeInstanceOf(VendorRequestError);
+    expect(calls).toEqual([]);
+  });
+
+  test("reports a vendor refusal as a vendor failure", async () => {
+    setEnv({});
+    const { fetchImpl } = recordingFetch({ detail: "quota exceeded" }, { ok: false, status: 429 });
+    const client = createElevenLabsClient({ fetchImpl });
+
+    const error = await rejection(client.speak("hola"));
+    expect(error).toBeInstanceOf(VendorRequestError);
+    expect((error as VendorRequestError).status).toBe(429);
   });
 });

@@ -47,6 +47,10 @@ const serverEnvSchema = z.object({
     .min(32, "INTERNAL_API_SECRET must be at least 32 characters"),
 
   // Optional capabilities
+
+  // Gates every voice feature: without it this server cannot sign a
+  // conversation URL, transcribe a recording, or synthesise speech, and the
+  // pages offer a form instead.
   ELEVENLABS_API_KEY: z.string().min(1).optional(),
   // Postgres for the durable appointment store (#17) and the durable audit log
   // (#4). Optional in the sense that matters here: unset does not fail the boot,
@@ -59,6 +63,10 @@ const serverEnvSchema = z.object({
   // Must be an http(s) Postgres HTTP endpoint, not a postgres:// socket URL.
   // See src/lib/storage.ts.
   DATABASE_URL: z.string().min(1).optional(),
+  // Which voice reads a patient's intake details back to them. A per-deployment
+  // choice; the client falls back to a stock default when this is absent.
+  ELEVENLABS_TTS_VOICE_ID: z.string().min(1).optional(),
+
   // Gates error monitoring. Absent it, src/lib/logger/sentry stays inert: the
   // SDK is never loaded and nothing is sent anywhere. See that module for the
   // redaction that has to hold before anything is.

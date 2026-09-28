@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import { PROTOTYPE_NOTICE, homeMetadata } from "@/i18n/metadata";
 import { LowBandwidthToggle } from "@/i18n/display-preferences";
+import { voiceMessages } from "@/app/voice/copy";
 import {
   DEFAULT_LANGUAGE,
   LANGUAGE_SLUGS,
@@ -16,6 +17,18 @@ export const metadata = homeMetadata();
  * language names on it are endonyms in `lang` and `dir` of their own.
  */
 const t = messagesFor(DEFAULT_LANGUAGE);
+
+/**
+ * The voice path's own label, from its own dictionary.
+ *
+ * Read from `@/app/voice/copy` rather than added to the intake registry on
+ * purpose: the registry's message set is the one every language surface in this
+ * app is written against, and a screen that has not shipped should not be able
+ * to add a key to it and fail the build for a translator who has not been asked
+ * yet. The voice screens carry their own closed key set instead, checked the
+ * same way.
+ */
+const voiceCopy = voiceMessages(DEFAULT_LANGUAGE);
 
 export default function HomePage() {
   return (
@@ -136,6 +149,28 @@ export default function HomePage() {
             );
           })}
         </div>
+
+        {/*
+          The way in without reading (#61).
+
+          Placed under the picker rather than inside it, and as a link rather
+          than a card, for a reason: the picker is a choice between languages
+          and a patient who cannot read this page in any of them is not helped
+          by a fourteenth card they cannot read. This says what it does in
+          English, leads to a screen whose only input is speech, and is
+          reachable without touching anything above it.
+        */}
+        <p className="mt-12 text-sm text-ink-muted">
+          <Link
+            href="/voice"
+            className="inline-flex items-center gap-2 text-accent font-semibold hover:text-accent-strong hover:underline tap-target"
+          >
+            {voiceCopy.title}
+            <span className="flow-arrow" aria-hidden="true">
+              &rarr;
+            </span>
+          </Link>
+        </p>
       </main>
 
       {/* Footer */}
