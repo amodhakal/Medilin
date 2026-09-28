@@ -81,6 +81,36 @@ const serverEnvSchema = z.object({
   TWILIO_AUTH_TOKEN: z.string().min(1).optional(),
   TWILIO_FROM_NUMBER: z.string().min(1).optional(),
 
+  // Twilio voice, for the outbound call to clinic reception (#64). The first
+  // three above are reused rather than duplicated: a deployment that sends SMS
+  // confirmations and places calls has one account and one sender, and a second
+  // set of variables is a second set to keep in agreement with the first.
+  //
+  // Together with the three above, all five or nothing: see
+  // src/lib/twilio/voice.ts, where a partial set is logged and refused rather
+  // than half-attempted.
+  //
+  // TWILIO_CLINIC_NUMBER is the line to ring, in E.164. There is deliberately no
+  // default for it, and no way to supply one per-request: a number this
+  // application did not choose is a number it dialled from configuration it
+  // cannot vouch for.
+  TWILIO_CLINIC_NUMBER: z.string().min(1).optional(),
+  // The absolute https origin Twilio fetches this application's TwiML from. A
+  // variable rather than something derived from the request, because the request
+  // that triggered a call is not made by Twilio: its Host header is the client's
+  // to choose, and the instruction Twilio acts on is fetched from outside.
+  TWILIO_CALLBACK_BASE_URL: z.string().min(1).optional(),
+
+  // Where a Twilio media stream is terminated (#3). A `wss://` URL owned by a
+  // long-lived service, not by this serverless application: a media stream is a
+  // WebSocket that stays open for the length of a call, and this deployment has
+  // no process to hold it. See src/lib/twilio/media-stream.ts for the whole
+  // argument, which is the same one #15 settled for the ElevenLabs socket.
+  //
+  // Unset is a working configuration, not a broken one: the clinic's line is then
+  // answered with a spoken greeting, which is a real telephone call.
+  TWILIO_MEDIA_STREAM_URL: z.string().min(1).optional(),
+
   // Webhook signing secrets (#65). Each is consulted only when its vendor's
   // signature header is present on an inbound /api/webhook request; when
   // unset, vendor verification for that vendor is skipped and the internal

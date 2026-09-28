@@ -7,6 +7,9 @@ import {
 } from "@/lib/appointments";
 import { resetServerEnvCache } from "@/lib/env";
 import { setLlmClient } from "@/lib/gemini";
+import { setRateLimitStore } from "@/lib/rate-limit";
+import type { FetchLike } from "@/lib/twilio/messaging";
+import { createTwilioVoiceClient, setTwilioVoice } from "@/lib/twilio/voice";
 import type { IntakeFormData } from "@/lib/validation/intake";
 import { bookAppointment } from "./book-appointment";
 import { ConfirmationDeliveryError } from "./deliver-confirmation";
@@ -235,6 +238,120 @@ function storeThatCannotGrant(): InMemoryAppointmentStore {
   };
   return store;
 }
+
+/**
+ * Dialling the clinic, during a booking (#64).
+ *
+ * Before this, the receptionist was a log line: `intake.booking_simulated`,
+ * printed between storing the record and sending the confirmation. These pin the
+ * two halves of replacing it.
+ *
+ * The first is that the default deployment is unchanged. There are no Twilio
+ * credentials here and in CI, so every test above takes the unconfigured path,
+ * and this block is mostly about asserting that a configured one *reaches* the
+ * vendor -- because "it still books" is also what a silently broken dialer looks
+ * like.
+ *
+ * The second is that a call is a network request on the path a patient is
+ * waiting on, and the answer is a report rather than an exception. The record is
+ * already stored when this runs: throwing would take down a booking that
+ * happened, and returning nothing would report a call that was never placed.
+ */
+describe("dialling the clinic during a booking", () => {
+  const voiceConfig = {
+    accountSid: "ACtest00000000000000000000000000",
+    authToken: "twilio-auth-token",
+    fromNumber: "+15558675309",
+    toNumber: "+15551230000",
+    callbackBaseUrl: "https://clinic.example",
+  };
+
+  let calls: { url: string; init: RequestInit | undefined }[] = [];
+  let callStatus = 201;
+
+  function installVoice() {
+    calls = [];
+    callStatus = 201;
+    setTwilioVoice({
+      from: voiceConfig.fromNumber,
+      to: voiceConfig.toNumber,
+      callbackBaseUrl: voiceConfig.callbackBaseUrl,
+      client: createTwilioVoiceClient(voiceConfig, (async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        return callStatus === 201
+          ? new Response(JSON.stringify({ sid: "CAabc", status: "queued" }), { status: 201 })
+          : new Response(JSON.stringify({ code: 21218 }), { status: callStatus });
+      }) as unknown as FetchLike),
+    });
+  }
+
+  beforeEach(() => {
+    setRateLimitStore(null);
+    installVoice();
+  });
+
+  afterEach(() => {
+    setTwilioVoice(null);
+    setRateLimitStore(null);
+  });
+
+  test("places a real call to the clinic", async () => {
+    await bookAppointment(submission, "https://clinic.test");
+
+    expect(calls).toHaveLength(1);
+    const form = new URLSearchParams(String(calls[0].init?.body));
+    expect(form.get("To")).toBe("+15551230000");
+    expect(form.get("From")).toBe("+15558675309");
+    expect(form.get("Url")).toBe("https://clinic.example/api/twilio/voice/answer");
+  });
+
+  test("still books, and still emails, when the call is placed", async () => {
+    const booking = await bookAppointment(submission, "https://clinic.test");
+
+    expect(booking.appointmentId).toBeTruthy();
+    expect(emails).toHaveLength(1);
+  });
+
+  test("books the appointment even when Twilio refuses the call", async () => {
+    // The record is already stored and the confirmation is already on its way.
+    // Failing the booking would trade a working appointment for a phone call,
+    // which is the wrong way round.
+    callStatus = 400;
+
+    const booking = await bookAppointment(submission, "https://clinic.test");
+
+    expect(booking.appointmentId).toBeTruthy();
+    expect(emails).toHaveLength(1);
+  });
+
+  test("does not put the booking record on the voice request", async () => {
+    await bookAppointment(submission, "https://clinic.test");
+
+    const body = String(calls[0].init?.body);
+    expect(body).not.toContain("Ada");
+    expect(body).not.toContain("ada@example.test");
+    expect(body).not.toContain("headache");
+  });
+
+  test("does not tell the patient which path ran", async () => {
+    // The return value crosses to a page a patient is looking at. A `dialled:
+    // true` is a Twilio account's state, not a patient's booking, and it is the
+    // sort of field that ends up in a screenshot.
+    callStatus = 400;
+    const booking = await bookAppointment(submission, "https://clinic.test");
+
+    expect(Object.keys(booking).sort()).toEqual(["appointmentId", "manageUrl", "spectateUrl"]);
+  });
+
+  test("places no call at all without the Twilio variables, and books as before", async () => {
+    setTwilioVoice(null);
+
+    const booking = await bookAppointment(submission, "https://clinic.test");
+
+    expect(booking.appointmentId).toBeTruthy();
+    expect(emails).toHaveLength(1);
+  });
+});
 
 /**
  * The management link handed to a patient at booking (#59).
