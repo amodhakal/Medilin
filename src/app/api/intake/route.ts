@@ -7,6 +7,7 @@ import { parseJsonBody } from "@/lib/validation/parse";
 import { internalHeaders } from "@/lib/auth/internal";
 import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
 import { logError, logInfo } from "@/lib/logger";
+import { sealRecord } from "@/lib/phi-token";
 
 const INTAKE_LIMIT = 5;
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -31,16 +32,13 @@ export async function POST(request: NextRequest) {
 
     const appointment = createAppointment(translatedData);
 
-    const baseUrl = request.nextUrl.origin;
-    const encodedPatientInfo = encodeURIComponent(
-      JSON.stringify(translatedData),
-    );
-    const spectateUrl = `${baseUrl}/spectate/${appointment.id}?patientInfo=${encodedPatientInfo}`;
+    // Was `?patientInfo=${encodeURIComponent(JSON.stringify(translatedData))}`,
+    // which put the whole record in the URL. The token is the record,
+    // encrypted: opaque in a log or a history entry, and openable only with
+    // the server-side key.
+    const token = sealRecord(JSON.stringify(translatedData));
+    const spectateUrl = `${request.nextUrl.origin}/spectate/${token}`;
 
-    // The spectate URL is deliberately not logged. It carries the appointment
-    // id and, for now, the whole record; logging it puts a joinable patient
-    // identifier into a log store. The record stops being in the URL in the
-    // next commit on this branch.
     logInfo("intake.session_url_created", { appointmentId: appointment.id });
 
     const mockHospitalResponse = {

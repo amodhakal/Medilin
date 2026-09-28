@@ -3,7 +3,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { clientLog } from "@/lib/logger/client";
-import type { AppointmentRecord } from "@/lib/validation/intake";
 
 
 interface TranscriptMessage {
@@ -14,24 +13,40 @@ interface TranscriptMessage {
 }
 
 /**
- * Was a hand-copied interface listing the same ten fields as the intake
- * form, in a different order, with `insurance` widened to `string`. The
- * shared record type replaces it so a renamed field is a compile error here
- * rather than an `undefined` at runtime.
+ * The fields this page renders and forwards to the voice agent.
+ *
+ * Supplied by the server component, which decrypts the route token. This used
+ * to be reconstructed in the browser from a query parameter, behind a
+ * hand-copied interface listing the same ten fields as the intake form in a
+ * different order, with `insurance` widened to `string`.
+ *
+ * Deliberately not typed as AppointmentRecord. The two share a shape, but a
+ * token decrypts to whatever was sealed, and claiming the validated record
+ * type here would assert a guarantee the page has not checked. The server
+ * component narrows the decrypted object field by field instead.
  */
-type PatientInfo = AppointmentRecord;
+export interface SpectatePatient {
+  firstName: string;
+  lastName: string;
+  email: string;
+  dob: string;
+  phone: string;
+  language: string;
+  medical_department: string;
+  additionalInfo: string;
+  insurance: string;
+  appointmentDateTime: string;
+}
 
 export default function SpectateClient({
-  searchParams,
+  patient,
   patientAgentId,
   receptionistAgentId,
 }: {
-  searchParams: Promise<{ patientInfo?: string }>;
+  patient: SpectatePatient;
   patientAgentId: string;
   receptionistAgentId: string;
 }) {
-  const [patientInfo, setPatientInfo] = useState<string>("");
-  const [patientInfoObj, setPatientInfoObj] = useState<PatientInfo | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [patientSpeaking, setPatientSpeaking] = useState(false);
@@ -41,38 +56,12 @@ export default function SpectateClient({
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const [isEnded, setIsEnded] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [mounted, setMounted] = useState(false);
 
   const wsARef = useRef<WebSocket | null>(null);
   const wsBRef = useRef<WebSocket | null>(null);
   const transcriptIdRef = useRef(0);
   const waitingForBResponseRef = useRef(false);
   const waitingForAResponseRef = useRef(false);
-
-  useEffect(() => {
-    searchParams.then((p) => {
-      // Was logging the raw query param, then the decoded string, then the
-      // parsed object, so a patient's full record appeared three times in
-      // devtools. Devtools are the most widely-read log sink there is, and
-      // anything captured by an error-reporting SDK is forwarded off-device.
-      if (p.patientInfo) {
-        const decoded = decodeURIComponent(p.patientInfo);
-        setPatientInfo(decoded);
-        try {
-          setPatientInfoObj(JSON.parse(decoded));
-          setMounted(true);
-        } catch (e) {
-          clientLog("error", "spectate.patient_info_parse_failed", {
-            errorMessage: e instanceof Error ? e.message : String(e),
-          });
-          setMounted(true);
-        }
-      } else {
-        setError("Missing patient information in URL parameters.");
-        setMounted(true);
-      }
-    });
-  }, [searchParams]);
 
   useEffect(() => {
     const container = document.getElementById("transcript-container");
@@ -106,9 +95,9 @@ export default function SpectateClient({
             type: "conversation_initiation_client_data",
           };
           
-          if (agent === "A" && patientInfoObj) {
+          if (agent === "A" && patient) {
             initData.dynamic_variables = {
-              patient_info: JSON.stringify(patientInfoObj),
+              patient_info: JSON.stringify(patient),
             };
           }
           
@@ -120,8 +109,8 @@ export default function SpectateClient({
 
           switch (data.type) {
             case "conversation_initiation_client_data":
-              if (agent === "A" && patientInfoObj) {
-                const p = patientInfoObj;
+              if (agent === "A") {
+                const p = patient;
                 const spectateText = `You are ${p.firstName} ${p.lastName}, a patient calling a hospital. Your details: email: ${p.email}, phone: ${p.phone}, DOB: ${p.dob}, insurance: ${p.insurance}, department: ${p.medical_department}, preferred language: ${p.language}. Additional info: ${p.additionalInfo}. Start the conversation by greeting and explaining why you're calling.`;
                 setTimeout(() => {
                   ws.send(
@@ -224,7 +213,7 @@ export default function SpectateClient({
         resolve(ws);
       });
     },
-    [patientInfoObj, sendMessageToAgent]
+    [patient, sendMessageToAgent]
   );
 
   const startConversation = useCallback(async () => {
@@ -329,36 +318,36 @@ export default function SpectateClient({
         </header>
 
         {/* Patient Details Preview */}
-        {patientInfoObj && (
+        {patient && (
           <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 mb-8 backdrop-blur-md shadow-lg">
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-xs uppercase tracking-wider font-semibold text-cyan-400">
                 Patient Consultation Profile
               </h2>
               <span className="text-xs text-slate-400 bg-slate-800 px-3 py-1 rounded-full">
-                Dept: <strong className="text-slate-200">{patientInfoObj.medical_department}</strong>
+                Dept: <strong className="text-slate-200">{patient.medical_department}</strong>
               </span>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
               <div>
                 <span className="text-slate-500 block text-xs">Patient Name</span>
                 <span className="font-medium text-slate-200">
-                  {patientInfoObj.firstName} {patientInfoObj.lastName}
+                  {patient.firstName} {patient.lastName}
                 </span>
               </div>
               <div>
                 <span className="text-slate-500 block text-xs">Email</span>
                 <span className="font-medium text-slate-200 truncate block">
-                  {patientInfoObj.email}
+                  {patient.email}
                 </span>
               </div>
               <div>
                 <span className="text-slate-500 block text-xs">Phone</span>
-                <span className="font-medium text-slate-200">{patientInfoObj.phone}</span>
+                <span className="font-medium text-slate-200">{patient.phone}</span>
               </div>
               <div>
                 <span className="text-slate-500 block text-xs">Language</span>
-                <span className="font-medium text-cyan-300 uppercase">{patientInfoObj.language}</span>
+                <span className="font-medium text-cyan-300 uppercase">{patient.language}</span>
               </div>
             </div>
           </div>
@@ -518,10 +507,10 @@ export default function SpectateClient({
           {!isConnected && !isEnded ? (
             <button
               onClick={startConversation}
-              disabled={!mounted || isConnecting || !patientInfoObj}
+              disabled={isConnecting}
               className="bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-bold px-10 py-4 rounded-2xl shadow-xl shadow-cyan-500/25 disabled:opacity-50 transition-all duration-300 cursor-pointer text-base flex items-center gap-3"
             >
-              {!mounted || !patientInfoObj ? (
+              {!patient ? (
                 "Loading Patient Data..."
               ) : isConnecting ? (
                 <>

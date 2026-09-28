@@ -1,8 +1,8 @@
 import * as crypto from 'crypto';
 
-const ALGORITHM = 'aes-256-gcm';
-const KEY_LENGTH = 32; // 256 bits
-const IV_LENGTH = 12; // 96 bits for GCM recommended
+export const ALGORITHM = 'aes-256-gcm';
+export const KEY_LENGTH = 32; // 256 bits
+export const IV_LENGTH = 12; // 96 bits for GCM recommended
 
 /**
  * Resolve the key-encryption key.
@@ -14,7 +14,7 @@ const IV_LENGTH = 12; // 96 bits for GCM recommended
  * missing — and HIPAA_MASTER_KEY was not listed in .env.example, so the
  * fallback was the expected path. Absence is now an error.
  */
-function getMasterKey(masterKeyHex?: string): Buffer {
+export function getMasterKey(masterKeyHex?: string): Buffer {
   const hex = masterKeyHex ?? process.env.HIPAA_MASTER_KEY;
 
   if (!hex) {

@@ -4,6 +4,7 @@ import { appointmentRequestSchema } from "@/lib/validation/intake";
 import { parseJsonBody } from "@/lib/validation/parse";
 import { callerKey, enforceRateLimit } from "@/lib/rate-limit";
 import { logInfo } from "@/lib/logger";
+import { sealRecord } from "@/lib/phi-token";
 
 const APPOINTMENTS_LIMIT = 20;
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -24,9 +25,8 @@ export async function POST(request: NextRequest) {
 
   const { email, language } = patientInfo;
 
-  const baseUrl = request.nextUrl.origin;
-  const encodedPatientInfo = encodeURIComponent(JSON.stringify(patientInfo));
-  const spectateUrl = `${baseUrl}/spectate/${appointment.id}?patientInfo=${encodedPatientInfo}`;
+  const token = sealRecord(JSON.stringify(patientInfo));
+  const spectateUrl = `${request.nextUrl.origin}/spectate/${token}`;
 
   // Was a decorative banner printing the whole patient record serialised with
   // indentation, the email address, and the spectate URL, on every request.
