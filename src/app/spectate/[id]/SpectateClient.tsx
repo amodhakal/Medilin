@@ -4,6 +4,21 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { clientLog } from "@/lib/logger/client";
 
+/** How long a socket may take to reach `open` before the attempt is abandoned. */
+const CONNECT_TIMEOUT_MS = 10_000;
+
+/**
+ * Upper bound on the delay we schedule a `pong` for.
+ *
+ * ElevenLabs sends `ping_ms` and we answer on a timer. That value arrives from
+ * the network, so it is clamped: an unclamped 2^31 or negative delay is a
+ * timer that never fires, or one that fires immediately, and both were
+ * reachable by anything that could speak the protocol.
+ */
+const PING_MAX_DELAY_MS = 10_000;
+
+/** The two agents in the simulated call. */
+type Agent = "A" | "B";
 
 interface TranscriptMessage {
   id: number;
@@ -38,6 +53,31 @@ export interface SpectatePatient {
   appointmentDateTime: string;
 }
 
+/**
+ * Parse one frame off the vendor socket.
+ *
+ * `onmessage` used to call `JSON.parse(event.data)` bare. A malformed frame
+ * throws inside an event handler, which the socket does not catch and React
+ * does not see, so a single bad frame from the far end silently killed the
+ * relay: no log line, no UI change, no further messages processed. Frames come
+ * from the network, so a bad one is dropped and counted, not fatal.
+ */
+function parseFrame(raw: unknown): Record<string, unknown> | null {
+  if (typeof raw !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function clampDelay(ms: number): number {
+  if (!Number.isFinite(ms)) return 0;
+  return Math.min(Math.max(ms, 0), PING_MAX_DELAY_MS);
+}
+
 export default function SpectateClient({
   patient,
   patientAgentId,
@@ -56,12 +96,47 @@ export default function SpectateClient({
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const [isEnded, setIsEnded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [disconnectNotice, setDisconnectNotice] = useState<string | null>(null);
 
   const wsARef = useRef<WebSocket | null>(null);
   const wsBRef = useRef<WebSocket | null>(null);
   const transcriptIdRef = useRef(0);
   const waitingForBResponseRef = useRef(false);
   const waitingForAResponseRef = useRef(false);
+
+  /**
+   * Every live timer this page owns.
+   *
+   * The 2500ms relay, the 500ms `contextual_update` sends, and the `pong`
+   * timers were all bare `setTimeout` calls whose handles were dropped on the
+   * floor. Each queued callback closes over a `setState` and sometimes over a
+   * `ws.send` for a socket that is closing, so navigating away mid-call left a
+   * trail of them firing for the next few seconds. The relay one is the worst
+   * of the set: it reads the two "waiting" refs, which are not reset, so an
+   * unmounted page could still decide to push a transcript line into a socket
+   * that the next page has nothing to do with. A Set because more than one can
+   * be outstanding at a time and a single handle would only ever clear one.
+   */
+  const timersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+
+  /**
+   * Whether the component is still mounted.
+   *
+   * A `WebSocket`'s `open` and `error` events are queued, so `connectAgent`'s
+   * promise can settle after the user has already hit "Exit". Both paths touch
+   * state, and the socket that opened in that window would have no reference
+   * left to close it, so it would live until the browser's own timeout.
+   */
+  const mountedRef = useRef(true);
+
+  /**
+   * Set while this page is closing the sockets on purpose.
+   *
+   * `close` fires `onclose` whether the peer or we ended it, and the handler
+   * cannot tell them apart from the event alone. Without this, unmounting or
+   * pressing "Stop" reported a dropped connection on the way out.
+   */
+  const intentionalCloseRef = useRef(false);
 
   useEffect(() => {
     const container = document.getElementById("transcript-container");
@@ -70,7 +145,27 @@ export default function SpectateClient({
     }
   }, [transcript]);
 
-  const sendMessageToAgent = useCallback((message: string, agent: "A" | "B") => {
+  /**
+   * Run `fn` after `delayMs`, tracked so it can be cancelled.
+   *
+   * `fn` is skipped entirely once the component is gone rather than allowed to
+   * run and call `setState` on a dead tree.
+   */
+  const schedule = useCallback((fn: () => void, delayMs: number) => {
+    const handle = setTimeout(() => {
+      timersRef.current.delete(handle);
+      if (mountedRef.current) fn();
+    }, delayMs);
+    timersRef.current.add(handle);
+    return handle;
+  }, []);
+
+  const cancelTimers = useCallback(() => {
+    for (const handle of timersRef.current) clearTimeout(handle);
+    timersRef.current.clear();
+  }, []);
+
+  const sendMessageToAgent = useCallback((message: string, agent: Agent) => {
     const ws = agent === "A" ? wsARef.current : wsBRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(
@@ -82,37 +177,104 @@ export default function SpectateClient({
     }
   }, []);
 
+  /**
+   * Close both sockets, and mark the close as ours.
+   *
+   * The refs are cleared before the closes so a handler that re-enters cannot
+   * find a socket that is already going away.
+   */
+  const closeSockets = useCallback(() => {
+    intentionalCloseRef.current = true;
+    const sockets = [wsARef.current, wsBRef.current];
+    wsARef.current = null;
+    wsBRef.current = null;
+    for (const ws of sockets) ws?.close();
+  }, []);
+
   const connectAgent = useCallback(
-    (agentId: string, agent: "A" | "B"): Promise<WebSocket> => {
+    (agentId: string, agent: Agent): Promise<WebSocket> => {
       return new Promise((resolve, reject) => {
         const ws = new WebSocket(
           `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${agentId}`
         );
 
+        // `settled` is the promise's own state; `opened` is the socket's. They
+        // are not the same question, and conflating them is what made the
+        // `catch` in startConversation unreachable: `resolve(ws)` used to run
+        // synchronously at the end of the function body, before `open` had
+        // ever fired, so by the time an error arrived the promise was already
+        // fulfilled and the rejection had nowhere to go.
+        let settled = false;
+        let opened = false;
+
+        const openTimer = setTimeout(() => {
+          timersRef.current.delete(openTimer);
+          clientLog("warn", "spectate.agent_open_timeout", { resource: `agent_${agent}` });
+          ws.close();
+          fail(new Error(`agent ${agent} did not open within ${CONNECT_TIMEOUT_MS}ms`));
+        }, CONNECT_TIMEOUT_MS);
+        timersRef.current.add(openTimer);
+
+        function clearOpenTimer() {
+          clearTimeout(openTimer);
+          timersRef.current.delete(openTimer);
+        }
+
+        function fail(reason: Error) {
+          if (settled) return;
+          settled = true;
+          clearOpenTimer();
+          if (!mountedRef.current) {
+            // The page went away while this socket was connecting. Nothing to
+            // connect for, and the socket would be orphaned with no reference
+            // left to close it.
+            ws.close();
+          }
+          reject(reason);
+        }
+
         ws.onopen = () => {
+          opened = true;
+          settled = true;
+          clearOpenTimer();
+
+          if (!mountedRef.current) {
+            ws.close();
+            reject(new Error("spectate page unmounted before the socket opened"));
+            return;
+          }
+
           clientLog("info", "spectate.agent_connected", { resource: `agent_${agent}` });
           const initData: Record<string, unknown> = {
             type: "conversation_initiation_client_data",
           };
-          
-          if (agent === "A" && patient) {
+
+          if (agent === "A") {
             initData.dynamic_variables = {
               patient_info: JSON.stringify(patient),
             };
           }
-          
+
           ws.send(JSON.stringify(initData));
+          resolve(ws);
         };
 
         ws.onmessage = (event) => {
-          const data = JSON.parse(event.data);
+          const data = parseFrame(event.data);
+          if (!data) {
+            // Counted rather than logged in full: a frame is vendor
+            // controlled, and the failure mode worth knowing about is how
+            // often it happens.
+            clientLog("warn", "spectate.unparseable_frame", { resource: `agent_${agent}` });
+            return;
+          }
 
           switch (data.type) {
             case "conversation_initiation_client_data":
               if (agent === "A") {
                 const p = patient;
                 const spectateText = `You are ${p.firstName} ${p.lastName}, a patient calling a hospital. Your details: email: ${p.email}, phone: ${p.phone}, DOB: ${p.dob}, insurance: ${p.insurance}, department: ${p.medical_department}, preferred language: ${p.language}. Additional info: ${p.additionalInfo}. Start the conversation by greeting and explaining why you're calling.`;
-                setTimeout(() => {
+                schedule(() => {
                   ws.send(
                     JSON.stringify({
                       type: "contextual_update",
@@ -121,7 +283,7 @@ export default function SpectateClient({
                   );
                 }, 500);
               } else if (agent === "B") {
-                setTimeout(() => {
+                schedule(() => {
                   ws.send(
                     JSON.stringify({
                       type: "contextual_update",
@@ -132,9 +294,12 @@ export default function SpectateClient({
               }
               break;
 
-            case "agent_response":
-              const response = data.agent_response_event?.agent_response;
-              if (response) {
+            case "agent_response": {
+              const responseEvent = data.agent_response_event as
+                | { agent_response?: unknown }
+                | undefined;
+              const response = responseEvent?.agent_response;
+              if (typeof response === "string" && response.length > 0) {
                 const role = agent === "A" ? "patient" : "receptionist";
                 setTranscript((prev) => [
                   ...prev,
@@ -145,16 +310,16 @@ export default function SpectateClient({
                     timestamp: new Date(),
                   },
                 ]);
-                
+
                 if (agent === "A") {
                   setCurrentPatientText(response);
                   setPatientSpeaking(true);
                   waitingForAResponseRef.current = false;
-                  
-                  setTimeout(() => {
+
+                  schedule(() => {
                     setCurrentPatientText("");
                     setPatientSpeaking(false);
-                    
+
                     if (!waitingForBResponseRef.current) {
                       waitingForBResponseRef.current = true;
                       sendMessageToAgent(response, "B");
@@ -164,11 +329,11 @@ export default function SpectateClient({
                   setCurrentReceptionistText(response);
                   setReceptionistSpeaking(true);
                   waitingForBResponseRef.current = false;
-                  
-                  setTimeout(() => {
+
+                  schedule(() => {
                     setCurrentReceptionistText("");
                     setReceptionistSpeaking(false);
-                    
+
                     if (!waitingForAResponseRef.current) {
                       waitingForAResponseRef.current = true;
                       sendMessageToAgent(response, "A");
@@ -177,54 +342,96 @@ export default function SpectateClient({
                 }
               }
               break;
+            }
 
-            case "ping":
-              setTimeout(() => {
+            case "ping": {
+              const pingEvent = data.ping_event as { event_id?: unknown; ping_ms?: unknown } | undefined;
+              const eventId = pingEvent?.event_id;
+              if (typeof eventId !== "string") break;
+              schedule(() => {
                 ws.send(
                   JSON.stringify({
                     type: "pong",
-                    event_id: data.ping_event.event_id,
+                    event_id: eventId,
                   })
                 );
-              }, data.ping_event.ping_ms);
+              }, clampDelay(typeof pingEvent?.ping_ms === "number" ? pingEvent.ping_ms : 0));
               break;
+            }
 
             default:
               break;
           }
         };
 
-        ws.onerror = (err) => {
-          clientLog("error", "spectate.websocket_error", {
-            resource: `agent_${agent}`,
-            errorMessage: err instanceof Error ? err.message : String(err),
-          });
-          reject(err);
+        ws.onerror = () => {
+          // A `WebSocket` error event carries no detail worth reporting in any
+          // engine, and it is not an `Error`, so there is nothing honest to put
+          // in the log field. What matters is which side of `open` it landed
+          // on: before, it is a failed connect and belongs to this promise;
+          // after, `onclose` is what reports it.
+          if (opened) {
+            clientLog("warn", "spectate.agent_socket_error", { resource: `agent_${agent}` });
+            return;
+          }
+          clientLog("error", "spectate.websocket_error", { resource: `agent_${agent}` });
+          fail(new Error(`agent ${agent} socket error`));
         };
 
-        ws.onclose = () => {
+        ws.onclose = (event) => {
+          if (!opened) {
+            fail(
+              new Error(`agent ${agent} closed before opening (code ${event.code})`)
+            );
+            return;
+          }
+
           if (agent === "A") {
             setPatientSpeaking(false);
           } else {
             setReceptionistSpeaking(false);
           }
-        };
 
-        resolve(ws);
+          if (intentionalCloseRef.current) return;
+
+          // Previously invisible. The promise had already resolved, so the
+          // `catch` in startConversation could not see it, and the header went
+          // on saying "Live Session Active" over a socket that was gone.
+          // Reconnect is #50; until then the page says what happened.
+          clientLog("warn", "spectate.agent_disconnected", {
+            resource: `agent_${agent}`,
+            statusCode: event.code,
+          });
+          if (mountedRef.current) {
+            setIsConnected(false);
+            setDisconnectNotice(
+              agent === "A"
+                ? "The patient agent's connection dropped."
+                : "The receptionist agent's connection dropped."
+            );
+          }
+        };
       });
     },
-    [patient, sendMessageToAgent]
+    [patient, schedule, sendMessageToAgent]
   );
 
   const startConversation = useCallback(async () => {
     try {
       setIsConnecting(true);
-      
+      setDisconnectNotice(null);
+      intentionalCloseRef.current = false;
+
       const wsA = await connectAgent(patientAgentId, "A");
       wsARef.current = wsA;
-      
+
       const wsB = await connectAgent(receptionistAgentId, "B");
       wsBRef.current = wsB;
+
+      if (!mountedRef.current) {
+        closeSockets();
+        return;
+      }
 
       setIsConnected(true);
       setIsConnecting(false);
@@ -232,25 +439,47 @@ export default function SpectateClient({
       clientLog("error", "spectate.start_failed", {
         errorMessage: err instanceof Error ? err.message : String(err),
       });
-      setError("Failed to connect to agents. Check console for details.");
+      // One socket can be up while the other failed. Closing both matters:
+      // the half-open one would sit there holding a session the page no
+      // longer believes in.
+      closeSockets();
+      if (!mountedRef.current) return;
+      setError("Could not reach the voice agents. Check your connection and try again.");
       setIsConnecting(false);
     }
-  }, [connectAgent, patientAgentId, receptionistAgentId]);
+  }, [closeSockets, connectAgent, patientAgentId, receptionistAgentId]);
 
   const stopConversation = useCallback(() => {
-    if (wsARef.current) {
-      wsARef.current.close();
-      wsARef.current = null;
-    }
-    if (wsBRef.current) {
-      wsBRef.current.close();
-      wsBRef.current = null;
-    }
+    cancelTimers();
+    closeSockets();
     setIsConnected(false);
     setIsEnded(true);
+    setDisconnectNotice(null);
     setPatientSpeaking(false);
     setReceptionistSpeaking(false);
-  }, []);
+    setCurrentPatientText("");
+    setCurrentReceptionistText("");
+  }, [cancelTimers, closeSockets]);
+
+  /**
+   * Tear everything down on unmount.
+   *
+   * There was no cleanup at all: navigating away from a live call left both
+   * sockets open, every queued timer running, and a relay that was still
+   * pushing transcript lines at a conversation nobody was watching.
+   *
+   * `mountedRef` is re-armed here rather than initialised once, because
+   * StrictMode mounts, unmounts, and remounts in development, and an effect
+   * that is not re-runnable is a lie in that mode.
+   */
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      cancelTimers();
+      closeSockets();
+    };
+  }, [cancelTimers, closeSockets]);
 
   if (error) {
     return (
@@ -312,10 +541,32 @@ export default function SpectateClient({
                     : "bg-slate-500"
                 }`}
               />
-              {isConnected ? "Live Session Active" : isEnded ? "Call Completed" : "Ready to Connect"}
+              {disconnectNotice
+                ? "Connection Lost"
+                : isConnected
+                ? "Live Session Active"
+                : isEnded
+                ? "Call Completed"
+                : "Ready to Connect"}
             </span>
           </div>
         </header>
+
+        {disconnectNotice && (
+          <div
+            role="status"
+            className="mb-6 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-5 py-4 text-sm text-amber-200 flex flex-wrap items-center justify-between gap-3"
+          >
+            <span>{disconnectNotice} Stop the call to start a new one.</span>
+            <button
+              type="button"
+              onClick={stopConversation}
+              className="rounded-lg bg-amber-400/90 hover:bg-amber-300 text-slate-950 text-xs font-semibold px-4 py-2 transition-colors cursor-pointer"
+            >
+              End call
+            </button>
+          </div>
+        )}
 
         {/* Patient Details Preview */}
         {patient && (
@@ -526,7 +777,7 @@ export default function SpectateClient({
                 </>
               )}
             </button>
-          ) : isConnected ? (
+          ) : isConnected || disconnectNotice ? (
             <button
               onClick={stopConversation}
               className="bg-red-600 hover:bg-red-500 text-white font-bold px-10 py-4 rounded-2xl shadow-xl shadow-red-600/25 transition-all duration-300 cursor-pointer text-base flex items-center gap-2"
