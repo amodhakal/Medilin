@@ -1,10 +1,6 @@
 import Link from "next/link";
 
-const languages = [
-  { slug: "english", name: "English", flag: "🇺🇸", description: "Seamless voice intake in English" },
-  { slug: "spanish", name: "Español", flag: "🇪🇸", description: "Admisión médica guiada por voz en español" },
-  { slug: "portuguese", name: "Português", flag: "🇧🇷", description: "Triagem de pacientes por voz em português" },
-];
+import { LANGUAGE_SLUGS, getLanguage } from "@/i18n/registry";
 
 export default function HomePage() {
   return (
@@ -37,27 +33,33 @@ export default function HomePage() {
 
         {/* Language Cards Grid */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 max-w-3xl mx-auto text-left">
-          {languages.map((lang) => (
-            <Link
-              key={lang.slug}
-              href={`/language/${lang.slug}`}
-              className="group bg-white border border-slate-200 hover:border-cyan-500 rounded-2xl p-6 shadow-sm hover:shadow-md transition-all duration-200 flex flex-col justify-between"
-            >
-              <div>
-                <div className="text-3xl mb-4">{lang.flag}</div>
-                <h2 className="text-lg font-bold text-slate-900 group-hover:text-cyan-600 transition-colors">
-                  {lang.name}
-                </h2>
-                <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
-                  {lang.description}
-                </p>
-              </div>
+          {LANGUAGE_SLUGS.map((slug) => {
+            const language = getLanguage(slug);
+            return (
+              <Link
+                key={slug}
+                href={`/language/${slug}`}
+                lang={language.locale}
+                className="group bg-white border border-slate-200 hover:border-cyan-500 rounded-2xl p-6 shadow-sm hover:shadow-md transition-all duration-200 flex flex-col justify-between"
+              >
+                <div>
+                  <div className="text-3xl mb-4" aria-hidden="true">
+                    {language.flag}
+                  </div>
+                  <h2 className="text-lg font-bold text-slate-900 group-hover:text-cyan-600 transition-colors">
+                    {language.name}
+                  </h2>
+                  <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+                    {language.description}
+                  </p>
+                </div>
 
-              <div className="mt-8 flex items-center text-xs font-semibold text-cyan-600 group-hover:translate-x-1 transition-transform">
-                Start Intake &rarr;
-              </div>
-            </Link>
-          ))}
+                <div className="mt-8 flex items-center text-xs font-semibold text-cyan-600 group-hover:translate-x-1 transition-transform">
+                  Start Intake &rarr;
+                </div>
+              </Link>
+            );
+          })}
         </div>
       </main>
 

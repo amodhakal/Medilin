@@ -5,94 +5,20 @@ import { toast } from "react-toastify";
 import { submitIntakeForm } from "@/app/actions";
 import Link from "next/link";
 
+import { DEFAULT_LANGUAGE, DEPARTMENT_OPTIONS, isLanguageSlug, messagesFor } from "@/i18n/registry";
+
 interface PageProps {
   params: Promise<{ slug: string }>;
 }
 
-type Language = "english" | "spanish" | "portuguese";
-
-const translations: Record<Language, Record<string, string>> = {
-  english: {
-    title: "Patient Intake Form",
-    subtitle: "Complete your details to initiate AI receptionist consultation",
-    firstName: "First Name",
-    lastName: "Last Name",
-    email: "Email Address",
-    dob: "Date of Birth",
-    insurance: "Do you have insurance?",
-    phone: "Doctor's Phone Number",
-    appointmentDateTime: "Appointment Date & Time",
-    whoToVisit: "Medical Department",
-    additionalInfo: "Additional Information / Symptoms",
-    submit: "Initiate Voice Consultation",
-    yes: "Yes",
-    no: "No",
-    selectOption: "-- Select Department --",
-    doctor: "General Practitioner",
-    eyeDoctor: "Ophthalmology (Eye)",
-    dentist: "Dental Care",
-    pediatrician: "Pediatrics",
-    psychiatrist: "Psychiatry & Mental Health",
-    other: "Specialist Consultation",
-    toastProcessing: "Processing intake & spinning up AI Agent...",
-    back: "Back to Languages",
-  },
-  spanish: {
-    title: "Formulario de Admisión",
-    subtitle: "Complete sus datos para iniciar la consulta con el recepcionista de IA",
-    firstName: "Nombre",
-    lastName: "Apellido",
-    email: "Correo Electrónico",
-    dob: "Fecha de Nacimiento",
-    insurance: "¿Tiene seguro médico?",
-    phone: "Número de Teléfono del Doctor",
-    appointmentDateTime: "Fecha y Hora de la Cita",
-    whoToVisit: "Departamento Médico",
-    additionalInfo: "Información Adicional / Síntomas",
-    submit: "Iniciar Consulta por Voz",
-    yes: "Sí",
-    no: "No",
-    selectOption: "-- Seleccionar Departamento --",
-    doctor: "Médico General",
-    eyeDoctor: "Oftalmología",
-    dentist: "Odontología",
-    pediatrician: "Pediatría",
-    psychiatrist: "Psiquiatría y Salud Mental",
-    other: "Consulta Especializada",
-    toastProcessing: "Procesando admisión y conectando Agente IA...",
-    back: "Volver a Idiomas",
-  },
-  portuguese: {
-    title: "Formulário de Admissão",
-    subtitle: "Preencha seus dados para iniciar a consulta com o recepcionista de IA",
-    firstName: "Nome",
-    lastName: "Sobrenome",
-    email: "Endereço de E-mail",
-    dob: "Data de Nascimento",
-    insurance: "Você possui seguro médico?",
-    phone: "Telefone do Médico",
-    appointmentDateTime: "Data e Hora da Consulta",
-    whoToVisit: "Departamento Médico",
-    additionalInfo: "Informações Adicionais / Sintomas",
-    submit: "Iniciar Consulta por Voz",
-    yes: "Sim",
-    no: "Não",
-    selectOption: "-- Selecionar Departamento --",
-    doctor: "Clínico Geral",
-    eyeDoctor: "Oftalmologia",
-    dentist: "Odontologia",
-    pediatrician: "Pediatria",
-    psychiatrist: "Psiquiatria e Saúde Mental",
-    other: "Consulta Especializada",
-    toastProcessing: "Processando admissão e iniciando Agente de Voz...",
-    back: "Voltar para Idiomas",
-  },
-};
-
 export default function LanguagePage({ params }: PageProps) {
   const { slug } = use(params);
-  const lang = (slug as Language) || "english";
-  const t = translations[lang] || translations.english;
+  // Checked rather than cast. The old `slug as Language` accepted any string
+  // and let the `|| translations.english` fallback underneath quietly turn a
+  // typo, a stale link, or a probe for an unlisted language into a working
+  // English form.
+  const lang = isLanguageSlug(slug) ? slug : DEFAULT_LANGUAGE;
+  const t = messagesFor(lang);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -278,12 +204,11 @@ export default function LanguagePage({ params }: PageProps) {
                   className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
                 >
                   <option value="">{t.selectOption}</option>
-                  <option value="Doctor">{t.doctor}</option>
-                  <option value="Eye Doctor">{t.eyeDoctor}</option>
-                  <option value="Dentist">{t.dentist}</option>
-                  <option value="Pediatrician">{t.pediatrician}</option>
-                  <option value="Psychiatrist">{t.psychiatrist}</option>
-                  <option value="Other">{t.other}</option>
+                  {DEPARTMENT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {t[option.messageKey]}
+                    </option>
+                  ))}
                 </select>
               </div>
             </div>
