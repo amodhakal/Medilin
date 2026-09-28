@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { DEFAULT_LANGUAGE, LANGUAGE_SLUGS, getLanguage } from "./registry";
+import type { Metadata } from "next";
+
+import {
+  DEFAULT_LANGUAGE,
+  LIVE_LANGUAGE_SLUGS,
+  PENDING_LANGUAGE_SLUGS,
+  getLanguage,
+  messagesFor,
+} from "./registry";
 import {
   PROTOTYPE_NOTICE,
   SITE_URL,
@@ -13,6 +21,13 @@ import {
   rootMetadata,
   sitemapEntries,
 } from "./metadata";
+
+/** Metadata for a bookable language, or a failure if the registry disagrees. */
+function metadataFor(slug: string): Metadata {
+  const metadata = languageMetadata(slug);
+  if (!metadata) throw new Error(`no metadata for ${slug}`);
+  return metadata;
+}
 
 describe("root metadata", () => {
   test("sends no referrer", () => {
@@ -56,41 +71,39 @@ describe("home metadata", () => {
 });
 
 describe("language metadata", () => {
-  test("titles every language in that language", () => {
-    for (const slug of LANGUAGE_SLUGS) {
-      const metadata = languageMetadata(slug);
-      expect(metadata.title).toBe(getLanguage(slug).messages.title);
-      expect(String(metadata.description)).toContain(
-        getLanguage(slug).messages.subtitle,
-      );
+  test("titles every bookable language in that language", () => {
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
+      const metadata = metadataFor(slug);
+      expect(metadata.title).toBe(messagesFor(slug).title);
+      expect(String(metadata.description)).toContain(messagesFor(slug).subtitle);
     }
   });
 
-  test("has a non-empty title and description for every language", () => {
-    for (const slug of LANGUAGE_SLUGS) {
-      const metadata = languageMetadata(slug);
+  test("has a non-empty title and description for every bookable language", () => {
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
+      const metadata = metadataFor(slug);
       expect(String(metadata.title).trim().length).toBeGreaterThan(0);
       expect(String(metadata.description).trim().length).toBeGreaterThan(0);
     }
   });
 
   test("is canonical to the language's own address", () => {
-    for (const slug of LANGUAGE_SLUGS) {
-      expect(languageMetadata(slug).alternates?.canonical).toBe(`/language/${slug}`);
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
+      expect(metadataFor(slug).alternates?.canonical).toBe(`/language/${slug}`);
     }
   });
 
-  test("declares every language as an alternate on every language", () => {
+  test("declares every bookable language as an alternate on every language", () => {
     const alternates = alternateLanguages();
-    for (const slug of LANGUAGE_SLUGS) {
-      expect(languageMetadata(slug).alternates?.languages).toEqual(alternates);
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
+      expect(metadataFor(slug).alternates?.languages).toEqual(alternates);
     }
   });
 
   test("uses an Open Graph locale with a region", () => {
-    expect(languageMetadata("english").openGraph?.locale).toBe("en_US");
-    expect(languageMetadata("spanish").openGraph?.locale).toBe("es_US");
-    expect(languageMetadata("portuguese").openGraph?.locale).toBe("pt_BR");
+    expect(metadataFor("english").openGraph?.locale).toBe("en_US");
+    expect(metadataFor("spanish").openGraph?.locale).toBe("es_US");
+    expect(metadataFor("portuguese").openGraph?.locale).toBe("pt_BR");
   });
 
   test("falls back to a region for an untagged locale", () => {
@@ -98,16 +111,16 @@ describe("language metadata", () => {
     expect(openGraphLocale({ ...getLanguage("spanish"), locale: "es-MX" })).toBe("es_MX");
   });
 
-  test("has a unique hreflang per language", () => {
-    const tags = LANGUAGE_SLUGS.map((slug) => hrefLang(slug));
+  test("has a unique hreflang per bookable language", () => {
+    const tags = LIVE_LANGUAGE_SLUGS.map((slug) => hrefLang(slug));
     expect(new Set(tags).size).toBe(tags.length);
   });
 });
 
 describe("alternate languages", () => {
-  test("covers every registered language", () => {
+  test("covers every bookable language", () => {
     const alternates = alternateLanguages();
-    for (const slug of LANGUAGE_SLUGS) {
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
       expect(alternates[hrefLang(slug)]).toBe(`/language/${slug}`);
     }
   });
@@ -119,32 +132,40 @@ describe("alternate languages", () => {
   test("has no entry for a language we do not offer", () => {
     expect(alternateLanguages()).not.toHaveProperty("de");
   });
+
+  test("has no entry for a language we cannot serve a page for", () => {
+    // An hreflang link is a claim that a document exists at that address.
+    for (const slug of PENDING_LANGUAGE_SLUGS) {
+      expect(alternateLanguages()).not.toHaveProperty(hrefLang(slug));
+    }
+  });
 });
 
 describe("language paths", () => {
   test("is the route the language page actually serves", () => {
-    for (const slug of LANGUAGE_SLUGS) {
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
       expect(languagePath(slug)).toMatch(/^\/language\/[a-z-]+$/);
     }
   });
 
-  test("is unique per language", () => {
-    const paths = LANGUAGE_SLUGS.map(languagePath);
+  test("is unique per bookable language", () => {
+    const paths = LIVE_LANGUAGE_SLUGS.map(languagePath);
     expect(new Set(paths).size).toBe(paths.length);
   });
 });
 
 describe("sitemap entries", () => {
-  test("covers the home page and every language", () => {
+  test("covers the home page and every bookable language", () => {
     expect(sitemapEntries().map((entry) => entry.path)).toEqual([
       "/",
-      ...LANGUAGE_SLUGS.map(languagePath),
+      ...LIVE_LANGUAGE_SLUGS.map(languagePath),
     ]);
   });
 
-  test("names the language of each entry", () => {
+  test("lists no language that has no page", () => {
+    const live: string[] = [...LIVE_LANGUAGE_SLUGS];
     for (const entry of sitemapEntries()) {
-      expect(LANGUAGE_SLUGS).toContain(entry.language);
+      expect(live).toContain(entry.language);
     }
   });
 });

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { LANGUAGE_SLUGS, getLanguage } from "@/i18n/registry";
+import { LANGUAGE_SLUGS, messagesFor } from "@/i18n/registry";
 import { BookingConfirmation } from "./BookingConfirmation";
 
 /**
@@ -30,7 +30,7 @@ function render(
       staying={false}
       onStay={() => {}}
       onResume={() => {}}
-      messages={getLanguage("english").messages}
+      messages={messagesFor("english")}
       {...overrides}
     />,
   );
@@ -104,7 +104,7 @@ describe("booking confirmation", () => {
 
   test("renders in every language, with its own countdown and labels", () => {
     for (const slug of LANGUAGE_SLUGS) {
-      const messages = getLanguage(slug).messages;
+      const messages = messagesFor(slug);
       const html = render({ messages });
       expect(html).toContain(messages.bookedTitle);
       expect(html).toContain(messages.joinCall);

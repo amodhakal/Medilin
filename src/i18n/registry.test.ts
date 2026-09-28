@@ -7,12 +7,15 @@ import {
   ENGLISH_MESSAGES,
   LANGUAGES,
   LANGUAGE_SLUGS,
+  LIVE_LANGUAGE_SLUGS,
+  PENDING_LANGUAGE_SLUGS,
+  formatMessage,
   getLanguage,
   htmlLang,
-  formatMessage,
   isLanguageSlug,
+  isLiveLanguage,
   messagesFor,
-  resolveLanguage,
+  resolveBookableLanguage,
 } from "./registry";
 
 describe("language registry", () => {
@@ -22,22 +25,58 @@ describe("language registry", () => {
     expect([...ui].sort()).toEqual(Object.keys(LANGUAGES).sort());
   });
 
-  test("the slugs the UI offers are exactly the slugs the server accepts", () => {
+  test("the slugs the UI offers are exactly the live slugs plus the pending ones", () => {
+    const live: string[] = [...LIVE_LANGUAGE_SLUGS];
+    const pending: string[] = [...PENDING_LANGUAGE_SLUGS];
+    expect([...live, ...pending].sort()).toEqual(ui.sort());
+    expect(live.length + pending.length).toBe(LANGUAGE_SLUGS.length);
+  });
+
+  test("the bookable languages are exactly the ones the server accepts", () => {
     const server: string[] = [...SUPPORTED_LANGUAGES];
-    expect([...ui].sort()).toEqual(server.sort());
+    const live: string[] = [...LIVE_LANGUAGE_SLUGS];
+    expect(live.sort()).toEqual(server.sort());
   });
 
   test("the default language is registered", () => {
     expect(isLanguageSlug(DEFAULT_LANGUAGE)).toBe(true);
   });
 
-  test("every language carries the metadata a page needs to render it", () => {
+  test("every language carries the metadata a card needs to render it", () => {
     for (const slug of LANGUAGE_SLUGS) {
       const language = getLanguage(slug);
-      expect(language.locale).toMatch(/^[a-z]{2,3}(-[A-Z]{2})?$/);
+      // BCP-47, enough of it: a language, an optional script, an optional
+      // region. "zh-Hans" is a real tag and has to pass.
+      expect(language.locale).toMatch(/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$/);
       expect(["ltr", "rtl"]).toContain(language.direction);
       expect(language.name.trim().length).toBeGreaterThan(0);
+      expect(language.flag.trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  test("every bookable language has a blurb, because a card shows one", () => {
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
+      const language = getLanguage(slug);
+      expect(language.status).toBe("live");
+      if (language.status !== "live") continue;
       expect(language.description.trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  test("no pending language claims to have a dictionary", () => {
+    // A partial dictionary is allowed for translating ahead of time, but it is
+    // never rendered: messagesFor answers for a live language only. What must
+    // not happen is a pending language quietly becoming renderable.
+    for (const slug of PENDING_LANGUAGE_SLUGS) {
+      expect(getLanguage(slug).status).toBe("pending");
+      expect(messagesFor(slug)).toBe(LANGUAGES[DEFAULT_LANGUAGE].messages);
+    }
+  });
+
+  test("the flag is paired with a text name, never used alone", () => {
+    for (const slug of LANGUAGE_SLUGS) {
+      expect(getLanguage(slug).name).not.toBe("");
+      expect(getLanguage(slug).flag).not.toBe("");
     }
   });
 
@@ -45,8 +84,8 @@ describe("language registry", () => {
     const keys = Object.keys(ENGLISH_MESSAGES);
     expect(keys.length).toBeGreaterThan(0);
 
-    for (const slug of LANGUAGE_SLUGS) {
-      const messages = getLanguage(slug).messages;
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
+      const messages = messagesFor(slug);
       expect(Object.keys(messages).sort()).toEqual([...keys].sort());
       for (const key of keys) {
         const value = messages[key as keyof typeof ENGLISH_MESSAGES];
@@ -59,29 +98,50 @@ describe("language registry", () => {
   test("no language ships a copy of the English strings untranslated", () => {
     // A language can legitimately share a token ("No", a date format), but a
     // language whose entire dictionary is English is a stub that shipped.
-    for (const slug of LANGUAGE_SLUGS) {
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
       if (slug === DEFAULT_LANGUAGE) continue;
       const translated = Object.keys(ENGLISH_MESSAGES).filter(
         (key) =>
-          getLanguage(slug).messages[key as keyof typeof ENGLISH_MESSAGES] !==
+          messagesFor(slug)[key as keyof typeof ENGLISH_MESSAGES] !==
           ENGLISH_MESSAGES[key as keyof typeof ENGLISH_MESSAGES],
       );
       expect(translated.length).toBeGreaterThan(0);
     }
   });
 
-  test("the flag is paired with a text name, never used alone", () => {
-    for (const slug of LANGUAGE_SLUGS) {
-      expect(getLanguage(slug).name).not.toBe("");
-      expect(getLanguage(slug).flag).not.toBe("");
-    }
-  });
 });
 
 describe("language lookup", () => {
   test("accepts every registered slug", () => {
     for (const slug of LANGUAGE_SLUGS) {
       expect(isLanguageSlug(slug)).toBe(true);
+    }
+  });
+
+  test("accepts a pending language as registered, but not as bookable", () => {
+    // Registered means the picker can mention it. Bookable means there is a
+    // form. Conflating the two is how a half-translated language ends up
+    // serving a form in the wrong language.
+    for (const slug of PENDING_LANGUAGE_SLUGS) {
+      expect(isLanguageSlug(slug)).toBe(true);
+      expect(isLiveLanguage(slug)).toBe(false);
+      expect(resolveBookableLanguage(slug)).toBeNull();
+    }
+  });
+
+  test("resolves a bookable language with its slug and its strings", () => {
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
+      const bookable = resolveBookableLanguage(slug);
+      expect(bookable).not.toBeNull();
+      if (!bookable) continue;
+      expect(bookable.slug).toBe(slug);
+      expect(bookable.language.messages).toBe(messagesFor(slug));
+    }
+  });
+
+  test("resolves nothing for a slug that is not registered at all", () => {
+    for (const slug of ["klingon", "", "English", "__proto__"]) {
+      expect(resolveBookableLanguage(slug)).toBeNull();
     }
   });
 
@@ -99,13 +159,12 @@ describe("language lookup", () => {
     }
   });
 
-  test("resolveLanguage falls back to the default for an unknown slug", () => {
-    expect(resolveLanguage("klingon")).toBe(LANGUAGES[DEFAULT_LANGUAGE]);
+  test("messagesFor falls back to the default for an unknown slug", () => {
     expect(messagesFor("klingon")).toBe(LANGUAGES[DEFAULT_LANGUAGE].messages);
   });
 
-  test("resolveLanguage returns the requested language for a known slug", () => {
-    expect(resolveLanguage("spanish")).toBe(LANGUAGES.spanish);
+  test("messagesFor returns the requested language for a bookable slug", () => {
+    expect(messagesFor("spanish")).toBe(LANGUAGES.spanish.messages);
     expect(messagesFor("portuguese")).toBe(LANGUAGES.portuguese.messages);
   });
 });
@@ -175,8 +234,8 @@ describe("formatMessage", () => {
   });
 
   test("every countdown string in every language is fillable", () => {
-    for (const slug of LANGUAGE_SLUGS) {
-      const { messages } = getLanguage(slug);
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
+      const messages = messagesFor(slug);
       const filled = formatMessage(messages.redirectingIn, { seconds: 20 });
       expect(filled).not.toContain("{");
       expect(filled).toContain("20");
@@ -186,8 +245,8 @@ describe("formatMessage", () => {
 
   test("no message is left with a placeholder nobody supplies", () => {
     const known = ["seconds"];
-    for (const slug of LANGUAGE_SLUGS) {
-      for (const value of Object.values(getLanguage(slug).messages)) {
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
+      for (const value of Object.values(messagesFor(slug))) {
         for (const match of value.matchAll(/\{(\w+)\}/g)) {
           expect(known).toContain(match[1]);
         }

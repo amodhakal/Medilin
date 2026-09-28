@@ -62,6 +62,9 @@ const ENGLISH = {
   notFoundBody:
     "This address does not match a language we offer. Pick one of the languages below to start.",
   pickLanguage: "Choose a language",
+  startIntake: "Start intake",
+  comingSoon: "Coming soon",
+  notYetBookable: "Not yet available for booking",
   fixErrors: "Check these fields",
   submitting: "Starting your consultation",
   bookedTitle: "Your appointment is booked",
@@ -116,9 +119,16 @@ export function formatMessage(
 
 export type TextDirection = "ltr" | "rtl";
 
-export interface LanguageDefinition {
+/** What every language has, translated or not. */
+export interface LanguageBasics {
   /** BCP-47 tag. The `lang` attribute is its primary subtag. */
   readonly locale: string;
+  /**
+   * Reading direction. Read from the registry rather than inferred from the
+   * locale, because inference from a language subtag is a table of exceptions
+   * (Azerbaijani is written both ways, Hebrew was, Serbian is in Latin script
+   * in Bosnia) and this app is not going to maintain one.
+   */
   readonly direction: TextDirection;
   /** Endonym: the language's name in that language, never translated. */
   readonly name: string;
@@ -127,13 +137,50 @@ export interface LanguageDefinition {
    * `name` as text rather than as the only label.
    */
   readonly flag: string;
+}
+
+/**
+ * A language a patient can actually book in.
+ *
+ * A live language has to be able to answer every string in the dictionary, so
+ * `messages` is the full `Messages` and not a subset. That is what makes
+ * "flip the status and ship" impossible: the change is a compile error until
+ * the strings are there.
+ */
+export type LiveLanguage = LanguageBasics & {
+  readonly status: "live";
   /** One line, in this language, on what choosing it gets you. */
   readonly description: string;
   readonly messages: Messages;
-}
+};
+
+/**
+ * A language we intend to offer and are not ready to book in.
+ *
+ * No dictionary, because a draft of a medical form in a language we cannot
+ * review is worse than no form: "Date of Birth" mistranslated into a
+ * discharge instruction is not a cosmetic problem. So a pending language
+ * carries its locale, direction, endonym, and flag -- the things a native
+ * speaker can check without a translator -- and nothing else. It is announced
+ * on the language picker as coming, and it has no page, no hreflang entry, and
+ * no sitemap entry, because advertising a document that does not exist is
+ * worse than not advertising it.
+ */
+export type PendingLanguage = LanguageBasics & {
+  readonly status: "pending";
+  /**
+   * A partial dictionary, for translating ahead of time. Never rendered: the
+   * form and its chrome read `messagesFor`, which only answers for a live
+   * language.
+   */
+  readonly messages?: Partial<Messages>;
+};
+
+export type LanguageDefinition = LiveLanguage | PendingLanguage;
 
 const DEFINITIONS = {
   english: {
+    status: "live",
     locale: "en",
     direction: "ltr",
     name: "English",
@@ -142,6 +189,7 @@ const DEFINITIONS = {
     messages: ENGLISH,
   },
   spanish: {
+    status: "live",
     locale: "es",
     direction: "ltr",
     name: "Español",
@@ -175,6 +223,9 @@ const DEFINITIONS = {
       notFoundBody:
         "Esta dirección no corresponde a ningún idioma que ofrezcamos. Elige uno de los idiomas siguientes para comenzar.",
       pickLanguage: "Elegir un idioma",
+      startIntake: "Iniciar admisión",
+      comingSoon: "Próximamente",
+      notYetBookable: "Aún no disponible para reservar",
       fixErrors: "Revisa estos campos",
       submitting: "Iniciando tu consulta",
       bookedTitle: "Tu cita está reservada",
@@ -199,6 +250,7 @@ const DEFINITIONS = {
     },
   },
   portuguese: {
+    status: "live",
     locale: "pt-BR",
     direction: "ltr",
     name: "Português",
@@ -232,6 +284,9 @@ const DEFINITIONS = {
       notFoundBody:
         "Este endereço não corresponde a nenhum idioma que oferecemos. Escolha um dos idiomas abaixo para começar.",
       pickLanguage: "Escolher um idioma",
+      startIntake: "Iniciar admissão",
+      comingSoon: "Em breve",
+      notYetBookable: "Ainda não disponível para agendamento",
       fixErrors: "Verifique estes campos",
       submitting: "Iniciando sua consulta",
       bookedTitle: "Sua consulta está agendada",
@@ -255,6 +310,50 @@ const DEFINITIONS = {
         "Descreva seus sintomas ou o motivo da consulta.",
     },
   },
+
+  /*
+   * Waiting on translation, and on the server.
+   *
+   * Each of these is one registry entry and no code. What a language needs to
+   * go live: a native speaker's reviewed dictionary, `status: "live"`, and its
+   * slug added to SUPPORTED_LANGUAGES in src/lib/validation/intake.ts -- the
+   * last of which is a one-line change in a file this work does not own,
+   * because the intake schema validates the language a record is written in,
+   * and offering a language the server refuses means every submission from
+   * that language fails validation.
+   *
+   * French and Mandarin are LTR; Arabic and Hebrew are RTL, and they are here
+   * as much to keep the right-to-left path exercised and visible as to expand
+   * coverage.
+   */
+  french: {
+    status: "pending",
+    locale: "fr",
+    direction: "ltr",
+    name: "Français",
+    flag: "🇫🇷",
+  },
+  mandarin: {
+    status: "pending",
+    locale: "zh-Hans",
+    direction: "ltr",
+    name: "中文",
+    flag: "🇨🇳",
+  },
+  arabic: {
+    status: "pending",
+    locale: "ar",
+    direction: "rtl",
+    name: "العربية",
+    flag: "🇸🇦",
+  },
+  hebrew: {
+    status: "pending",
+    locale: "he",
+    direction: "rtl",
+    name: "עברית",
+    flag: "🇮🇱",
+  },
 } as const satisfies Record<string, LanguageDefinition>;
 
 /**
@@ -266,26 +365,72 @@ export const LANGUAGES = DEFINITIONS;
 export type LanguageSlug = keyof typeof DEFINITIONS;
 
 /**
- * Every language the UI can offer, in presentation order.
+ * Every language the registry knows about, in presentation order.
  *
  * Derived from the registry rather than written out, because a hand-maintained
  * second list is exactly the drift this module exists to remove. The `as` is
  * sound: the keys of an object literal are known to TypeScript, and
- * registry.test.ts asserts this array against the server's own language list.
+ * registry.test.ts asserts this array against the registry itself.
  */
 export const LANGUAGE_SLUGS = Object.keys(DEFINITIONS) as LanguageSlug[];
 
-/** The language used when nothing better is known. */
-export const DEFAULT_LANGUAGE: LanguageSlug = "english";
+/**
+ * The language used when nothing better is known, and the language the picker
+ * and the not-found page are written in.
+ *
+ * A literal rather than a `LanguageSlug`, so that looking the default up
+ * resolves to the English entry and not to the union of every language, which
+ * is what `LANGUAGES[DEFAULT_LANGUAGE]` would otherwise be.
+ */
+export const DEFAULT_LANGUAGE = "english" satisfies LanguageSlug;
+
+/** The slugs of the languages a patient can book in, derived from the data. */
+export type LiveLanguageSlug = {
+  [K in LanguageSlug]: (typeof DEFINITIONS)[K] extends { status: "live" }
+    ? K
+    : never;
+}[LanguageSlug];
+
+export function isLiveLanguage(slug: LanguageSlug): slug is LiveLanguageSlug {
+  return DEFINITIONS[slug].status === "live";
+}
 
 /**
- * Compile-time guarantee that the UI covers the languages the intake schema
- * accepts. Adding a language to the server's enum without registering it here
- * stops the build instead of producing a form the server rejects.
+ * Bookable languages, in presentation order.
+ *
+ * This is the list the language picker links to, the list the language route
+ * prerenders, and the list hreflang alternates and the sitemap advertise,
+ * because all four are statements that a page exists at a URL. A pending
+ * language has none of those.
+ */
+export const LIVE_LANGUAGE_SLUGS: LiveLanguageSlug[] =
+  LANGUAGE_SLUGS.filter(isLiveLanguage);
+
+/** Languages we intend to offer and cannot book in yet. */
+export const PENDING_LANGUAGE_SLUGS: LanguageSlug[] =
+  LANGUAGE_SLUGS.filter((slug) => !isLiveLanguage(slug));
+
+/**
+ * Compile-time guarantees about the server.
+ *
+ * The intake schema has its own list of languages, in a file this work does not
+ * own, and the two have to agree in one direction or the other: every language
+ * the server accepts must exist here, and every language the server accepts
+ * must be live, because a record submitted in a language the schema rejects
+ * fails validation and the patient is told to check their fields. Adding a
+ * language to SUPPORTED_LANGUAGES without registering it here, or registering
+ * it as pending, stops the build.
  */
 type AssertNever<T extends never> = T;
 export type RegistryCoversServerLanguages = AssertNever<
-  SupportedLanguage extends LanguageSlug ? never : ["missing from the registry", SupportedLanguage]
+  SupportedLanguage extends LanguageSlug
+    ? never
+    : ["missing from the registry", SupportedLanguage]
+>;
+export type ServerLanguagesAreBookable = AssertNever<
+  Exclude<SupportedLanguage, LiveLanguageSlug> extends never
+    ? never
+    : ["registered but not bookable", Exclude<SupportedLanguage, LiveLanguageSlug>]
 >;
 
 /**
@@ -304,13 +449,38 @@ export function getLanguage(slug: LanguageSlug): LanguageDefinition {
   return DEFINITIONS[slug];
 }
 
-/** Look up a language, falling back to the default. Never throws. */
-export function resolveLanguage(slug: string): LanguageDefinition {
-  return isLanguageSlug(slug) ? DEFINITIONS[slug] : DEFINITIONS[DEFAULT_LANGUAGE];
+/** A bookable language, with the slug that named it. */
+export interface BookableLanguage {
+  readonly slug: LiveLanguageSlug;
+  readonly language: LiveLanguage;
 }
 
+/**
+ * Resolve a route parameter to a language that can be booked in, or null.
+ *
+ * Null for a slug that is not in the registry and for one that is registered
+ * but pending. A pending language has no form, so serving it a page would mean
+ * rendering a form in a language we cannot translate, or serving English under
+ * a URL that says otherwise. Both callers treat null as not found.
+ */
+export function resolveBookableLanguage(slug: string): BookableLanguage | null {
+  if (!isLanguageSlug(slug) || !isLiveLanguage(slug)) return null;
+  return { slug, language: DEFINITIONS[slug] };
+}
+
+/**
+ * The message set for a language.
+ *
+ * Answers for a live language and falls back to the default for anything else,
+ * including a pending one, whose dictionary is either absent or a partial
+ * draft. Every string in the form is read through here, so a page can never
+ * render `undefined` because a language is half-translated.
+ */
 export function messagesFor(slug: string): Messages {
-  return resolveLanguage(slug).messages;
+  const language = isLanguageSlug(slug) ? DEFINITIONS[slug] : undefined;
+  return language?.status === "live"
+    ? language.messages
+    : DEFINITIONS[DEFAULT_LANGUAGE].messages;
 }
 
 /** The primary subtag, for the `lang` attribute. */

@@ -89,6 +89,21 @@
   }
 }
 
+/*
+ * Reading direction.
+ *
+ * Every direction-dependent declaration in this file is a logical property --
+ * `border-inline-start`, not `border-left` -- so a right-to-left language needs
+ * no separate stylesheet. The one thing a logical property cannot express is a
+ * glyph that points: an arrow means "forward" in a left-to-right script and
+ * "backward" in a right-to-left one, so `.flow-arrow` mirrors it under
+ * `[dir="rtl"]` instead.
+ */
+[dir="rtl"] .flow-arrow {
+  display: inline-block;
+  transform: scaleX(-1);
+}
+
 @keyframes soundWave {
   0%, 100% {
     height: 8px;

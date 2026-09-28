@@ -8,10 +8,10 @@ import Link from "next/link";
 
 import {
   DEPARTMENT_OPTIONS,
-  getLanguage,
   htmlLang,
   type IntakeFieldName,
-  type LanguageSlug,
+  type LiveLanguage,
+  type LiveLanguageSlug,
 } from "@/i18n/registry";
 import {
   collectIssues,
@@ -73,8 +73,13 @@ const CONTROL_INVALID =
 const ERROR_TEXT = "mt-1.5 text-xs font-medium text-red-700";
 const ERROR_BORDER = "border-red-400";
 
-export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
-  const language = getLanguage(slug);
+export default function IntakeForm({
+  slug,
+  language,
+}: {
+  slug: LiveLanguageSlug;
+  language: LiveLanguage;
+}) {
   const t = language.messages;
 
   const [errors, setErrors] = useState<FieldErrors>({});
@@ -201,7 +206,11 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
           href="/"
           className="inline-flex items-center gap-2 text-xs text-cyan-700 hover:text-cyan-800 mb-6 font-semibold transition-colors"
         >
-          &larr; {t.back}
+          {/* The arrow points back the way the page reads. */}
+          <span className="flow-arrow" aria-hidden="true">
+            &larr;
+          </span>{" "}
+          {t.back}
         </Link>
 
         <div className="bg-white border border-slate-200 rounded-3xl p-8 shadow-xl">

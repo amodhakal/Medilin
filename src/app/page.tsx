@@ -1,9 +1,20 @@
 import Link from "next/link";
 
 import { PROTOTYPE_NOTICE, homeMetadata } from "@/i18n/metadata";
-import { LANGUAGE_SLUGS, getLanguage } from "@/i18n/registry";
+import {
+  DEFAULT_LANGUAGE,
+  LANGUAGE_SLUGS,
+  getLanguage,
+  messagesFor,
+} from "@/i18n/registry";
 
 export const metadata = homeMetadata();
+
+/**
+ * The picker's own copy. The page is in one language -- the default -- and the
+ * language names on it are endonyms in `lang` and `dir` of their own.
+ */
+const t = messagesFor(DEFAULT_LANGUAGE);
 
 export default function HomePage() {
   return (
@@ -34,35 +45,88 @@ export default function HomePage() {
           Streamline patient intake with autonomous AI voice agents. Select your preferred language to begin.
         </p>
 
-        {/* Language Cards Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 max-w-3xl mx-auto text-left">
+        {/*
+          Language Cards Grid.
+
+          `text-start` rather than `text-left`: the card text is in the
+          reader's language, but a page that will host right-to-left languages
+          should not need auditing to find the places that assume otherwise.
+        */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6 max-w-3xl mx-auto text-start">
           {LANGUAGE_SLUGS.map((slug) => {
             const language = getLanguage(slug);
+            const endonym = (
+              // `lang` and `dir` on the endonym itself: it is written in that
+              // language, and an endonym in Arabic has to be set right-to-left
+              // even when everything around it is not.
+              <h2
+                lang={language.locale}
+                dir={language.direction}
+                className="text-lg font-bold text-slate-900 transition-colors"
+              >
+                {language.name}
+              </h2>
+            );
+
+            if (language.status === "pending") {
+              /*
+                Announced, not linked.
+
+                A language we cannot book in yet has no page, so there is
+                nothing to link to and nothing to prerender. It is still listed,
+                because "we are working on it" is more useful to someone who
+                only speaks that language than leaving them to conclude the app
+                does not want them. A div rather than a link, so it is not in
+                the tab order: a control that does nothing should not be
+                reachable by keyboard.
+              */
+              return (
+                <div
+                  key={slug}
+                  aria-disabled="true"
+                  className="bg-slate-100 border border-slate-200 rounded-2xl p-6 flex flex-col justify-between"
+                >
+                  <div>
+                    <div className="text-3xl mb-4 opacity-60" aria-hidden="true">
+                      {language.flag}
+                    </div>
+                    {endonym}
+                    <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+                      {t.notYetBookable}
+                    </p>
+                  </div>
+
+                  <div className="mt-8 flex items-center">
+                    <span className="inline-flex items-center rounded-full border border-slate-300 px-2.5 py-1 text-[0.6875rem] font-semibold uppercase tracking-wider text-slate-600">
+                      {t.comingSoon}
+                    </span>
+                  </div>
+                </div>
+              );
+            }
+
             return (
               <Link
                 key={slug}
                 href={`/language/${slug}`}
-                className="group bg-white border border-slate-200 hover:border-cyan-500 rounded-2xl p-6 shadow-sm hover:shadow-md transition-all duration-200 flex flex-col justify-between"
+                className="group bg-white border border-slate-200 hover:border-cyan-600 rounded-2xl p-6 shadow-sm hover:shadow-md transition-all duration-200 flex flex-col justify-between"
               >
                 <div>
                   <div className="text-3xl mb-4" aria-hidden="true">
                     {language.flag}
                   </div>
-                  {/* `lang` on the endonym only: it is written in that
-                      language, while the blurb below is the reader's. */}
-                  <h2
-                    lang={language.locale}
-                    className="text-lg font-bold text-slate-900 group-hover:text-cyan-600 transition-colors"
-                  >
-                    {language.name}
-                  </h2>
-                  <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+                  <div className="group-hover:text-cyan-700">{endonym}</div>
+                  <p className="text-xs text-slate-600 mt-1.5 leading-relaxed">
                     {language.description}
                   </p>
                 </div>
 
-                <div className="mt-8 flex items-center text-xs font-semibold text-cyan-600 group-hover:translate-x-1 transition-transform">
-                  Start Intake &rarr;
+                <div className="mt-8 flex items-center text-xs font-semibold text-cyan-700">
+                  {t.startIntake}{" "}
+                  {/* The arrow points the way the page reads. */}
+                  <span className="flow-arrow" aria-hidden="true">
+                    &rarr;
+                  </span>
                 </div>
               </Link>
             );

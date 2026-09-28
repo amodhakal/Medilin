@@ -2,9 +2,10 @@ import type { Metadata } from "next";
 
 import {
   DEFAULT_LANGUAGE,
-  LANGUAGE_SLUGS,
+  LIVE_LANGUAGE_SLUGS,
   getLanguage,
   htmlLang,
+  resolveBookableLanguage,
   type LanguageDefinition,
   type LanguageSlug,
 } from "./registry";
@@ -70,16 +71,20 @@ export function openGraphLocale(language: LanguageDefinition): string {
 }
 
 /**
- * Every language's address, keyed by hreflang, plus `x-default`.
+ * Every bookable language's address, keyed by hreflang, plus `x-default`.
  *
  * This is what makes the language picker a set of real alternate documents
  * rather than three internal links, and it is why the alternates are generated
  * from the registry instead of being written out per page.
+ *
+ * Bookable languages only. An hreflang link is a claim that a document exists
+ * at that address in that language, and advertising a language we cannot serve
+ * is a broken promise to a crawler and a language handler.
  */
 export function alternateLanguages(): Record<string, string> {
   const alternates: Record<string, string> = {};
 
-  for (const slug of LANGUAGE_SLUGS) {
+  for (const slug of LIVE_LANGUAGE_SLUGS) {
     alternates[hrefLang(slug)] = languagePath(slug);
   }
 
@@ -138,11 +143,18 @@ export function homeMetadata(): Metadata {
   };
 }
 
-/** Per-language document metadata, from the registry. */
-export function languageMetadata(slug: LanguageSlug): Metadata {
-  const language = getLanguage(slug);
-  const { messages } = language;
-  const path = languagePath(slug);
+/**
+ * Per-language document metadata, from the registry.
+ *
+ * Null for anything that is not a bookable language, so a caller that resolves
+ * a route parameter cannot build metadata for a page that will not be rendered.
+ */
+export function languageMetadata(slug: string): Metadata | null {
+  const bookable = resolveBookableLanguage(slug);
+  if (!bookable) return null;
+
+  const { messages } = bookable.language;
+  const path = languagePath(bookable.slug);
 
   return {
     title: messages.title,
@@ -156,7 +168,7 @@ export function languageMetadata(slug: LanguageSlug): Metadata {
       title: messages.title,
       description: messages.subtitle,
       url: path,
-      locale: openGraphLocale(language),
+      locale: openGraphLocale(bookable.language),
     },
     twitter: {
       card: "summary",
@@ -170,6 +182,6 @@ export function languageMetadata(slug: LanguageSlug): Metadata {
 export function sitemapEntries(): Array<{ path: string; language: LanguageSlug }> {
   return [
     { path: "/", language: DEFAULT_LANGUAGE },
-    ...LANGUAGE_SLUGS.map((slug) => ({ path: languagePath(slug), language: slug })),
+    ...LIVE_LANGUAGE_SLUGS.map((slug) => ({ path: languagePath(slug), language: slug })),
   ];
 }

@@ -1,7 +1,8 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
+import { ToastContainer } from "react-toastify";
 
-import { LANGUAGE_SLUGS, isLanguageSlug } from "@/i18n/registry";
+import { LIVE_LANGUAGE_SLUGS, resolveBookableLanguage } from "@/i18n/registry";
 import { languageMetadata } from "@/i18n/metadata";
 import IntakeForm from "./IntakeForm";
 
@@ -21,7 +22,10 @@ import IntakeForm from "./IntakeForm";
  * slug is a 404 with a page that says so, and the known slugs are prerendered.
  */
 export function generateStaticParams(): Array<{ slug: string }> {
-  return LANGUAGE_SLUGS.map((slug) => ({ slug }));
+  // Bookable languages only. A pending language is announced on the picker and
+  // has no page, so prerendering a route for it would be a page that exists
+  // only to say it does not.
+  return LIVE_LANGUAGE_SLUGS.map((slug) => ({ slug }));
 }
 
 /**
@@ -40,11 +44,12 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const { slug } = await params;
 
-  if (!isLanguageSlug(slug)) {
+  const metadata = languageMetadata(slug);
+  if (!metadata) {
     notFound();
   }
 
-  return languageMetadata(slug);
+  return metadata;
 }
 
 export default async function LanguagePage({
@@ -54,9 +59,40 @@ export default async function LanguagePage({
 }) {
   const { slug } = await params;
 
-  if (!isLanguageSlug(slug)) {
+  const bookable = resolveBookableLanguage(slug);
+  if (!bookable) {
     notFound();
   }
 
-  return <IntakeForm slug={slug} />;
+  return (
+    <>
+      <IntakeForm slug={bookable.slug} language={bookable.language} />
+      {/*
+        The toast container lives here rather than in the root layout, because
+        this is the only page that raises toasts and because it is the only
+        place that knows the reading direction. react-toastify mirrors its own
+        layout when told the container is RTL, which a global container in the
+        root layout -- where `<html lang>` is fixed to English and the language
+        is not known -- could not do.
+      */}
+      {/* `rtl` mirrors react-toastify's own layout. The wrapper is for
+          `dir`: the library has no prop for it, and without it the logical
+          properties in the toast rules -- the coloured rule down the inline
+          start edge -- would resolve against the document's direction, which
+          is English, on a page in Arabic. */}
+      <div dir={bookable.language.direction}>
+        <ToastContainer
+          position="top-center"
+          draggable={false}
+          closeOnClick={false}
+          pauseOnFocusLoss
+          closeButton
+          autoClose={8000}
+          newestOnTop
+          role="alert"
+          rtl={bookable.language.direction === "rtl"}
+        />
+      </div>
+    </>
+  );
 }

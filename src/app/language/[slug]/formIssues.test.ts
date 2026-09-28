@@ -3,9 +3,8 @@ import { describe, expect, test } from "bun:test";
 import {
   FIELD_LABELS,
   INTAKE_FIELDS,
-  LANGUAGES,
-  LANGUAGE_SLUGS,
-  getLanguage,
+  LIVE_LANGUAGE_SLUGS,
+  messagesFor,
 } from "@/i18n/registry";
 import { intakeSchema } from "@/lib/validation/intake";
 import { describe as describeIssues } from "@/lib/validation/parse";
@@ -24,7 +23,7 @@ import {
  * the form does not have must not be attached to one that it does.
  */
 
-const english = getLanguage("english").messages;
+const english = messagesFor("english");
 
 function issuesFrom(raw: Record<string, unknown>) {
   const parsed = intakeSchema.safeParse(raw);
@@ -102,7 +101,7 @@ describe("summaryEntries", () => {
   test("names each failing field in the reader's language", () => {
     const entries = summaryEntries(
       { email: "Enter a valid email address" },
-      getLanguage("spanish").messages,
+      messagesFor("spanish"),
     );
 
     expect(entries).toHaveLength(1);
@@ -134,10 +133,9 @@ describe("summaryEntries", () => {
   });
 
   test("has a label for every language it could be rendered in", () => {
-    for (const slug of LANGUAGE_SLUGS) {
-      const messages = getLanguage(slug).messages;
+    for (const slug of LIVE_LANGUAGE_SLUGS) {
       for (const field of INTAKE_FIELDS) {
-        const [entry] = summaryEntries({ [field]: "bad" }, messages);
+        const [entry] = summaryEntries({ [field]: "bad" }, messagesFor(slug));
         expect(entry.label.trim().length).toBeGreaterThan(0);
       }
     }
@@ -151,7 +149,7 @@ describe("summaryEntries", () => {
 describe("field wiring", () => {
   test("every field label is a real message", () => {
     for (const [field, messageKey] of Object.entries(FIELD_LABELS)) {
-      expect(LANGUAGES.english.messages[messageKey].trim().length).toBeGreaterThan(0);
+      expect(messagesFor("english")[messageKey].trim().length).toBeGreaterThan(0);
       expect(field.trim().length).toBeGreaterThan(0);
     }
   });

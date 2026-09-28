@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { DEFAULT_LANGUAGE, LANGUAGE_SLUGS, getLanguage } from "@/i18n/registry";
+import { LIVE_LANGUAGE_SLUGS, getLanguage, messagesFor } from "@/i18n/registry";
 
 /**
  * The 404 for an unrecognised language slug.
@@ -12,7 +12,9 @@ import { DEFAULT_LANGUAGE, LANGUAGE_SLUGS, getLanguage } from "@/i18n/registry";
  * not exist": the address was wrong, not the patient.
  */
 export default function LanguageNotFound() {
-  const t = getLanguage(DEFAULT_LANGUAGE).messages;
+  // A not-found boundary receives no route params, so it cannot know which
+  // language was asked for and answers in the default language.
+  const t = messagesFor("english");
 
   return (
     <main className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-6">
@@ -29,13 +31,14 @@ export default function LanguageNotFound() {
           {t.pickLanguage}
         </h2>
         <ul className="flex flex-wrap justify-center gap-3">
-          {LANGUAGE_SLUGS.map((slug) => {
+          {LIVE_LANGUAGE_SLUGS.map((slug) => {
             const language = getLanguage(slug);
             return (
               <li key={slug}>
                 <Link
                   href={`/language/${slug}`}
                   lang={language.locale}
+                  dir={language.direction}
                   className="inline-flex items-center gap-2 bg-white border border-slate-200 hover:border-cyan-500 rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-800 hover:text-cyan-700 transition-colors"
                 >
                   <span aria-hidden="true">{language.flag}</span>

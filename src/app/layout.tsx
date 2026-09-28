@@ -13,7 +13,6 @@ import { Geist, Geist_Mono } from "next/font/google";
  */
 import "react-toastify/dist/ReactToastify.css";
 import "./globals.css";
-import { ToastContainer } from "react-toastify";
 
 import { rootMetadata } from "@/i18n/metadata";
 
@@ -37,6 +36,10 @@ export const metadata = rootMetadata;
 /**
  * The document element.
  *
+ * There is no ToastContainer here. It moved to the language route, which is
+ * the only page that raises toasts and the only place that knows the reading
+ * direction of the page it is on; see src/app/language/[slug]/page.tsx.
+ *
  * `lang` is fixed to English here because `<html>` can only be set by the root
  * layout, and the language of a document is not known until a route resolves
  * one. Each language route therefore declares its own `lang` and `dir` on the
@@ -56,24 +59,6 @@ export default function RootLayout({
     >
       <body className="min-h-full flex flex-col">
         {children}
-        {/*
-          `draggable` off: a drag handle is a mouse affordance with no keyboard
-          equivalent, and on a form that is about to navigate it is a trap for
-          anyone who grabs the wrong thing. `closeOnClick` off so clicking a
-          toast cannot dismiss a message a patient has not read yet;
-          `pauseOnFocusLoss` on so moving away to read a field does not take the
-          message away from them.
-        */}
-        <ToastContainer
-          position="top-center"
-          draggable={false}
-          closeOnClick={false}
-          pauseOnFocusLoss
-          closeButton
-          autoClose={8000}
-          newestOnTop
-          role="alert"
-        />
       </body>
     </html>
   );
