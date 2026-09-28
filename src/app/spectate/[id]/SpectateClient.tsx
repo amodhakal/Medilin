@@ -1,8 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useMemo } from "react";
-import { useAgentRelay } from "@/hooks/useAgentRelay";
+import { useCallback, useEffect, useMemo } from "react";
+import { useAgentRelay, type AgentSide } from "@/hooks/useAgentRelay";
+import {
+  createAgentSocketFactory,
+  type AgentSocketFactory,
+  type VoiceCredential,
+} from "@/lib/voice/agent-socket";
+import { clientLog } from "@/lib/logger/client";
 import { AgentCard } from "@/components/spectate/AgentCard";
 import { CallControls } from "@/components/spectate/CallControls";
 import { SessionBadge, SessionNotice } from "@/components/spectate/SessionStatus";
@@ -36,23 +42,28 @@ export interface SpectatePatient {
   appointmentDateTime: string;
 }
 
+/** Where a browser asks this app's server for a signed conversation URL. */
+const SESSION_ENDPOINT = "/api/voice/session";
+
 /**
  * The spectate page.
  *
  * Now only composition. The two sockets, the transcript, the turn-taking, and
  * every timer live in @/hooks/useAgentRelay, and the presentational pieces
  * live in @/components/spectate. What is left here is the record this page was
- * given and the decision about what to say to each agent, which belongs with
- * the record it is derived from.
+ * given, the decision about what to say to each agent, and -- since #15 -- the
+ * one socket factory that replaced a pair of agent ids.
  */
 export default function SpectateClient({
   patient,
-  patientAgentId,
-  receptionistAgentId,
+  voiceAvailable,
+  sessionToken,
 }: {
   patient: SpectatePatient;
-  patientAgentId: string;
-  receptionistAgentId: string;
+  /** Whether this deployment has a voice credential at all. */
+  voiceAvailable: boolean;
+  /** The sealed spectate token, which is what authorises a voice session. */
+  sessionToken: string;
 }) {
   // Memoised so the relay's effect dependencies are stable. The strings are
   // built here rather than inside the hook so that everything derived from the
@@ -88,9 +99,86 @@ export default function SpectateClient({
     [patient]
   );
 
+  /**
+   * Ask the server for a signed URL for one side.
+   *
+   * The only thing the browser learns from this is a `wss://` URL that stops
+   * working in a minute. The agent id stays in the server's configuration and
+   * the API key stays in the server's environment; neither is in this module,
+   * in the page's props, or in anything the browser can read.
+   *
+   * Throws on any non-OK answer, including the 503 a deployment without a voice
+   * credential gets, and including the 403 for a token that is not a booking.
+   * The socket factory turns that into a failed connect, which the relay
+   * already reports, so no error text is invented here.
+   */
+  const mintCredential = useCallback(
+    async (side: AgentSide): Promise<VoiceCredential> => {
+      const response = await fetch(SESSION_ENDPOINT, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ side, session: sessionToken }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`voice session refused: ${response.status}`);
+      }
+
+      const body = (await response.json()) as { url?: unknown; expiresAt?: unknown };
+      if (typeof body.url !== "string" || typeof body.expiresAt !== "number") {
+        throw new Error("voice session response was not a credential");
+      }
+
+      return { url: body.url, expiresAt: body.expiresAt };
+    },
+    [sessionToken],
+  );
+
+  /**
+   * The factory, built once.
+   *
+   * `useMemo` with nothing but `mintCredential` in the dependency list, which
+   * is what keeps it referentially stable: it goes into the relay's
+   * configuration, and a factory that changed identity on every render would
+   * re-run the relay's reconfigure effect forever. The React Compiler rewrites
+   * this into exactly this, so the stability is a property of the dependency
+   * list and not of the hook.
+   */
+  const sockets = useMemo<AgentSocketFactory | null>(() => {
+    if (!voiceAvailable) return null;
+
+    return createAgentSocketFactory({
+      mint: mintCredential,
+      onFault: (fault) => clientLog("warn", "voice.socket_fault", { resource: fault }),
+    });
+  }, [mintCredential, voiceAvailable]);
+
+  /**
+   * Fetch the credentials while the patient reads the page.
+   *
+   * The one cost of asking the server instead of the vendor is a round trip
+   * between pressing Start and the socket existing. Doing it here puts that
+   * round trip on page load, where nobody is waiting on it, and the factory
+   * reuses what it fetches.
+   *
+   * Skipped when this deployment has no voice credential: those sides cannot be
+   * opened, and the relay's own failure message is the honest one.
+   */
+  useEffect(() => {
+    if (!sockets) return;
+    sockets.warm();
+    return () => {
+      sockets.clear();
+    };
+  }, [sockets]);
+
+  const openSocket = useMemo(
+    () => (sockets ? (side: AgentSide) => sockets.open(side) : undefined),
+    [sockets],
+  );
+
   const { state, start, stop, reconnect, reconnectAll } = useAgentRelay({
-    patientAgentId,
-    receptionistAgentId,
+    createSocket: openSocket,
     patientOpeningContext,
     receptionistOpeningContext,
     patientDynamicVariables,
