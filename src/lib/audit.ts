@@ -12,7 +12,7 @@ export interface AuditLogEntry {
   hash: string;
 }
 
-class AuditLogManager {
+export class AuditLogManager {
   private logs: AuditLogEntry[] = [];
   private genesisHash: string = '0000000000000000000000000000000000000000000000000000000000000000';
 
