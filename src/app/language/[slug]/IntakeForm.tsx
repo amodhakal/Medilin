@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { toast } from "react-toastify";
 import { submitIntakeForm } from "@/app/actions";
+import { clientLog } from "@/lib/logger/client";
 import Link from "next/link";
 
 import {
@@ -19,6 +20,7 @@ import {
   summaryEntries,
   type FieldErrors,
 } from "./formIssues";
+import { createSubmitGate } from "./submitGate";
 
 /**
  * The intake form for one language.
@@ -49,38 +51,71 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
 
   const [errors, setErrors] = useState<FieldErrors>({});
   const [unattached, setUnattached] = useState<string[]>([]);
+  const [pending, setPending] = useState(false);
   const summaryRef = useRef<HTMLDivElement | null>(null);
+  // The gate refuses a second submission synchronously, which a state flag
+  // cannot: two clicks in one frame both read `pending === false`. The state
+  // alongside it is what renders the disabled button.
+  const gate = useRef(createSubmitGate());
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    const formData = new FormData(e.currentTarget);
-    formData.append("language", slug);
-    const result = await submitIntakeForm(formData);
+    if (!gate.current.begin()) return;
 
-    // The previous version showed a success toast unconditionally and then
-    // redirected only if a spectateUrl happened to be present, so a rejected
-    // submission looked identical to a booking until the page silently did
-    // nothing.
-    if (!result.ok) {
-      const collected = collectIssues(result.issues);
-      setErrors(collected.byField);
-      setUnattached(result.issues.length > 0 ? collected.unattached : [result.error]);
+    setPending(true);
+
+    try {
+      const formData = new FormData(e.currentTarget);
+      formData.append("language", slug);
+      const result = await submitIntakeForm(formData);
+
+      // The previous version showed a success toast unconditionally and then
+      // redirected only if a spectateUrl happened to be present, so a rejected
+      // submission looked identical to a booking until the page silently did
+      // nothing.
+      if (!result.ok) {
+        const collected = collectIssues(result.issues);
+        setErrors(collected.byField);
+        setUnattached(
+          result.issues.length > 0 ? collected.unattached : [result.error],
+        );
+        clientLog("warn", "intake.submit_rejected", {
+          language: slug,
+          issueCount: result.issues.length,
+        });
+        toast.error(t.submitFailed);
+        // The toast is transient and disappears. The summary does not, and it
+        // is where the per-field detail is, so focus moves there rather than
+        // leaving a patient to hunt for what changed.
+        summaryRef.current?.focus();
+        return;
+      }
+
+      setErrors({});
+      setUnattached([]);
+      clientLog("info", "intake.submit_accepted", { language: slug });
+      toast.success(t.toastProcessing);
+      // assign() rather than `window.location.href = url`, which the React
+      // compiler's immutability rule rejects as a write to a global. Same
+      // navigation, and a full document load rather than a client-side one,
+      // which is what a page opening two WebSockets wants.
+      window.location.assign(result.spectateUrl);
+    } catch (error) {
+      // A server action can throw before it returns its union: a dropped
+      // connection, a platform error, a serialization failure. Previously that
+      // was an unhandled rejection and a form that looked ready to submit
+      // again while nothing had been sent.
+      clientLog("error", "intake.submit_failed", {
+        language: slug,
+        errorName: error instanceof Error ? error.name : "unknown",
+      });
+      setErrors({});
+      setUnattached([t.submitFailed]);
       toast.error(t.submitFailed);
-      // The toast is transient and disappears. The summary does not, and it is
-      // where the per-field detail is, so focus moves there rather than leaving
-      // a patient to hunt for what changed.
-      summaryRef.current?.focus();
-      return;
+    } finally {
+      gate.current.end();
+      setPending(false);
     }
-
-    setErrors({});
-    setUnattached([]);
-    toast.success(t.toastProcessing);
-    // assign() rather than `window.location.href = url`, which the React
-    // compiler's immutability rule rejects as a write to a global. Same
-    // navigation, and a full document load rather than a client-side one,
-    // which is what a page opening two WebSockets wants.
-    window.location.assign(result.spectateUrl);
   };
 
   const showError = (field: IntakeFieldName) => Boolean(errors[field]);
@@ -151,7 +186,11 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="space-y-5">
+          <form
+            onSubmit={handleSubmit}
+            aria-busy={pending}
+            className="space-y-5"
+          >
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label htmlFor="firstName" className={LABEL}>
@@ -397,12 +436,49 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
               )}
             </div>
 
+            {/*
+              `disabled` rather than a click handler that ignores the second
+              click: a disabled button is out of the tab order and out of the
+              accessibility tree's reachable set, so a screen reader user is
+              told the form is busy by the control itself. The status region
+              below carries the same information in words, because a disabled
+              button is not always announced.
+            */}
             <button
               type="submit"
-              className="w-full bg-cyan-700 hover:bg-cyan-800 text-white font-semibold py-4 rounded-xl shadow-md transition-colors cursor-pointer text-center text-sm tracking-wide"
+              disabled={pending}
+              aria-disabled={pending}
+              className="w-full bg-cyan-700 hover:bg-cyan-800 disabled:bg-cyan-700/60 disabled:shadow-none text-white font-semibold py-4 rounded-xl shadow-md transition-colors cursor-pointer disabled:cursor-progress text-center text-sm tracking-wide inline-flex items-center justify-center gap-2.5"
             >
-              {t.submit}
+              {pending && (
+                // `motion-reduce:animate-none` so the spinner stops for anyone
+                // who has asked the operating system for less motion.
+                <svg
+                  className="animate-spin motion-reduce:animate-none h-4 w-4 shrink-0"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <circle
+                    className="opacity-30"
+                    cx="12"
+                    cy="12"
+                    r="10"
+                    stroke="currentColor"
+                    strokeWidth="4"
+                  />
+                  <path
+                    className="opacity-90"
+                    fill="currentColor"
+                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                  />
+                </svg>
+              )}
+              {pending ? t.submitting : t.submit}
             </button>
+            <p role="status" aria-live="polite" className="sr-only">
+              {pending ? t.submitting : ""}
+            </p>
           </form>
         </div>
       </div>
