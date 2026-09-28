@@ -64,6 +64,11 @@ const serverEnvSchema = z.object({
   // redaction that has to hold before anything is.
   SENTRY_DSN: z.string().min(1).optional(),
   CRON_SECRET: z.string().min(1).optional(),
+  // Twilio messaging, for SMS and WhatsApp confirmations (#60). All three or
+  // none: a partial set disables messaging rather than half-configuring it,
+  // and an unset TWILIO_FROM_NUMBER leaves the confirmation email-only. The
+  // sender is E.164, optionally prefixed `whatsapp:` to send over WhatsApp
+  // instead of SMS; see src/lib/twilio/messaging.ts.
   TWILIO_ACCOUNT_SID: z.string().min(1).optional(),
   TWILIO_AUTH_TOKEN: z.string().min(1).optional(),
   TWILIO_FROM_NUMBER: z.string().min(1).optional(),
