@@ -48,7 +48,8 @@ const submission = {
 };
 
 const realFetch = globalThis.fetch;
-let webhookCalls: Request[] = [];
+/** Anything the booking path tried to send over the network. Should be empty. */
+let outboundCalls: unknown[] = [];
 
 function post(path: string, body: unknown, headers: Record<string, string> = {}) {
   return new NextRequest(`https://clinic.test${path}`, {
@@ -59,7 +60,7 @@ function post(path: string, body: unknown, headers: Record<string, string> = {})
 }
 
 beforeEach(() => {
-  webhookCalls = [];
+  outboundCalls = [];
   setRateLimitStore(null);
 
   setLlmClient({
@@ -68,11 +69,11 @@ beforeEach(() => {
     },
   });
 
-  // Only the internal webhook leaves the process. Swapping globalThis.fetch is
-  // how a route under test is stopped from calling its own origin.
-  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
-    webhookCalls.push(new Request(String(input), init));
-    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  // Any HTTP call at all from the booking path is a self-call, and the stub
+  // records it rather than letting it reach a network.
+  globalThis.fetch = (async (input: unknown) => {
+    outboundCalls.push(input);
+    return new Response(JSON.stringify({ id: "resend-1" }), { status: 200 });
   }) as typeof fetch;
 });
 
@@ -116,16 +117,14 @@ describe("the two booking routes", () => {
     expect(JSON.stringify(body)).not.toContain("dolor de cabeza");
   });
 
-  test("still sends the confirmation webhook, with the internal secret", async () => {
+  test("makes no HTTP request to itself", async () => {
+    // The booking path used to POST to this application's own /api/webhook, at
+    // a URL built from the request's Host header, and then ignore what came
+    // back. There is no self-call left on the path: not to the webhook, and not
+    // anywhere else.
     await (await handleBooking(post("/api/intake", submission))).json();
 
-    expect(webhookCalls).toHaveLength(1);
-    const sent = webhookCalls[0];
-    expect(sent.headers.get("x-internal-secret")).toBe(BASELINE.INTERNAL_API_SECRET);
-
-    const payload = (await sent.json()) as { email: string; language: string };
-    expect(payload.email).toBe("ada@example.test");
-    expect(payload.language).toBe("spanish");
+    expect(outboundCalls).toEqual([]);
   });
 });
 

@@ -2,11 +2,11 @@ import "server-only";
 
 import { getClinicName } from "@/config";
 import { createAppointment } from "@/lib/appointments";
-import { internalHeaders } from "@/lib/auth/internal";
 import { logInfo } from "@/lib/logger";
 import { sealRecord } from "@/lib/phi-token";
 import { translateToEnglish } from "@/lib/translateToEnglish";
 import type { IntakeFormData } from "@/lib/validation/intake";
+import { deliverConfirmation } from "./deliver-confirmation";
 import { negotiateAppointmentTime } from "./schedule";
 
 /**
@@ -26,7 +26,10 @@ import { negotiateAppointmentTime } from "./schedule";
  * handler.
  *
  * `origin` is a parameter rather than something read from the request, so that
- * every URL this builds comes from one decided value.
+ * every URL this builds comes from one decided value. Pass an empty string for a
+ * root-relative spectate URL, which is what a caller in the same process wants:
+ * there is no trustworthy absolute origin available inside a server action, and
+ * a relative URL resolves against whichever origin the user is actually on.
  */
 
 export interface Booking {
@@ -67,14 +70,15 @@ export async function bookAppointment(
 
   logInfo("intake.booking_simulated", { appointmentId: appointment.id });
 
-  await fetch(`${origin}/api/webhook`, {
-    method: "POST",
-    headers: internalHeaders(),
-    body: JSON.stringify({
-      email: translatedData.email,
-      language: sourceLanguage,
-      info: JSON.stringify(mockHospitalResponse),
-    }),
+  // Was `fetch(`${origin}/api/webhook`, { headers: internalHeaders(), ... })`:
+  // an HTTP round trip to this same process, to a URL derived from the
+  // request's own Host header, whose response was never inspected. The delivery
+  // is a function call now, for the same reasons as #43 in the server action,
+  // and its result is available to be checked rather than discarded.
+  await deliverConfirmation({
+    email: translatedData.email,
+    language: sourceLanguage,
+    info: JSON.stringify(mockHospitalResponse),
   });
 
   return { appointmentId: appointment.id, spectateUrl };
