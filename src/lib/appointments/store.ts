@@ -12,6 +12,13 @@ import type { AppointmentRecord } from "@/lib/validation/intake";
  * are all asynchronous. That is not incidental tidiness -- a durable store is a
  * network round trip, and a synchronous signature over one would either block
  * the event loop or hide the await behind a promise nobody checks.
+ *
+ * Four more arrived with #59 and are about a different thing: `issueActionGrant`
+ * and friends. They are not about appointments, they are about the capabilities
+ * a patient is handed a link for, and they are on the same interface because
+ * they have the same durability requirement. A capability kept anywhere else
+ * -- a cookie, an in-process `Set`, a signed token alone -- is a capability that
+ * a cold start silently invalidates, which is the bug #17 was.
  */
 
 /**
@@ -73,6 +80,59 @@ export type AppointmentPatch = Partial<
 >;
 
 /**
+ * What a patient may do to their own appointment through a link (#59).
+ *
+ * A closed set of two, and closed for the same reason `APPOINTMENT_STATUSES` is:
+ * every caller that acts on one has to branch on it, and a free-text action
+ * would admit "Cancel", "CANCELLED" and "cancel " as three capabilities that
+ * all serialise into a sealed token nobody can inspect.
+ *
+ * It lives here rather than beside the token that carries it, because the store
+ * has to be able to check a grant without parsing anything: the token module
+ * depends on the store's vocabulary, never the other way round.
+ *
+ * `read` is absent on purpose. Opening the appointment is what the tracking
+ * link in ../phi-token already does, and a management link that could also read
+ * would be a second, wider way in for no added capability.
+ */
+export const PATIENT_ACTIONS = ["reschedule", "cancel"] as const;
+
+export type PatientAction = (typeof PATIENT_ACTIONS)[number];
+
+export function isPatientAction(value: unknown): value is PatientAction {
+  return (
+    typeof value === "string" &&
+    (PATIENT_ACTIONS as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * A capability a patient was handed, as the store remembers it.
+ *
+ * Everything here is also inside the sealed token. The duplication is the
+ * point: the token is authenticated, this is authorised. A payload sealed with
+ * the right key by anything else in the process would pass the AEAD check and
+ * still have no row here.
+ */
+export interface ActionGrant {
+  /**
+   * The token's own id, minted per token.
+   *
+   * The only key a grant can be looked up or withdrawn by, so it must be
+   * unique per mint rather than per appointment: two links to the same
+   * appointment are two capabilities, and revoking one must not revoke the
+   * other.
+   */
+  jti: string;
+  appointmentId: string;
+  actions: PatientAction[];
+  /** After this the grant is refused whatever the row says. */
+  expiresAt: Date;
+  /** Null while the grant is live. Stamped when it is spent or withdrawn. */
+  withdrawnAt: Date | null;
+}
+
+/**
  * Reject a patch the store could not honour, before it reaches a store.
  *
  * Called by the facade so that both implementations fail the same way and with
@@ -93,9 +153,9 @@ export function assertValidAppointmentPatch(patch: AppointmentPatch): void {
  *
  * Implementations are expected to be safe to share across concurrent requests
  * and across processes. Everything above this interface -- booking, the status
- * API, the sealed token -- is written against the interface alone, so a second
- * implementation (or a test double) needs to provide these four methods and
- * nothing else.
+ * API, the sealed token, the patient action link -- is written against the
+ * interface alone, so a second implementation (or a test double) needs to
+ * provide these methods and nothing else.
  *
  * The store is a durability layer, not a workflow engine. It enforces that a
  * status is one of `APPOINTMENT_STATUSES` and that an identifier is immutable,
@@ -127,4 +187,50 @@ export interface AppointmentStore {
    * and it should not have to be reconstructed at every call site.
    */
   cancel(id: string): Promise<Appointment | undefined>;
+
+  /**
+   * Remember a capability a patient was handed a link for.
+   *
+   * A grant is the durable half of a link. The token carries what may be done
+   * and until when; the grant carries the fact that *this* token was really
+   * issued by us, which nothing inside the token can prove -- it is only
+   * authenticated, not authorised. Without this, a token sealed under a stolen
+   * master key would be as good as one we minted.
+   *
+   * Idempotent on `jti`, so re-issuing a grant is a no-op rather than a second
+   * live capability for the same token.
+   */
+  issueActionGrant(grant: ActionGrant): Promise<ActionGrant>;
+
+  /** The grant, or `undefined` if no such capability was ever issued. */
+  getActionGrant(jti: string): Promise<ActionGrant | undefined>;
+
+  /**
+   * Spend a grant: withdraw it and hand it back, or `undefined` if it is
+   * unknown, already withdrawn, or past `now`.
+   *
+   * Atomic, and that is the entire reason it is not `getActionGrant` followed
+   * by `issueActionGrant`. Two requests carrying the same link would both read
+   * a live grant, both decide they may act, and both act; the patient gets two
+   * reschedules for one click. Whoever wins the compare-and-set is the one that
+   * proceeds, and the other is told the link has been used.
+   *
+   * `now` is a parameter because expiry is decided here, once, rather than in
+   * whichever caller happened to remember to check.
+   */
+  spendActionGrant(jti: string, now: Date): Promise<ActionGrant | undefined>;
+
+  /**
+   * Withdraw every live grant for an appointment, and report how many.
+   *
+   * This is what makes a link revocable in the way a patient expects: once an
+   * appointment is cancelled, no outstanding link may bring it back. Without it
+   * a patient could cancel through one link and then reschedule through an old
+   * copy of it, which is a record that is cancelled and booked at the same
+   * time.
+   *
+   * Idempotent, and it deliberately does not prune the withdrawn rows: a
+   * capability that has been spent should still be reportable as spent.
+   */
+  withdrawActionGrants(appointmentId: string, now: Date): Promise<number>;
 }

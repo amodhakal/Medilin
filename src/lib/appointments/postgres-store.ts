@@ -1,6 +1,6 @@
 import { SqlError, type SqlClient } from "@/lib/storage";
 import { decryptPHI, encryptPHI, type EncryptedEnvelope } from "@/lib/encryption";
-import { isAppointmentStatus, type Appointment, type AppointmentPatch, type AppointmentStore } from "./store";
+import { isPatientAction, isAppointmentStatus, type ActionGrant, type Appointment, type AppointmentPatch, type AppointmentStore, type PatientAction } from "./store";
 import type { AppointmentRecord } from "@/lib/validation/intake";
 
 /**
@@ -140,6 +140,111 @@ export class PostgresAppointmentStore implements AppointmentStore {
   }
 
   /**
+   * Record a capability, once.
+   *
+   * `ON CONFLICT (jti) DO NOTHING` rather than an upsert, so a `jti` that is
+   * already present keeps the row it was issued with -- including a
+   * `withdrawn_at` somebody already set. An upsert would let a re-mint un-spend
+   * a capability by rewriting the row.
+   */
+  async issueActionGrant(grant: ActionGrant): Promise<ActionGrant> {
+    await this.ready();
+
+    const rows = await this.sql.query<ActionGrantRow>(
+      `INSERT INTO appointment_action_grants
+         (jti, appointment_id, actions, expires_at, withdrawn_at)
+       VALUES ($1, $2, $3::text[], $4, NULL)
+       ON CONFLICT (jti) DO NOTHING
+       RETURNING ${GRANT_COLUMNS}`,
+      [
+        grant.jti,
+        grant.appointmentId,
+        // A Postgres array literal rather than JSON: the database can compare
+        // and index it, and it is not a place a caller-supplied string could
+        // become anything but an element of a text array.
+        `{${grant.actions.join(",")}}`,
+        grant.expiresAt.toISOString(),
+      ],
+    );
+
+    // Nothing returned means this `jti` was already issued, and the row that is
+    // there is the one that was issued first. Returning the existing grant is
+    // what makes `issueActionGrant` idempotent: re-minting the same capability
+    // cannot produce a second live one.
+    if (rows.length === 0) {
+      const existing = await this.getActionGrant(grant.jti);
+      if (existing) return existing;
+
+      // The row was deleted between the conflict and this read -- which is what
+      // deleting an appointment does, since the grant cascades. Throwing rather
+      // than returning a phantom grant: `rows[0]` is not there, and inventing a
+      // capability would authorise something nobody issued.
+      throw new SqlError(
+        "unexpected",
+        "A capability conflicted with a row that then could not be read.",
+      );
+    }
+
+    return toActionGrant(rows[0]);
+  }
+
+  async getActionGrant(jti: string): Promise<ActionGrant | undefined> {
+    await this.ready();
+
+    const rows = await this.sql.query<ActionGrantRow>(
+      `SELECT ${GRANT_COLUMNS} FROM appointment_action_grants WHERE jti = $1`,
+      [jti],
+    );
+
+    return rows.length === 0 ? undefined : toActionGrant(rows[0]);
+  }
+
+  /**
+   * `UPDATE ... WHERE withdrawn_at IS NULL AND expires_at > $2 RETURNING`.
+   *
+   * The whole of the atomicity is in that predicate: two concurrent callers
+   * both match the row or neither does, never both, because the second one
+   * blocks on the row lock and then finds `withdrawn_at` already set. Reading
+   * the row first and writing it back in a second statement would have a window
+   * in between, and this is the one place in the store where a window is not a
+   * correctness detail but a patient being rescheduled twice for one click.
+   *
+   * A row that cannot be found, has already been withdrawn, or has expired is
+   * simply not returned -- the three are the same answer to a caller, because
+   * telling them apart tells a prober which they managed.
+   */
+  async spendActionGrant(jti: string, now: Date): Promise<ActionGrant | undefined> {
+    await this.ready();
+
+    const rows = await this.sql.query<ActionGrantRow>(
+      `UPDATE appointment_action_grants
+          SET withdrawn_at = $3
+        WHERE jti = $1
+          AND withdrawn_at IS NULL
+          AND expires_at > $2
+        RETURNING ${GRANT_COLUMNS}`,
+      [jti, now.toISOString(), now.toISOString()],
+    );
+
+    return rows.length === 0 ? undefined : toActionGrant(rows[0]);
+  }
+
+  async withdrawActionGrants(appointmentId: string, now: Date): Promise<number> {
+    await this.ready();
+
+    const rows = await this.sql.query<{ jti: string }>(
+      `UPDATE appointment_action_grants
+          SET withdrawn_at = $2
+        WHERE appointment_id = $1
+          AND withdrawn_at IS NULL
+        RETURNING jti`,
+      [appointmentId, now.toISOString()],
+    );
+
+    return rows.length;
+  }
+
+  /**
    * Create the table if it is not there yet, once per process.
    *
    * The promise is dropped on failure rather than cached, so a database that was
@@ -179,6 +284,33 @@ export class PostgresAppointmentStore implements AppointmentStore {
     await this.sql.query(`
       COMMENT ON COLUMN appointments.patient_info IS
         'Envelope-encrypted patient record (AES-256-GCM under a per-record DEK wrapped by HIPAA_MASTER_KEY). Ciphertext, not plaintext.'
+    `);
+
+    // The durable half of a patient action link (#59). Nothing here is PHI: it
+    // is a capability id, the appointment it applies to, the closed set of
+    // actions it permits, and two timestamps. There is deliberately no column
+    // for "who", because there is nobody -- the holder of the link is whoever
+    // has the link, and inventing an identity for them would be the kind of
+    // fiction an audit trail should not contain.
+    await this.sql.query(`
+      CREATE TABLE IF NOT EXISTS appointment_action_grants (
+        jti            text PRIMARY KEY,
+        appointment_id text NOT NULL REFERENCES appointments (id) ON DELETE CASCADE,
+        actions        text[] NOT NULL,
+        expires_at     timestamptz NOT NULL,
+        withdrawn_at   timestamptz,
+        CONSTRAINT appointment_action_grants_actions_check
+          CHECK (actions <@ ARRAY['reschedule', 'cancel']::text[])
+      )
+    `);
+
+    // `withdrawActionGrants` filters on exactly this, on every cancellation,
+    // and it is the statement that must not fall back to a scan once a clinic
+    // has issued a few thousand links.
+    await this.sql.query(`
+      CREATE INDEX IF NOT EXISTS appointment_action_grants_live_idx
+        ON appointment_action_grants (appointment_id)
+        WHERE withdrawn_at IS NULL
     `);
   }
 }
@@ -237,6 +369,82 @@ function toEnvelope(value: unknown): EncryptedEnvelope {
 
 const COLUMNS =
   "id, patient_info, status, conversation_ended, created_at, updated_at";
+
+const GRANT_COLUMNS =
+  "jti, appointment_id, actions, expires_at, withdrawn_at";
+
+interface ActionGrantRow {
+  jti: string;
+  appointment_id: string;
+  actions: string[];
+  expires_at: string;
+  withdrawn_at: string | null;
+}
+
+/**
+ * Rebuild a grant from a database row.
+ *
+ * Checked rather than cast, for the reason `toAppointment` checks its row: a
+ * capability row that does not parse must not be handed to a caller as a
+ * capability that permits something. In particular `actions` is validated
+ * against the closed set, because this is the row that *authorises* -- a
+ * capability list that had somehow been widened in the database would otherwise
+ * be honoured silently, which is the one direction of error this table exists
+ * to make impossible.
+ */
+export function toActionGrant(row: ActionGrantRow): ActionGrant {
+  if (typeof row.jti !== "string" || row.jti === "") {
+    throw new Error("appointment_action_grants row: jti is missing or not a string");
+  }
+
+  if (typeof row.appointment_id !== "string" || row.appointment_id === "") {
+    throw new Error("appointment_action_grants row: appointment_id is missing or not a string");
+  }
+
+  if (!Array.isArray(row.actions) || row.actions.length === 0) {
+    throw new Error("appointment_action_grants row: actions is not a non-empty array");
+  }
+
+  for (const action of row.actions) {
+    if (!isPatientAction(action)) {
+      throw new Error(
+        `appointment_action_grants row: action is not one of the known actions (got ${JSON.stringify(action)})`,
+      );
+    }
+  }
+
+  // Narrowed by the loop above, one element at a time, against the same closed
+  // set the column constraint enforces. Casting here records that the check
+  // already happened rather than skipping it.
+  const actions = row.actions as PatientAction[];
+
+  const withdrawnAt =
+    row.withdrawn_at === null || row.withdrawn_at === undefined
+      ? null
+      : toGrantDate(row.withdrawn_at, "withdrawn_at");
+
+  return {
+    jti: row.jti,
+    appointmentId: row.appointment_id,
+    actions: [...actions],
+    expiresAt: toGrantDate(row.expires_at, "expires_at"),
+    withdrawnAt,
+  };
+}
+
+function toGrantDate(value: unknown, column: string): Date {
+  if (typeof value !== "string" && typeof value !== "number") {
+    throw new Error(`appointment_action_grants row: ${column} is not a timestamp`);
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`appointment_action_grants row: ${column} is not a timestamp`);
+  }
+
+  return date;
+}
 
 interface AppointmentRow {
   id: string;

@@ -1,6 +1,7 @@
 import type { AppointmentRecord } from "@/lib/validation/intake";
 import {
   assertValidAppointmentPatch,
+  type ActionGrant,
   type Appointment,
   type AppointmentPatch,
   type AppointmentStore,
@@ -52,9 +53,71 @@ export class InMemoryAppointmentStore implements AppointmentStore {
     return this.update(id, { status: "cancelled" });
   }
 
+  /**
+   * The capability grants this process has handed out.
+   *
+   * A `Map`, and therefore exactly as per-instance as the appointments beside
+   * it: a link minted on one serverless instance resolves on none of the
+   * others. That is not a shortcut taken here, it is the documented reason
+   * `PostgresAppointmentStore` exists, and it applies to the grants identically.
+   */
+  private readonly grants = new Map<string, ActionGrant>();
+
+  async issueActionGrant(grant: ActionGrant): Promise<ActionGrant> {
+    const existing = this.grants.get(grant.jti);
+    if (existing) return cloneGrant(existing);
+
+    this.grants.set(grant.jti, cloneGrant(grant));
+    return cloneGrant(grant);
+  }
+
+  async getActionGrant(jti: string): Promise<ActionGrant | undefined> {
+    const found = this.grants.get(jti);
+    return found ? cloneGrant(found) : undefined;
+  }
+
+  /**
+   * Withdraw and return, in one step.
+   *
+   * The check and the write are adjacent statements inside one synchronous turn
+   * of the event loop with no `await` between them, which is what makes this
+   * atomic here for the same reason `INSERT ... ON CONFLICT DO NOTHING` is
+   * atomic there. Splitting it into a read and a write would leave a gap for
+   * two concurrent requests carrying the same link to both act on it.
+   */
+  async spendActionGrant(jti: string, now: Date): Promise<ActionGrant | undefined> {
+    const existing = this.grants.get(jti);
+    if (!existing) return undefined;
+    if (existing.withdrawnAt !== null) return undefined;
+    if (existing.expiresAt.getTime() <= now.getTime()) return undefined;
+
+    const spent: ActionGrant = { ...existing, withdrawnAt: new Date(now.getTime()) };
+    this.grants.set(jti, spent);
+    return cloneGrant(spent);
+  }
+
+  async withdrawActionGrants(appointmentId: string, now: Date): Promise<number> {
+    let withdrawn = 0;
+
+    for (const [jti, grant] of this.grants) {
+      if (grant.appointmentId !== appointmentId) continue;
+      if (grant.withdrawnAt !== null) continue;
+
+      this.grants.set(jti, { ...grant, withdrawnAt: new Date(now.getTime()) });
+      withdrawn += 1;
+    }
+
+    return withdrawn;
+  }
+
   /** Test seam. Not part of `AppointmentStore`. */
   get size(): number {
     return this.appointments.size;
+  }
+
+  /** Test seam. Not part of `AppointmentStore`. */
+  get grantCount(): number {
+    return this.grants.size;
   }
 }
 
@@ -85,5 +148,15 @@ export function clone(appointment: Appointment): Appointment {
     patientInfo: { ...appointment.patientInfo },
     createdAt: new Date(appointment.createdAt.getTime()),
     updatedAt: new Date(appointment.updatedAt.getTime()),
+  };
+}
+
+/** The same for a grant: hand out a copy so a caller cannot withdraw it in place. */
+export function cloneGrant(grant: ActionGrant): ActionGrant {
+  return {
+    ...grant,
+    actions: [...grant.actions],
+    expiresAt: new Date(grant.expiresAt.getTime()),
+    withdrawnAt: grant.withdrawnAt === null ? null : new Date(grant.withdrawnAt.getTime()),
   };
 }

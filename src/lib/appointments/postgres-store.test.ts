@@ -1,8 +1,8 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { SqlError, type SqlClient } from "@/lib/storage";
 import { encryptPHI, type EncryptedEnvelope } from "@/lib/encryption";
-import { PostgresAppointmentStore } from "./postgres-store";
-import type { Appointment } from "./store";
+import { PostgresAppointmentStore, toActionGrant } from "./postgres-store";
+import type { ActionGrant, Appointment } from "./store";
 import type { AppointmentRecord } from "../validation/intake";
 
 /**
@@ -35,6 +35,29 @@ const PATIENT: AppointmentRecord = {
 
 const CREATED_AT = "2026-09-01T10:00:00.000Z";
 const UPDATED_AT = "2026-09-02T11:30:00.000Z";
+const EXPIRES_AT = "2026-09-08T10:00:00.000Z";
+
+function grantRow(overrides: Record<string, unknown> = {}) {
+  return {
+    jti: "cap-1",
+    appointment_id: "a1",
+    actions: ["reschedule", "cancel"],
+    expires_at: EXPIRES_AT,
+    withdrawn_at: null,
+    ...overrides,
+  };
+}
+
+function grant(overrides: Partial<ActionGrant> = {}): ActionGrant {
+  return {
+    jti: "cap-1",
+    appointmentId: "a1",
+    actions: ["reschedule", "cancel"],
+    expiresAt: new Date(EXPIRES_AT),
+    withdrawnAt: null,
+    ...overrides,
+  };
+}
 
 // Set at module scope because the fixture rows are sealed records: what a row
 // holds is ciphertext, and building one needs a key. The "no key" tests below
@@ -111,7 +134,11 @@ function fakeDatabase(handlers: Record<string, Handler>): FakeDatabase {
 
       // Schema bootstrap: answered for every test so that adding a DDL statement
       // does not mean editing twenty handler maps.
-      if (statement.includes("CREATE TABLE") || statement.includes("COMMENT ON")) {
+      if (
+        statement.includes("CREATE TABLE") ||
+        statement.includes("CREATE INDEX") ||
+        statement.includes("COMMENT ON")
+      ) {
         return [];
       }
 
@@ -131,6 +158,10 @@ const handles = {
   get: (rows: unknown[]) => () => rows,
   update: (rows: unknown[]) => () => rows,
   cancel: (rows: unknown[]) => () => rows,
+  issueGrant: (rows: unknown[]) => () => rows,
+  getGrant: (rows: unknown[]) => () => rows,
+  spendGrant: (rows: unknown[]) => () => rows,
+  withdrawGrants: (rows: unknown[]) => () => rows,
 };
 
 describe("PostgresAppointmentStore", () => {
@@ -146,7 +177,10 @@ describe("PostgresAppointmentStore", () => {
     await store.create(appointment({ id: "a2" }));
     await store.get("a1");
 
-    const schemas = statements.filter((s) => s.sql.includes("CREATE TABLE"));
+    // Matched on the table name rather than on "CREATE TABLE", because the grants
+    // table added in #59 is created by the same one-shot bootstrap and would
+    // otherwise be counted as a second schema attempt.
+    const schemas = statements.filter((s) => s.sql.includes("CREATE TABLE IF NOT EXISTS appointments"));
     expect(schemas).toHaveLength(1);
   });
 
@@ -181,7 +215,9 @@ describe("PostgresAppointmentStore", () => {
     const store = new PostgresAppointmentStore(sql);
     await expect(store.get("a1")).rejects.toBeInstanceOf(SqlError);
     expect(await store.get("a1")).toEqual(appointment());
-    expect(statements.filter((s) => s.includes("CREATE TABLE"))).toHaveLength(2);
+    expect(
+      statements.filter((s) => s.includes("CREATE TABLE IF NOT EXISTS appointments")),
+    ).toHaveLength(2);
   });
 
   describe("create", () => {
@@ -484,6 +520,201 @@ describe("PHI at rest", () => {
     test("returns undefined for an id that is not there", async () => {
       const { sql } = fakeDatabase({ "CREATE TABLE": () => [], UPDATE: handles.cancel([]) });
       expect(await new PostgresAppointmentStore(sql).cancel("missing")).toBeUndefined();
+    });
+  });
+
+  // The capability grants of #59. The in-memory store in ./memory-store.test
+  // says what the rules are; these assert that the durable one expresses the
+  // same rules in SQL rather than in a comment.
+  describe("action grants", () => {
+    test("creates the grants table and its index alongside the appointments table", async () => {
+      const { sql, statements } = fakeDatabase({});
+
+      await new PostgresAppointmentStore(sql)
+        .getActionGrant("cap-1")
+        .catch(() => undefined);
+
+      const ddl = statements.filter((s) => s.sql.includes("CREATE")).map((s) => s.sql).join("\n");
+      expect(ddl).toContain("CREATE TABLE IF NOT EXISTS appointment_action_grants");
+      expect(ddl).toContain("appointment_action_grants_actions_check");
+      expect(ddl).toContain("CREATE INDEX IF NOT EXISTS appointment_action_grants_live_idx");
+    });
+
+    test("declares the capability check against the same closed set as the application", async () => {
+      const { sql, statements } = fakeDatabase({});
+
+      await new PostgresAppointmentStore(sql).issueActionGrant(grant()).catch(() => undefined);
+
+      const ddl = statements.find((s) => s.sql.includes("appointment_action_grants"))!.sql;
+      // The database is the second line of defence for PATIENT_ACTIONS, exactly
+      // as appointments_status_check is for APPOINTMENT_STATUSES: an
+      // authorisation that can be bypassed with psql is not one.
+      expect(ddl).toContain("CHECK (actions <@ ARRAY['reschedule', 'cancel']::text[])");
+      expect(ddl).toContain("ON DELETE CASCADE");
+    });
+
+    test("binds every value, and puts no part of the grant into the statement text", async () => {
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_action_grants": handles.issueGrant([grantRow()]),
+      });
+
+      await new PostgresAppointmentStore(sql).issueActionGrant(grant({ jti: "cap-1' OR '1'='1" }));
+
+      const insert = statements.find((s) => s.sql.includes("INSERT INTO appointment_action_grants"))!;
+      expect(insert.params).toEqual(["cap-1' OR '1'='1", "a1", "{reschedule,cancel}", EXPIRES_AT]);
+      expect(insert.sql).not.toContain("OR '1'='1");
+    });
+
+    test("conflicts rather than overwrites, so a re-mint cannot un-spend a grant", async () => {
+      const { sql, statements } = fakeDatabase({
+        "INSERT INTO appointment_action_grants": handles.issueGrant([]),
+        "FROM appointment_action_grants": handles.getGrant([
+          grantRow({ withdrawn_at: "2026-09-02T10:00:00.000Z" }),
+        ]),
+      });
+      const store = new PostgresAppointmentStore(sql);
+
+      const reissued = await store.issueActionGrant(grant());
+
+      expect(reissued.withdrawnAt).toEqual(new Date("2026-09-02T10:00:00.000Z"));
+      const insert = statements.find((s) => s.sql.includes("INSERT INTO appointment_action_grants"))!;
+      expect(insert.sql).toContain("ON CONFLICT (jti) DO NOTHING");
+      expect(insert.sql).not.toContain("DO UPDATE");
+    });
+
+    test("throws rather than inventing a grant that conflicts with nothing readable", async () => {
+      // The row was deleted between the conflict and the follow-up read, which is
+      // what deleting an appointment does. A phantom grant would authorise a
+      // capability nobody issued.
+      const { sql } = fakeDatabase({
+        "INSERT INTO appointment_action_grants": handles.issueGrant([]),
+        "FROM appointment_action_grants": handles.getGrant([]),
+      });
+
+      await expect(new PostgresAppointmentStore(sql).issueActionGrant(grant())).rejects.toBeInstanceOf(
+        SqlError,
+      );
+    });
+
+    test("gets a grant by jti", async () => {
+      const { sql, statements } = fakeDatabase({
+        "FROM appointment_action_grants": handles.getGrant([grantRow()]),
+      });
+
+      expect(await new PostgresAppointmentStore(sql).getActionGrant("cap-1")).toEqual(grant());
+
+      const select = statements.find((s) => s.sql.includes("FROM appointment_action_grants"))!;
+      expect(select.params).toEqual(["cap-1"]);
+    });
+
+    test("returns undefined for a jti that was never issued", async () => {
+      const { sql } = fakeDatabase({ "FROM appointment_action_grants": handles.getGrant([]) });
+
+      expect(await new PostgresAppointmentStore(sql).getActionGrant("cap-1")).toBeUndefined();
+    });
+
+    describe("spendActionGrant", () => {
+      test("tests and sets in one statement, which is where the atomicity lives", async () => {
+        // Two requests carrying the same link must not both match this row.
+        // `UPDATE ... WHERE withdrawn_at IS NULL AND expires_at > $2 RETURNING`
+        // is a single compare-and-set: the loser blocks on the row lock and then
+        // finds the column already set. A read followed by a write would have a
+        // window in it.
+        const { sql, statements } = fakeDatabase({
+          "SET withdrawn_at = $3": handles.spendGrant([
+            grantRow({ withdrawn_at: "2026-09-02T10:00:00.000Z" }),
+          ]),
+        });
+        const now = new Date("2026-09-02T10:00:00.000Z");
+
+        const spent = await new PostgresAppointmentStore(sql).spendActionGrant("cap-1", now);
+
+        expect(spent!.withdrawnAt).toEqual(now);
+        const update = statements.find((s) => s.sql.includes("SET withdrawn_at = $3"))!;
+        expect(update.sql).toContain("WHERE jti = $1");
+        expect(update.sql).toContain("AND withdrawn_at IS NULL");
+        expect(update.sql).toContain("AND expires_at > $2");
+        expect(update.sql).toContain("RETURNING");
+        expect(update.params).toEqual(["cap-1", now.toISOString(), now.toISOString()]);
+      });
+
+      test("refuses an expired grant in the same statement", async () => {
+        const { sql } = fakeDatabase({ "SET withdrawn_at = $3": handles.spendGrant([]) });
+        const store = new PostgresAppointmentStore(sql);
+
+        expect(
+          await store.spendActionGrant("cap-1", new Date(EXPIRES_AT)),
+        ).toBeUndefined();
+        expect(
+          await store.spendActionGrant("cap-1", new Date("2026-09-09T00:00:00.000Z")),
+        ).toBeUndefined();
+      });
+
+      test("refuses one that was never issued, and one already spent, identically", async () => {
+        const { sql } = fakeDatabase({ "SET withdrawn_at = $3": handles.spendGrant([]) });
+
+        expect(await new PostgresAppointmentStore(sql).spendActionGrant("cap-1", new Date())).toBeUndefined();
+      });
+    });
+
+    test("withdraws every live grant for an appointment and counts the rows it touched", async () => {
+      const { sql, statements } = fakeDatabase({
+        "SET withdrawn_at = $2": handles.withdrawGrants([{ jti: "cap-1" }, { jti: "cap-2" }]),
+      });
+      const now = new Date("2026-09-02T10:00:00.000Z");
+
+      expect(await new PostgresAppointmentStore(sql).withdrawActionGrants("a1", now)).toBe(2);
+
+      const update = statements.find((s) => s.sql.includes("SET withdrawn_at = $2"))!;
+      // Only live rows, so a second cancellation counts zero and does not move
+      // the timestamp of a grant that was spent yesterday.
+      expect(update.sql).toContain("WHERE appointment_id = $1");
+      expect(update.sql).toContain("AND withdrawn_at IS NULL");
+      expect(update.params).toEqual(["a1", now.toISOString()]);
+    });
+
+    test("returns zero for an appointment with no live grants", async () => {
+      const { sql } = fakeDatabase({ "SET withdrawn_at = $2": handles.withdrawGrants([]) });
+
+      expect(await new PostgresAppointmentStore(sql).withdrawActionGrants("a1", new Date())).toBe(0);
+    });
+  });
+
+  // A grant row that does not parse must not be handed to a caller as one that
+  // permits something. `toActionGrant` is the only place a stored capability
+  // becomes a live one.
+  describe("toActionGrant", () => {
+    test("rebuilds a grant from a row", () => {
+      expect(toActionGrant(grantRow())).toEqual(grant());
+    });
+
+    test("rebuilds one that has been withdrawn", () => {
+      expect(
+        toActionGrant(grantRow({ withdrawn_at: "2026-09-02T10:00:00.000Z" })).withdrawnAt,
+      ).toEqual(new Date("2026-09-02T10:00:00.000Z"));
+    });
+
+    test("copies the capability array rather than aliasing the row's", () => {
+      const row = grantRow();
+      const rebuilt = toActionGrant(row);
+
+      rebuilt.actions.push("cancel");
+
+      expect(row.actions).toEqual(["reschedule", "cancel"]);
+    });
+
+    test.each([
+      ["a capability outside the closed set", { actions: ["delete_everything"] }, /not one of the known actions/],
+      ["an empty capability set", { actions: [] }, /non-empty array/],
+      ["a capability list that is not an array", { actions: "reschedule" }, /non-empty array/],
+      ["a missing jti", { jti: "" }, /jti is missing/],
+      ["a missing appointment id", { appointment_id: "" }, /appointment_id is missing/],
+      ["an unparseable expiry", { expires_at: "not a date" }, /expires_at is not a timestamp/],
+      ["an unparseable withdrawal", { withdrawn_at: "not a date" }, /withdrawn_at is not a timestamp/],
+    ])("throws rather than returning a grant it cannot vouch for: %s", (_label, overrides, message) => {
+      // The whole point of this table: a capability that comes back wrong is a
+      // capability that authorises something the issuing side never agreed to.
+      expect(() => toActionGrant(grantRow(overrides))).toThrow(message);
     });
   });
 });

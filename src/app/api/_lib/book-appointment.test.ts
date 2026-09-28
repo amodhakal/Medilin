@@ -1,5 +1,10 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { InMemoryAuditLogStore, setAuditLogStore } from "@/lib/audit";
+import {
+  InMemoryAppointmentStore,
+  setAppointmentStore,
+  spendPatientAction,
+} from "@/lib/appointments";
 import { resetServerEnvCache } from "@/lib/env";
 import { setLlmClient } from "@/lib/gemini";
 import type { IntakeFormData } from "@/lib/validation/intake";
@@ -82,6 +87,9 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = realFetch;
   setLlmClient(null);
+  // A test below installs a store whose grant write fails. Left in place it would
+  // break every booking after it.
+  setAppointmentStore(null);
 });
 
 afterAll(() => {
@@ -210,5 +218,110 @@ describe("bookAppointment", () => {
       /could not be reached/,
     );
     expect(emails).toEqual([]);
+  });
+});
+
+/**
+ * A store that is a real one, except that the grant write fails.
+ *
+ * Shadowed on the instance rather than spread onto a literal: a class's methods
+ * live on its prototype, so `{ ...new InMemoryAppointmentStore() }` is an object
+ * with no `create` on it at all, and the failure lands somewhere unrelated.
+ */
+function storeThatCannotGrant(): InMemoryAppointmentStore {
+  const store = new InMemoryAppointmentStore();
+  store.issueActionGrant = async () => {
+    throw new Error("the database could not be reached");
+  };
+  return store;
+}
+
+/**
+ * The management link handed to a patient at booking (#59).
+ *
+ * Minted here because this is the only moment there is both a record to mint one
+ * for and an inbox to put it in. Two things are asserted that are really about
+ * ordering: the link is minted *before* the confirmation is sent, so the email
+ * that says "here is your appointment" also says "here is how to change it", and
+ * a failure to mint does not take the booking down with it.
+ */
+describe("booking a management link", () => {
+  test("mints one, and returns it", async () => {
+    const booking = await bookAppointment(submission, "https://clinic.test");
+
+    expect(booking.manageUrl).toMatch(/^https:\/\/clinic\.test\/reschedule\//);
+  });
+
+  test("puts it in the confirmation, so the patient has it in their inbox", async () => {
+    // The payload the LLM is asked to render *is* the email, so the link has to be
+    // in what it was given. Captured from the prompt rather than from the
+    // rendered body, which this suite stubs.
+    let prompt = "";
+    setLlmClient({
+      async generateJson({ prompt: sent }) {
+        if (sent.includes("medical intake form translator")) {
+          return { additionalInfo: "headache", medical_department: "Doctor" };
+        }
+        prompt = sent;
+        return { subject: "Su cita", body: "<p>Martes 09:30</p>" };
+      },
+    });
+
+    await bookAppointment(submission, "https://clinic.test");
+
+    expect(prompt).toContain("/reschedule/");
+  });
+
+  test("is a working link, not just a string", async () => {
+    const booking = await bookAppointment(submission, "https://clinic.test");
+
+    const token = booking.manageUrl!.split("/reschedule/")[1];
+    const spent = await spendPatientAction(token, "reschedule");
+
+    expect(spent.ok).toBe(true);
+  });
+
+  test("a root-relative booking gets a root-relative link", async () => {
+    // A server action has no trustworthy absolute origin, so it passes an empty
+    // one and every URL this builds has to resolve against wherever the patient
+    // actually is.
+    const booking = await bookAppointment(submission, "");
+
+    expect(booking.spectateUrl).toMatch(/^\/spectate\//);
+    expect(booking.manageUrl).toMatch(/^\/reschedule\//);
+  });
+
+  test("does not fail the booking when the link cannot be minted", async () => {
+    // The appointment exists and the confirmation is on its way. The cost of
+    // having no link is a patient who telephones, which is what happened to all of
+    // them before this branch. Failing the booking instead would trade a working
+    // appointment for a working link.
+    setAppointmentStore(storeThatCannotGrant());
+
+    const booking = await bookAppointment(submission, "https://clinic.test");
+
+    expect(booking.appointmentId).toBeTruthy();
+    expect(booking.manageUrl).toBeNull();
+    expect(emails).toHaveLength(1);
+  });
+
+  test("leaves the field out of the email entirely when there is no link", async () => {
+    // A `null` in a confirmation body is a broken link in an inbox. An absent
+    // field is not there to be clicked.
+    setAppointmentStore(storeThatCannotGrant());
+    let payload = "";
+    setLlmClient({
+      async generateJson({ prompt }) {
+        if (prompt.includes("medical intake form translator")) {
+          return { additionalInfo: "headache", medical_department: "Doctor" };
+        }
+        payload = prompt;
+        return { subject: "Su cita", body: "<p>Listo</p>" };
+      },
+    });
+
+    await bookAppointment(submission, "https://clinic.test");
+
+    expect(payload).not.toContain("manageUrl");
   });
 });

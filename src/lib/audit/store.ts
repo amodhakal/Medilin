@@ -44,6 +44,12 @@ export const AUDIT_REASONS = [
   "track_link",
   "internal_api",
   "status_change",
+  // #59. A patient changing their own appointment through a scoped, expiring,
+  // revocable link. Distinct from `track_link` on purpose: that is a read of a
+  // record, and this is a write to one, made by whoever holds the link. An
+  // auditor asking "who cancelled this?" should not have to answer "someone
+  // with a bearer token, and the trail does not say which kind".
+  "patient_link",
 ] as const;
 
 export type AuditReason = (typeof AUDIT_REASONS)[number];
@@ -68,6 +74,15 @@ export const AUDIT_ACTIONS = [
   "APPOINTMENT_UPDATED",
   "APPOINTMENT_CANCELLED",
   "PHI_READ",
+  // #59. A patient action through a management link that was refused: expired,
+  // already used, withdrawn by a cancellation, or asking for something the link
+  // does not grant. Its own action rather than a note on another one, because a
+  // trail is append-only and calling a refused attempt an update would put a
+  // change into the log that never happened. Most requests carrying a
+  // management link are refusals, and a trail with only the successes answers
+  // "who cancelled this?" with no account of the twenty failed attempts on the
+  // same record that week.
+  "APPOINTMENT_ACTION_REFUSED",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -85,6 +100,17 @@ export const AUDIT_ACTORS = {
   patient: "patient:web",
   /** Whoever holds a link to a record, with no account behind it. */
   linkBearer: "link-bearer",
+  /**
+   * A patient acting on their own record through a management link (#59).
+   *
+   * Separate from `linkBearer` because the trail can now tell them apart, and
+   * that is the whole point of #59: the management link is scoped, expiring and
+   * revocable, so an entry that says `patient:link` is a *write* by whoever
+   * holds that link, where `link-bearer` is a *read* by whoever holds the
+   * tracking one. It is still a bearer credential -- there is no account behind
+   * either -- and the actor says which link, not who the person is.
+   */
+  patientLink: "patient:link",
   /** A caller holding the internal shared secret. */
   internalApi: "internal-api",
   /** The booking pipeline recording on its own behalf. */
