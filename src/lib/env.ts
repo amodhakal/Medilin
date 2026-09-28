@@ -48,6 +48,14 @@ const serverEnvSchema = z.object({
 
   // Optional capabilities
   ELEVENLABS_API_KEY: z.string().min(1).optional(),
+  // Postgres for the durable appointment store (#17). Optional in the sense
+  // that matters here: unset does not fail the boot, it selects the in-memory
+  // store, which is per-instance and does not survive a serverless cold start. A
+  // production deployment that leaves this unset is still losing bookings; the
+  // schema only decides whether a *durable* store is available to lose them in.
+  //
+  // Must be an http(s) Postgres HTTP endpoint, not a postgres:// socket URL.
+  // See src/lib/storage.ts.
   DATABASE_URL: z.string().min(1).optional(),
   SENTRY_DSN: z.string().min(1).optional(),
   CRON_SECRET: z.string().min(1).optional(),

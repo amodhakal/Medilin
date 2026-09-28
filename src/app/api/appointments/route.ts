@@ -20,6 +20,11 @@ import { logInfo } from "@/lib/logger";
  * between a caller and that record: uuidv4 is unguessable, not secret, and the
  * ids are handed out in booking responses. The spectate page does not use this
  * -- it reads a sealed token -- so nothing in the app depends on it being open.
+ *
+ * The response is the whole appointment, which now includes `status` and
+ * `updatedAt` as well as the record. That is the status lookup: an id, the
+ * state it is in, and when it last changed, and none of it requires a second
+ * endpoint to be added later.
  */
 export { handleBooking as POST } from "../_lib/handle-booking";
 
@@ -34,7 +39,10 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "id is required" }, { status: 400 });
   }
 
-  const appointment = getAppointment(id);
+  // Awaited rather than read synchronously: a durable store is a network round
+  // trip, and a synchronous signature over one would either block the event
+  // loop or hide the await behind a promise nobody checks.
+  const appointment = await getAppointment(id);
 
   if (!appointment) {
     return NextResponse.json({ error: "Appointment not found" }, { status: 404 });

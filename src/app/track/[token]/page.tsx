@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getClinicName } from "@/config";
-import { openRecord } from "@/lib/phi-token";
+import { resolveRecord } from "@/lib/phi-token";
 import { formatRequestedAt, toTrackSummary } from "./summary";
 import { TimeUntil } from "./TimeUntil";
 
@@ -10,10 +10,11 @@ import { TimeUntil } from "./TimeUntil";
  * The public appointment page.
  *
  * Reached by link, and the link is the whole of the authorisation: the route
- * segment is the sealed record from src/lib/phi-token, so opening it needs
- * HIPAA_MASTER_KEY, which never leaves the server. There is no session, no
- * email confirmation step, and no identifier to guess — the token is 256 bits
- * of authenticated ciphertext, so this cannot be enumerated.
+ * segment is a token from src/lib/phi-token -- the record sealed under the
+ * server-side key, or a short reference to the record in the store -- so
+ * opening it needs HIPAA_MASTER_KEY or a database, neither of which ever leaves
+ * the server. There is no session, no email confirmation step, and no identifier
+ * to guess.
  *
  * The reason it is worth having separately from `/spectate/[id]` is that the
  * two answer different questions to different people. The spectate link is
@@ -26,6 +27,12 @@ import { TimeUntil } from "./TimeUntil";
  * A token is a bearer credential to an encrypted patient record, so writing one
  * to a log puts the log — and whatever third party is collecting it — one step
  * from a name, a date of birth, and a symptom description.
+ *
+ * The reference form of the token is a uuid rather than 256 bits of
+ * authenticated ciphertext, so it is shorter and it is not tamper-evident; what
+ * it gains is that the record is not in the URL at all, and that a link can be
+ * withdrawn by deleting what it points at. Enumeration is not the risk either
+ * way: it is 122 bits of uuidv4 against a link nobody would guess.
  */
 
 export const metadata: Metadata = {
@@ -73,7 +80,7 @@ export const revalidate = 0;
 export default async function TrackPage({ params }: { params: Promise<{ token: string }> }) {
   const { token } = await params;
 
-  const plaintext = openRecord(token);
+  const plaintext = await resolveRecord(token);
   if (!plaintext) {
     // Truncated, tampered, sealed under a different key, or from an older
     // version. Deliberately indistinguishable to the caller, and deliberately

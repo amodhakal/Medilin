@@ -3,7 +3,7 @@ import "server-only";
 import { getClinicName } from "@/config";
 import { createAppointment } from "@/lib/appointments";
 import { logError, logInfo } from "@/lib/logger";
-import { sealRecord } from "@/lib/phi-token";
+import { sealForDelivery } from "@/lib/phi-token";
 import { translateToEnglish } from "@/lib/translateToEnglish";
 import type { IntakeFormData } from "@/lib/validation/intake";
 import { ConfirmationDeliveryError, deliverConfirmation } from "./deliver-confirmation";
@@ -47,13 +47,16 @@ export async function bookAppointment(
   const translatedData = await translateToEnglish(data, sourceLanguage);
   logInfo("intake.translated", { language: sourceLanguage });
 
-  const appointment = createAppointment(translatedData);
+  const appointment = await createAppointment(translatedData);
 
   // Was `?patientInfo=${encodeURIComponent(JSON.stringify(translatedData))}`,
-  // which put the whole record in the URL. The token is the record,
-  // encrypted: opaque in a log or a history entry, and openable only with
-  // the server-side key.
-  const token = sealRecord(JSON.stringify(translatedData));
+  // which put the whole record in the URL. Neither of the two tokens that
+  // replaced it puts a record in a URL: with a durable store the link carries a
+  // short reference and the record is read back server-side, and without one it
+  // carries the record sealed under a single key, which is what keeps the link
+  // working across serverless instances. Which of the two depends on the store,
+  // and the decision belongs to sealForDelivery rather than to this call site.
+  const token = sealForDelivery(JSON.stringify(translatedData), appointment.id);
   const spectateUrl = `${origin}/spectate/${token}`;
 
   logInfo("intake.session_url_created", { appointmentId: appointment.id });
