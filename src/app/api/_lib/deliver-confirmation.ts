@@ -5,11 +5,19 @@ import { getEmailFrom } from "@/config";
 import { getServerEnv } from "@/lib/env";
 import { logError, logInfo } from "@/lib/logger";
 import { translateFromEnglish } from "@/lib/translateFromEnglish";
+import {
+  messagingChannels,
+  notifyChannels,
+  parseBookingRecord,
+  type ChannelReports,
+  type NotificationChannel,
+  type NotificationRequest,
+} from "@/lib/twilio/notification";
 import type { SupportedLanguage } from "@/lib/validation/intake";
 import { buildAppointmentIcs, buildIcsEvent, parseAppointmentDetails } from "./ics";
 
 /**
- * Sending the patient's confirmation email.
+ * Sending the patient their confirmation.
  *
  * The booking path used to reach this by `fetch`ing its own `/api/webhook`,
  * with the origin built from the request. That is the same self-call #43 removed
@@ -25,6 +33,18 @@ import { buildAppointmentIcs, buildIcsEvent, parseAppointmentDetails } from "./i
  * "the email did not go out", and a function that signals that by throwing
  * pushes every caller into a try/catch that mostly forgets to check, which is
  * how the status of this call went unchecked in the first place.
+ *
+ * The channels are values, not branches (#60). Sending by SMS and WhatsApp too
+ * is the same call the booking path already makes, with the transports behind
+ * @/lib/twilio/notification; what that module contributes here is a per-channel
+ * report, and the guarantee that a text message carries none of the appointment
+ * record the email carries.
+ *
+ * What has not changed is the promise. The email is still the channel whose
+ * failure means the patient was not told, and `ok` still answers to the email
+ * alone: a deployment with no TWILIO_* variables sends exactly one message
+ * through exactly one code path, and one that is refused a text is a delivery
+ * that succeeded.
  */
 
 export interface ConfirmationRequest {
@@ -49,8 +69,8 @@ export interface ConfirmationRequest {
 }
 
 export type DeliveryResult =
-  | { ok: true; subject: string }
-  | { ok: false; reason: DeliveryFailure };
+  | { ok: true; subject: string; channels: ChannelReports }
+  | { ok: false; reason: DeliveryFailure; channels: ChannelReports };
 
 export type DeliveryFailure = "translation_failed" | "email_failed";
 
@@ -81,6 +101,96 @@ export class ConfirmationDeliveryError extends Error {
   }
 }
 
+/** A file sent alongside the email, as Resend's attachment shape. */
+interface EmailAttachment {
+  filename: string;
+  content: Buffer;
+  contentType: string;
+}
+
+/**
+ * The calendar invite (#58), built outside the channel and handed in.
+ *
+ * A hand-rolled VCALENDAR attached as `appointment.ics`, so the patient can add
+ * the negotiated slot to their diary straight from the email. Built after
+ * translation so a broken invite can never fail the delivery: no invite means
+ * "send without the attachment", never "do not send".
+ */
+function buildConfirmationAttachments(
+  request: ConfirmationRequest,
+): EmailAttachment[] | undefined {
+  try {
+    const ics = request.appointment
+      ? buildIcsEvent({
+          startIso: request.appointment.startIso,
+          durationMinutes: request.appointment.durationMinutes,
+          summary: request.appointment.summary ?? "Medical appointment",
+          description: request.appointment.description,
+        })
+      : (() => {
+          const details = parseAppointmentDetails(request.info);
+          return details ? buildAppointmentIcs(details) : null;
+        })();
+
+    if (!ics) return undefined;
+
+    return [
+      {
+        filename: "appointment.ics",
+        content: Buffer.from(ics, "utf-8"),
+        contentType: "text/calendar; method=PUBLISH",
+      },
+    ];
+  } catch (error) {
+    logError("webhook.ics_failed", error, { language: request.language });
+    return undefined;
+  }
+}
+
+/**
+ * The email, as a channel.
+ *
+ * A value rather than a `try` block in the middle of a function, so that
+ * adding a transport is adding a line to a list. The reporting is the old
+ * reporting, unchanged: Resend returns failures as values and throws for the
+ * rest, and both are "not sent" with the same reason and the same log line.
+ */
+function emailChannel(attachments?: EmailAttachment[]): NotificationChannel {
+  return {
+    id: "email",
+    isConfigured: () => true,
+    async send({ email, language }: NotificationRequest) {
+      const subject = email.subject;
+      const body = email.body;
+
+      try {
+        const resend = new Resend(getServerEnv().RESEND_KEY);
+
+        const { error } = await resend.emails.send({
+          from: getEmailFrom(),
+          to: [email.to],
+          subject,
+          html: body,
+          ...(attachments ? { attachments } : {}),
+        });
+
+        if (error) {
+          logError("webhook.resend_failed", error, { language });
+          return { status: "failed", reason: "email_failed" };
+        }
+      } catch (error) {
+        // A thrown SDK error rather than a returned one: a missing key, or the
+        // network being gone. Resend returns failures as values and throws for
+        // the rest, and both are "not sent".
+        logError("webhook.resend_threw", error, { language });
+        return { status: "failed", reason: "email_failed" };
+      }
+
+      return { status: "sent" };
+    },
+  };
+}
+
 /**
  * Translate the confirmation and send it.
  *
@@ -101,66 +211,32 @@ export async function deliverConfirmation(
     ));
   } catch (error) {
     logError("webhook.translation_failed", error, { language: request.language });
-    return { ok: false, reason: "translation_failed" };
+    return { ok: false, reason: "translation_failed", channels: {} };
   }
 
-  try {
-    const resend = new Resend(getServerEnv().RESEND_KEY);
+  const channels = await notifyChannels(
+    [emailChannel(buildConfirmationAttachments(request)), ...messagingChannels()],
+    {
+      email: { to: request.email, subject, body },
+      // Read once, here, so that every channel is reading the same parse of
+      // the same string. A record that is not an object is passed on as null
+      // and the messaging channels have nothing to address, rather than a
+      // channel inventing its own reading of it.
+      record: parseBookingRecord(request.info),
+      language: request.language,
+    },
+  );
 
-    // The calendar invite (#58): a hand-rolled VCALENDAR attached as
-    // `appointment.ics`, so the patient can add the negotiated slot to their
-    // diary straight from the email. Built after translation so a broken
-    // invite can never fail the delivery: no invite means "send without the
-    // attachment", never "do not send".
-    let attachments:
-      | { filename: string; content: Buffer; contentType: string }[]
-      | undefined;
-    try {
-      const ics = request.appointment
-        ? buildIcsEvent({
-            startIso: request.appointment.startIso,
-            durationMinutes: request.appointment.durationMinutes,
-            summary: request.appointment.summary ?? "Medical appointment",
-            description: request.appointment.description,
-          })
-        : (() => {
-            const details = parseAppointmentDetails(request.info);
-            return details ? buildAppointmentIcs(details) : null;
-          })();
-      if (ics) {
-        attachments = [
-          {
-            filename: "appointment.ics",
-            content: Buffer.from(ics, "utf-8"),
-            contentType: "text/calendar; method=PUBLISH",
-          },
-        ];
-      }
-    } catch (error) {
-      logError("webhook.ics_failed", error, { language: request.language });
-    }
-
-    const { error } = await resend.emails.send({
-      from: getEmailFrom(),
-      to: [request.email],
-      subject,
-      html: body,
-      ...(attachments ? { attachments } : {}),
-    });
-
-    if (error) {
-      logError("webhook.resend_failed", error, { language: request.language });
-      return { ok: false, reason: "email_failed" };
-    }
-  } catch (error) {
-    // A thrown SDK error rather than a returned one: a missing key, or the
-    // network being gone. Resend returns failures as values and throws for the
-    // rest, and both are "not sent".
-    logError("webhook.resend_threw", error, { language: request.language });
-    return { ok: false, reason: "email_failed" };
+  // The email decides, as it always has. A text message is a second way to
+  // reach a patient who has already been reached, so its failure is reported
+  // and logged rather than escalated into "the confirmation did not go out" --
+  // the booking path would throw on that, and a patient holding the email would
+  // be told to contact the clinic about an appointment that was confirmed.
+  if (channels.email?.status !== "sent") {
+    return { ok: false, reason: "email_failed", channels };
   }
 
   logInfo("webhook.sent", { language: request.language });
 
-  return { ok: true, subject };
+  return { ok: true, subject, channels };
 }
