@@ -5,7 +5,7 @@ import { useMemo } from "react";
 import { useAgentRelay } from "@/hooks/useAgentRelay";
 import { AgentCard } from "@/components/spectate/AgentCard";
 import { CallControls } from "@/components/spectate/CallControls";
-import { ConnectionNotice, SessionBadge } from "@/components/spectate/SessionStatus";
+import { SessionBadge, SessionNotice } from "@/components/spectate/SessionStatus";
 import { PatientProfile } from "@/components/spectate/PatientProfile";
 import { Transcript } from "@/components/spectate/Transcript";
 
@@ -95,7 +95,22 @@ export default function SpectateClient({
     patientDynamicVariables,
   });
 
-  const { phase, error, notice, transcript, speaking, currentText, socket } = state;
+  const { phase, error, notice, transcript, speaking, currentText, socket, stalled, awaiting } =
+    state;
+
+  /**
+   * What a card says when it has nothing on it.
+   *
+   * The relay knows which side owes it a reply, so the card says that rather
+   * than a flat "Listening". Watching a demo stall, the operator can see
+   * whether it is waiting on the patient agent or the receptionist instead of
+   * guessing from two identical cards.
+   */
+  const idleHint = (side: "patient" | "receptionist"): string => {
+    if (phase === "idle") return "Waiting to connect";
+    if (awaiting === side) return "Owes a reply";
+    return "Listening";
+  };
 
   if (error) {
     return (
@@ -142,8 +157,13 @@ export default function SpectateClient({
           <SessionBadge phase={phase} />
         </header>
 
-        {phase === "degraded" && notice && (
-          <ConnectionNotice notice={notice} onDismiss={stop} socket={socket} />
+        {notice && (phase === "degraded" || stalled) && (
+          <SessionNotice
+            notice={notice}
+            stalled={stalled && phase !== "degraded"}
+            socket={socket}
+            onDismiss={stop}
+          />
         )}
 
         <PatientProfile patient={patient} />
@@ -156,7 +176,7 @@ export default function SpectateClient({
             status={socket.patient}
             speaking={speaking.patient}
             currentText={currentText.patient}
-            idleHint={phase === "idle" ? "Waiting to connect" : "Listening"}
+            idleHint={idleHint("patient")}
           />
           <AgentCard
             side="receptionist"
@@ -165,7 +185,7 @@ export default function SpectateClient({
             status={socket.receptionist}
             speaking={speaking.receptionist}
             currentText={currentText.receptionist}
-            idleHint={phase === "idle" ? "Waiting to connect" : "Ready to respond"}
+            idleHint={idleHint("receptionist")}
           />
         </div>
 

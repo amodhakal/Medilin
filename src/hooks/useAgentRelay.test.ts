@@ -22,10 +22,19 @@ import {
 /* Fakes                                                                       */
 /* -------------------------------------------------------------------------- */
 
+const EPOCH = 1_700_000_000_000;
+
 class FakeClock implements RelayClock {
   private nextHandle = 1;
   private readonly due = new Map<number, { at: number; fn: () => void }>();
-  private current = 0;
+
+  /**
+   * Starts at a fixed instant rather than zero so transcript timestamps look
+   * like timestamps, and advances with the timers. The relay's give-up logic
+   * measures elapsed real time through `now`, so a clock that never moves
+   * would make "we waited long enough" untestable.
+   */
+  private current = EPOCH;
 
   setTimeout(fn: () => void, ms: number): number {
     const handle = this.nextHandle++;
@@ -56,6 +65,10 @@ class FakeClock implements RelayClock {
 
   get pending(): number {
     return this.due.size;
+  }
+
+  now(): number {
+    return this.current;
   }
 }
 
@@ -149,7 +162,7 @@ function makeRelay(overrides: Partial<AgentRelayConfig> = {}): Harness {
     receptionistOpeningContext: "You are the receptionist.",
     createSocket,
     clock,
-    now: () => 1_700_000_000_000,
+    now: () => clock.now(),
     log: (level, message, fields) => {
       logs.push({ level, message, fields });
     },
@@ -517,14 +530,14 @@ describe("turn taking", () => {
     expect(transcript[0]?.at).toBe(1_700_000_000_000);
   });
 
-  test("does not send the same line to a side that is already answering", () => {
+  test("hands on the most recent line when a side speaks twice, once", () => {
     const harness = makeRelay();
     harness.openBoth();
 
-    // The patient speaks twice before the hold elapses. The second hold sees
-    // the flag already set and stays quiet, so the receptionist gets one line,
-    // not two. This is the "no duplicate transcripts" property the flags buy,
-    // and #25 has to keep it.
+    // The old code scheduled one 2500ms timer per response and cancelled
+    // none of them, so two lines produced two handoffs and two identical
+    // relays. The hold is re-armed per utterance now, so the second line owns
+    // the floor and the first line's timer is gone.
     harness.sockets.patient.emitFrame({
       type: "agent_response",
       agent_response_event: { agent_response: "first" },
@@ -537,7 +550,344 @@ describe("turn taking", () => {
 
     const relayed = harness.sockets.receptionist.ofType("user_message");
     expect(relayed).toHaveLength(1);
-    expect(relayed[0]?.text).toBe("first");
+    expect(relayed[0]?.text).toBe("second");
+  });
+
+  test("does not let an earlier line's hold blank a later one off the card", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "first" },
+    });
+    harness.clock.advance(2_400);
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "second" },
+    });
+    harness.clock.advance(100); // the first line's hold would fire here
+
+    const state = harness.relay.getState();
+    expect(state.currentText.patient).toBe("second");
+    expect(state.speaking.patient).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Streaming                                                                   */
+/* -------------------------------------------------------------------------- */
+
+describe("streamed utterances", () => {
+  const partial = (text: string) => ({
+    type: "agent_response",
+    agent_response_event: { agent_response: text, is_final_response: false },
+  });
+  const final = (text: string) => ({
+    type: "agent_response",
+    agent_response_event: { agent_response: text, is_final_response: true },
+  });
+
+  test("revises one transcript entry across a run of partials", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame(partial("I need"));
+    harness.sockets.patient.emitFrame(partial("I need a"));
+    harness.sockets.patient.emitFrame(partial("I need a dentist"));
+    harness.sockets.patient.emitFrame(final("I need a dentist"));
+
+    const transcript = harness.relay.getState().transcript;
+    // One line, not four. Appending each partial is what made overlapping
+    // streamed transcripts duplicate and interleave.
+    expect(transcript).toHaveLength(1);
+    expect(transcript[0]?.text).toBe("I need a dentist");
+    expect(transcript[0]?.finalized).toBe(true);
+  });
+
+  test("does not hand a partial on before the utterance is finished", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame(partial("I need"));
+    harness.clock.advance(1_500);
+    expect(harness.sockets.receptionist.ofType("user_message")).toHaveLength(0);
+
+    harness.sockets.patient.emitFrame(final("I need a dentist"));
+    harness.clock.advance(2_500);
+    expect(harness.sockets.receptionist.ofType("user_message")).toHaveLength(1);
+  });
+
+  test("starts a new entry after a finalized utterance", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame(partial("hello"));
+    harness.sockets.patient.emitFrame(final("hello"));
+    harness.sockets.patient.emitFrame(partial("are you there"));
+    harness.sockets.patient.emitFrame(final("are you there"));
+
+    expect(harness.relay.getState().transcript).toHaveLength(2);
+  });
+
+  test("treats a missing is_final_response as final", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "no flag at all" },
+    });
+    expect(harness.relay.getState().transcript[0]?.finalized).toBe(true);
+  });
+
+  test("closes a stream that never sent its final and hands the line on", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame(partial("I need a dent"));
+    expect(harness.relay.getState().transcript[0]?.finalized).toBe(false);
+
+    // Silence means the final is never coming. Holding the turn open waiting
+    // for it is the deadlock; taking what we have is the recovery.
+    harness.clock.advance(2_000);
+    expect(harness.relay.getState().transcript[0]?.finalized).toBe(true);
+
+    harness.clock.advance(2_500);
+    const relayed = harness.sockets.receptionist.ofType("user_message");
+    expect(relayed).toHaveLength(1);
+    expect(relayed[0]?.text).toBe("I need a dent");
+  });
+
+  test("re-arms the silence timer on every partial, so a slow stream survives", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    for (let i = 0; i < 5; i += 1) {
+      harness.clock.advance(1_500);
+      harness.sockets.patient.emitFrame(partial(`part ${i}`));
+    }
+    harness.clock.advance(1_999);
+    expect(harness.relay.getState().transcript[0]?.finalized).toBe(false);
+  });
+
+  test("suppresses a final frame that repeats the line just committed", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame(final("I need a dentist"));
+    harness.sockets.patient.emitFrame(final("I need a dentist"));
+
+    // The vendor does resend a final frame, and the old code printed the line
+    // twice for it.
+    expect(harness.relay.getState().transcript).toHaveLength(1);
+    expect(harness.logs.some((l) => l.message === "spectate.transcript_deduplicated")).toBe(
+      true
+    );
+  });
+
+  test("still records a side genuinely repeating itself", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    // Something else spoke in between, so this is not a retransmit.
+    harness.sockets.patient.emitFrame(final("Yes."));
+    harness.sockets.receptionist.emitFrame(final("Anything else?"));
+    harness.sockets.patient.emitFrame(final("Yes."));
+
+    const patientLines = harness.relay
+      .getState()
+      .transcript.filter((entry) => entry.role === "patient");
+    expect(patientLines).toHaveLength(2);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Turn recovery                                                               */
+/* -------------------------------------------------------------------------- */
+
+describe("turn recovery", () => {
+  test("requeues a line when the socket it was addressed to is not open", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+
+    // The old `sendMessageToAgent` checked `readyState === OPEN` and returned
+    // quietly, and the caller had already marked the turn handed off, so the
+    // line vanished and the relay waited forever for a reply to a message that
+    // was never sent.
+    harness.sockets.receptionist.emitClose(1006);
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "are you there" },
+    });
+    harness.clock.advance(2_500);
+
+    expect(harness.relay.getState().awaiting).toBe("receptionist");
+    expect(harness.relay.getState().notice).toContain("Holding a line");
+  });
+
+  test("delivers the held line as soon as the socket comes back", () => {
+    const harness = makeRelay();
+    harness.openBoth();
+    harness.sockets.receptionist.emitClose(1006);
+
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "are you there" },
+    });
+    harness.clock.advance(2_500);
+    expect(harness.sockets.receptionist.ofType("user_message")).toHaveLength(0);
+
+    // #50 adds reconnect. Here the socket is simply made open again by hand,
+    // which is all the relay needs: it retries on a timer, not on an event.
+    harness.sockets.receptionist.readyState = 1;
+    harness.clock.advance(1_500);
+    expect(harness.sockets.receptionist.ofType("user_message")).toHaveLength(1);
+  });
+
+  test("gives up on an undeliverable line instead of retrying forever", () => {
+    const harness = makeRelay({ sendGiveUpMs: 30_000, sendRetryMs: 1_500 });
+    harness.openBoth();
+    harness.sockets.receptionist.emitClose(1006);
+
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "are you there" },
+    });
+    harness.clock.advance(2_500);
+    harness.clock.advance(60_000);
+
+    const state = harness.relay.getState();
+    expect(state.stalled).toBe(true);
+    expect(state.awaiting).toBeNull();
+    expect(state.notice).toContain("never came back");
+  });
+
+  test("abandons a turn whose answer never arrives, rather than wedging", () => {
+    const harness = makeRelay({ responseTimeoutMs: 20_000 });
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "I need a dentist" },
+    });
+    harness.clock.advance(2_500);
+    expect(harness.relay.getState().awaiting).toBe("receptionist");
+
+    // Nothing comes back. Under the old flags this was the end of the
+    // session: the flag stayed set, the guard on the next handoff stayed
+    // closed, and the page showed a perfectly healthy call that had stopped
+    // having a conversation.
+    harness.clock.advance(20_000);
+    const state = harness.relay.getState();
+    expect(state.awaiting).toBeNull();
+    expect(state.stalled).toBe(true);
+    expect(state.notice).toContain("did not respond");
+  });
+
+  test("keeps relaying after a stall, so one lost turn is not the end", () => {
+    const harness = makeRelay({ responseTimeoutMs: 20_000 });
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "I need a dentist" },
+    });
+    harness.clock.advance(2_500);
+    harness.clock.advance(20_000);
+    expect(harness.relay.getState().stalled).toBe(true);
+
+    // The patient agent, left to its own devices, tries again.
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "are you still there" },
+    });
+    harness.clock.advance(2_500);
+    expect(harness.sockets.receptionist.ofType("user_message")).toHaveLength(2);
+  });
+
+  test("clears the stall once the awaited side does answer", () => {
+    const harness = makeRelay({ responseTimeoutMs: 20_000 });
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "I need a dentist" },
+    });
+    harness.clock.advance(2_500);
+    harness.sockets.receptionist.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "What time?" },
+    });
+
+    // The stall is gone the moment the awaited side answers, and the turn has
+    // already been handed back to the patient.
+    expect(harness.relay.getState().stalled).toBe(false);
+    expect(harness.relay.getState().awaiting).toBeNull();
+
+    harness.clock.advance(2_500);
+    expect(harness.relay.getState().awaiting).toBe("patient");
+  });
+
+  test("does not re-send a line that was already delivered", () => {
+    const harness = makeRelay({ responseTimeoutMs: 20_000 });
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "I need a dentist" },
+    });
+    harness.clock.advance(2_500);
+    harness.clock.advance(19_999);
+    expect(harness.sockets.receptionist.ofType("user_message")).toHaveLength(1);
+  });
+
+  test("accepts a line from a side that was not the one being waited on", () => {
+    const harness = makeRelay({ responseTimeoutMs: 20_000 });
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "I need a dentist" },
+    });
+    harness.clock.advance(2_500);
+    expect(harness.relay.getState().awaiting).toBe("receptionist");
+
+    // Out of turn. The old flags ignored the floor entirely and would relay
+    // this on top of the turn already in flight, interleaving the two.
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "hello? anyone?" },
+    });
+    harness.clock.advance(2_500);
+
+    expect(harness.sockets.receptionist.ofType("user_message")).toHaveLength(2);
+    expect(harness.relay.getState().awaiting).toBe("receptionist");
+  });
+
+  test("requeues the unanswered line when the socket drops mid-turn", () => {
+    const harness = makeRelay({ responseTimeoutMs: 20_000 });
+    harness.openBoth();
+
+    harness.sockets.patient.emitFrame({
+      type: "agent_response",
+      agent_response_event: { agent_response: "I need a dentist" },
+    });
+    harness.clock.advance(2_500);
+    expect(harness.relay.getState().awaiting).toBe("receptionist");
+
+    // The socket dies before it can answer. The turn goes back to the outbox
+    // rather than being counted against a socket that can never reply.
+    harness.sockets.receptionist.emitClose(1006);
+    expect(harness.relay.getState().awaiting).toBeNull();
+
+    harness.sockets.receptionist.readyState = 1;
+    harness.clock.advance(1_500);
+    // Delivered once before the drop and once after it. At-least-once is the
+    // right call here: a duplicated `user_message` makes the other agent say
+    // something twice, whereas dropping the turn loses the call. The vendor's
+    // own dedupe, if any, is a better place to settle that than this relay is.
+    expect(harness.sockets.receptionist.ofType("user_message")).toHaveLength(2);
+    expect(harness.relay.getState().awaiting).toBe("receptionist");
   });
 });
 

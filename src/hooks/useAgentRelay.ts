@@ -69,6 +69,16 @@ export interface TranscriptEntry {
    * that is not this object graph.
    */
   at: number;
+  /**
+   * False while the agent is still streaming this line.
+   *
+   * A voice agent sends an utterance as a run of partial frames followed by
+   * one final. Rendering every partial as its own turn produced a transcript
+   * that duplicated and interleaved itself, so a partial now revises the entry
+   * it belongs to and only a final, or a silence long enough to mean one is
+   * never coming, closes it.
+   */
+  finalized: boolean;
 }
 
 export type PerSide<T> = Record<AgentSide, T>;
@@ -83,8 +93,19 @@ export interface RelayState {
   speaking: PerSide<boolean>;
   currentText: PerSide<string>;
   socket: PerSide<SocketStatus>;
-  /** The side currently holding the floor, or null when neither is. */
+  /** The side currently speaking, or null when neither is. */
   floor: AgentSide | null;
+  /**
+   * The side a line was handed to and which has not answered yet.
+   *
+   * This is the whole of the turn state that used to be two booleans. The
+   * difference is that it is cleared by a timer as well as by a response, so
+   * there is no path through the machine where a line was sent and nothing
+   * ever clears the record of it.
+   */
+  awaiting: AgentSide | null;
+  /** Set when a handoff timed out, i.e. the relay had to give up on a turn. */
+  stalled: boolean;
 }
 
 /**
@@ -123,11 +144,60 @@ const SOCKET_OPEN = 1;
 
 export const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 
-/** How long a side keeps the floor before its line is handed to the other. */
+/**
+ * How long a finished line stays on the card before it is handed to the other
+ * agent. Long enough to read, short enough that a demo does not stall.
+ */
 export const DEFAULT_HOLD_MS = 2_500;
 
 /** How long after `open` the opening `contextual_update` goes out. */
 export const DEFAULT_CONTEXT_DELAY_MS = 500;
+
+/**
+ * How long to wait for a streamed utterance before treating the silence as
+ * the end of it.
+ *
+ * A voice agent streams an utterance as partial frames and then one final
+ * frame. The final is not guaranteed: if it is lost, the partials that came
+ * before it are still the best account of what was said. Holding the turn open
+ * indefinitely waiting for a frame that will not arrive is the deadlock this
+ * whole state machine exists to remove, so silence closes the turn.
+ */
+export const DEFAULT_STREAM_IDLE_MS = 2_000;
+
+/**
+ * How long a relayed line waits for the agent it was addressed to.
+ *
+ * This is the guarantee the old two-boolean scheme could not make. A line was
+ * sent, a flag was set, and the flag was cleared only by a matching response
+ * — so one lost frame, one refused tool call, or one agent that simply ended
+ * its turn left the relay permanently deaf to that side.
+ */
+export const DEFAULT_RESPONSE_TIMEOUT_MS = 20_000;
+
+/** How often a line that could not be sent is retried. */
+export const DEFAULT_SEND_RETRY_MS = 1_500;
+
+/**
+ * How long a line keeps trying to reach a socket that is not open, before the
+ * relay gives up and says so.
+ *
+ * Bounded on purpose. The alternative — retrying forever — is a spinner that
+ * never resolves and a transcript that silently stops growing.
+ */
+export const DEFAULT_SEND_GIVE_UP_MS = 30_000;
+
+/**
+ * Window in which a byte-identical back-to-back line counts as a retransmit.
+ *
+ * A partial frame that is immediately followed by a final carrying the same
+ * text is handled structurally, by the streaming state, and does not need
+ * this. What is left is a final frame arriving twice for one utterance,
+ * which the vendor does and which used to print the line twice. The window is
+ * short and the comparison requires nothing at all in between, so the cost of
+ * being wrong is a genuinely repeated sentence read twice in a row.
+ */
+export const DEFAULT_DEDUPE_WINDOW_MS = 2_000;
 
 /**
  * Ceiling on the `pong` delay.
@@ -152,6 +222,8 @@ export function initialRelayState(): RelayState {
     currentText: { patient: "", receptionist: "" },
     socket: { patient: "idle", receptionist: "idle" },
     floor: null,
+    awaiting: null,
+    stalled: false,
   };
 }
 
@@ -222,6 +294,11 @@ export interface AgentRelayConfig {
   connectTimeoutMs?: number;
   holdMs?: number;
   contextDelayMs?: number;
+  streamIdleMs?: number;
+  responseTimeoutMs?: number;
+  sendRetryMs?: number;
+  sendGiveUpMs?: number;
+  dedupeWindowMs?: number;
   log?: RelayLog;
   /** Injected for deterministic timestamps in tests. */
   now?: () => number;
@@ -260,6 +337,9 @@ export class AgentRelay {
    */
   private readonly timers = new Set<number>();
   private readonly connectTimers: Partial<PerSide<number>> = {};
+  private readonly holdTimers: Partial<PerSide<number>> = {};
+  private readonly streamTimers: Partial<PerSide<number>> = {};
+  private responseTimer: number | null = null;
 
   /**
    * Per-socket handshake bookkeeping.
@@ -274,17 +354,48 @@ export class AgentRelay {
   private readonly opened: PerSide<boolean> = { patient: false, receptionist: false };
 
   /**
-   * Turn-taking flags, one per side: "I have sent this side something and am
-   * waiting for it to answer."
+   * The turn.
    *
-   * Carried over from the component verbatim, including the property that
-   * makes it fragile: they are set optimistically on send and cleared only by
-   * the matching response, so a line that is never answered wedges the relay
-   * forever. Replaced by an explicit turn state machine in #25; kept here so
-   * this branch is a pure move and the behaviour change is reviewable on its
-   * own.
+   * One object rather than the pair of booleans this replaced. The booleans
+   * (`waitingForAResponseRef` / `waitingForBResponseRef`) were set optimistically
+   * when a line went out and cleared only by the matching response, so a single
+   * frame the relay did not get left the flag set and the relay deaf to that
+   * side for the rest of the session. Nothing in the design could clear it.
+   *
+   * `awaiting` is the side a line was handed to, `text` is the line itself, and
+   * there is always a timer that clears it: the response timeout. A turn can
+   * therefore be lost, but it cannot be lost *silently or permanently*, which
+   * is the whole difference.
    */
-  private awaitingResponse: PerSide<boolean> = { patient: false, receptionist: false };
+  private awaiting: { to: AgentSide; text: string } | null = null;
+
+  /**
+   * A line that has not yet reached the socket it was addressed to.
+   *
+   * Kept rather than dropped. The old `sendMessageToAgent` checked
+   * `readyState === OPEN` and returned quietly if it was not, and the caller
+   * had already marked its turn as handed off, so the line vanished and the
+   * relay sat waiting for a reply to a message that was never sent.
+   */
+  private outbox: { to: AgentSide; text: string; since: number } | null = null;
+
+  /** The utterance each side is currently streaming, as a transcript id. */
+  private readonly streaming: PerSide<number | null> = {
+    patient: null,
+    receptionist: null,
+  };
+
+  /** The most recent finalized line per side, for retransmit suppression. */
+  private readonly lastFinal: PerSide<{ id: number; text: string; at: number } | null> = {
+    patient: null,
+    receptionist: null,
+  };
+
+  /** The most recent utterance per side, held for the handoff after the hold. */
+  private readonly committed: PerSide<{ text: string } | null> = {
+    patient: null,
+    receptionist: null,
+  };
 
   private nextEntryId = 0;
   private disposed = false;
@@ -350,6 +461,7 @@ export class AgentRelay {
     this.stopping = false;
     this.commitConfig();
     this.clearTimers();
+    this.resetTurn();
     this.patch({
       phase: "connecting",
       error: null,
@@ -357,6 +469,8 @@ export class AgentRelay {
       speaking: { patient: false, receptionist: false },
       currentText: { patient: "", receptionist: "" },
       floor: null,
+      awaiting: null,
+      stalled: false,
     });
 
     this.openSide("patient");
@@ -368,6 +482,7 @@ export class AgentRelay {
     if (this.disposed) return;
     this.stopping = true;
     this.clearTimers();
+    this.resetTurn();
     this.closeSockets();
     this.patch({
       phase: "stopped",
@@ -377,6 +492,8 @@ export class AgentRelay {
       currentText: { patient: "", receptionist: "" },
       socket: { patient: "closed", receptionist: "closed" },
       floor: null,
+      awaiting: null,
+      stalled: false,
     });
   }
 
@@ -391,6 +508,7 @@ export class AgentRelay {
     this.disposed = true;
     this.stopping = true;
     this.clearTimers();
+    this.resetTurn();
     this.closeSockets();
     this.listeners.clear();
   }
@@ -471,6 +589,7 @@ export class AgentRelay {
           phase: "degraded",
           notice: `The ${label(side)} agent's connection dropped.`,
         });
+        this.requeueUnanswered(side);
       }
     };
   }
@@ -574,10 +693,17 @@ export class AgentRelay {
       }
 
       case "agent_response": {
-        const event = frame.agent_response_event as { agent_response?: unknown } | undefined;
+        const event = frame.agent_response_event as
+          | { agent_response?: unknown; is_final_response?: unknown }
+          | undefined;
         const text = event?.agent_response;
         if (typeof text !== "string" || text.length === 0) break;
-        this.onAgentResponse(side, text);
+        // `is_final_response` marks the end of an utterance. A vendor that
+        // omits it is treated as final, which is the old behaviour and the
+        // safe default; a vendor that sends `false` is streaming, and treating
+        // each partial as its own turn is what duplicated the transcript.
+        const isFinal = event?.is_final_response !== false;
+        this.onAgentResponse(side, text, isFinal);
         break;
       }
 
@@ -600,48 +726,301 @@ export class AgentRelay {
   /* ------------------------------ turn taking ---------------------------- */
 
   /**
-   * A side said something: show it, record it, and hand it on after the hold.
+   * One utterance from one side.
    *
-   * This is the old component logic moved verbatim, with one exception that
-   * matters for #25 rather than here: a side that is handed a line while its
-   * socket is not open silently loses it. The flag-based scheme treats that
-   * as "already sent", so the relay never retries and the conversation is over.
+   * `isFinal` is the vendor's own signal that the utterance is complete. It
+   * drives whether this is a new transcript entry or a revision of the one
+   * already on screen, which is the difference between a transcript and a
+   * log of every word the TTS engine emitted.
+   *
+   * The three cases:
+   *
+   *  1. A partial for an utterance already in progress revises that entry.
+   *     Appending was the old behaviour and it is what made overlapping
+   *     streamed transcripts duplicate themselves, once per partial.
+   *  2. A final closes the utterance: it revises the entry, hands the turn
+   *     on, and clears the streaming slot so the next utterance starts fresh.
+   *  3. A final with no utterance in progress is a new entry, unless it is a
+   *     byte-identical repeat of the last line from that side inside the
+   *     dedupe window, which is a retransmit rather than a new sentence.
    */
-  private onAgentResponse(side: AgentSide, text: string): void {
-    this.appendTranscript(side, text);
+  private onAgentResponse(side: AgentSide, text: string, isFinal: boolean): void {
+    const inProgress = this.streaming[side];
+
+    if (inProgress !== null) {
+      this.reviseEntry(inProgress, text, isFinal);
+      this.armStreamIdle(side, inProgress);
+      if (isFinal) {
+        this.streaming[side] = null;
+        this.lastFinal[side] = { id: inProgress, text, at: this.now() };
+        this.commitUtterance(side, text);
+      }
+      return;
+    }
+
+    if (isFinal && this.isRetransmit(side, text)) {
+      this.log("info", "spectate.transcript_deduplicated", { resource: resourceFor(side) });
+      return;
+    }
+
+    const id = this.nextEntryId++;
+    this.patch({
+      transcript: [
+        ...this.state.transcript,
+        { id, role: side, text, at: this.now(), finalized: isFinal },
+      ],
+    });
+
+    if (!isFinal) {
+      this.streaming[side] = id;
+      this.armStreamIdle(side, id);
+      return;
+    }
+
+    this.lastFinal[side] = { id, text, at: this.now() };
+    this.commitUtterance(side, text);
+  }
+
+  /**
+   * A final frame immediately after a partial carrying the same text, with
+   * nothing in between, is the vendor closing an utterance it already
+   * streamed. That is handled structurally by the streaming slot above, so
+   * this only has to catch the harder case: a whole final frame arriving
+   * twice.
+   *
+   * Both conditions are load-bearing. The text has to be byte-identical, and
+   * it has to be the *last thing in the transcript*: if either agent said
+   * anything in between, then this really is a new line that happens to
+   * sound like the last one, and dropping it would delete a turn of the
+   * conversation to suppress a duplicate. That is the wrong trade for a
+   * booking call, where "Yes." twice is a real exchange.
+   */
+  private isRetransmit(side: AgentSide, text: string): boolean {
+    const last = this.lastFinal[side];
+    if (!last || last.text !== text) return false;
+
+    const entries = this.state.transcript;
+    if (entries.length === 0) return false;
+    const newest = entries[entries.length - 1];
+    if (newest?.role !== side || newest.text !== text) return false;
+
+    const window = this.config.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
+    return this.now() - last.at <= window;
+  }
+
+  /**
+   * A streamed utterance goes quiet: close it and move on.
+   *
+   * This is the promise the old design could not keep. It used to append every
+   * partial as its own turn and hand the floor on 2500ms after the *last* one,
+   * so a stream that never sent its final left the transcript permanently
+   * "speaking" and the relay waiting on a handoff that was never scheduled.
+   */
+  private onStreamIdle(side: AgentSide, id: number): void {
+    if (this.disposed || this.streaming[side] !== id) return;
+    const entry = this.state.transcript.find((candidate) => candidate.id === id);
+    if (!entry) return;
+
+    this.streaming[side] = null;
+    this.log("warn", "spectate.stream_never_finalized", { resource: resourceFor(side) });
+    this.patch({
+      transcript: this.state.transcript.map((candidate) =>
+        candidate.id === id ? { ...candidate, finalized: true } : candidate
+      ),
+    });
+    this.lastFinal[side] = { id, text: entry.text, at: this.now() };
+    this.commitUtterance(side, entry.text);
+  }
+
+  /**
+   * An utterance is complete: it takes the floor, and after the hold it is
+   * handed to the other side.
+   *
+   * Re-arming the hold per utterance, rather than letting the first hold timer
+   * clear the current text of a later one, is what stops two lines from the
+   * same side overlapping. The old code scheduled a timer per response and
+   * never cancelled any of them, so a second line was wiped off the card by
+   * the first line's timer while it was still the current one.
+   */
+  private commitUtterance(side: AgentSide, text: string): void {
+    // Whatever turn we were waiting on this side for is now answered. Cleared
+    // here, before the new floor is set, so a stall warning is not left on
+    // screen for a turn that has since been answered.
+    this.clearTurnFor(side);
+
+    this.committed[side] = { text };
     this.patch({
       currentText: { ...this.state.currentText, [side]: text },
       speaking: { ...this.state.speaking, [side]: true },
       floor: side,
     });
 
-    // The side has now spoken, so it is no longer waiting to be spoken to.
-    this.awaitingResponse[side] = false;
+    this.clearHold(side);
+    this.holdTimers[side] = this.schedule(() => {
+      delete this.holdTimers[side];
+      this.releaseFloor(side);
+    }, this.config.holdMs ?? DEFAULT_HOLD_MS);
+  }
 
-    const listener = otherSide(side);
-    this.schedule(() => {
+  /** The hold elapsed: take the line off the card and hand it on. */
+  private releaseFloor(side: AgentSide): void {
+    if (this.committed[side]?.text === undefined) return;
+    const text = this.committed[side]?.text ?? "";
+    this.committed[side] = null;
+
+    // Only clear the card if this side still holds it. A line that arrived
+    // from elsewhere in the meantime has taken the floor and must not be
+    // blanked by a timer belonging to an older one.
+    if (this.state.floor === side) {
       this.patch({
         currentText: { ...this.state.currentText, [side]: "" },
         speaking: { ...this.state.speaking, [side]: false },
-        floor: this.state.floor === side ? null : this.state.floor,
+        floor: null,
       });
+    }
 
-      if (this.awaitingResponse[listener]) return;
-      this.awaitingResponse[listener] = true;
-      this.sendTo(listener, text);
-    }, this.config.holdMs ?? DEFAULT_HOLD_MS);
+    this.handoff(side, text);
+  }
+
+  /**
+   * Hand a finished line to the other agent, and wait for its answer.
+   *
+   * Every exit from here terminates. The line is either delivered now, or it
+   * goes to the outbox and is retried until `sendGiveUpMs` has run out, and
+   * either way a response timer is armed that clears `awaiting` whether or not
+   * an answer ever arrives.
+   */
+  private handoff(from: AgentSide, text: string): void {
+    const to = otherSide(from);
+    if (this.disposed || !text) return;
+
+    this.awaiting = { to, text };
+    this.patch({ awaiting: to, stalled: false, notice: null });
+
+    if (this.sendTo(to, text)) {
+      this.armResponseTimeout(to);
+      return;
+    }
+
+    this.outbox = { to, text, since: this.now() };
+    this.patch({
+      notice: `Holding a line for the ${label(to)} agent until its connection is back.`,
+    });
+    this.schedule(() => this.flushOutbox(), this.config.sendRetryMs ?? DEFAULT_SEND_RETRY_MS);
+  }
+
+  private flushOutbox(): void {
+    if (this.disposed || !this.outbox) return;
+    const pending = this.outbox;
+
+    if (this.sendTo(pending.to, pending.text)) {
+      this.outbox = null;
+      // Restore the turn before arming its timeout, or the relay would
+      // redeliver the line and then not be waiting for the answer to it.
+      this.awaiting = { to: pending.to, text: pending.text };
+      this.patch({ awaiting: pending.to, stalled: false });
+      this.armResponseTimeout(pending.to);
+      return;
+    }
+
+    const giveUp = this.config.sendGiveUpMs ?? DEFAULT_SEND_GIVE_UP_MS;
+    if (this.now() - pending.since >= giveUp) {
+      this.log("warn", "spectate.relay_abandoned", { resource: resourceFor(pending.to) });
+      this.outbox = null;
+      this.clearResponseTimeout();
+      if (this.awaiting?.to !== pending.to) return;
+      this.awaiting = null;
+      this.patch({
+        awaiting: null,
+        stalled: true,
+        notice: `The ${label(pending.to)} agent never came back, so the call stopped there.`,
+      });
+      return;
+    }
+
+    this.schedule(() => this.flushOutbox(), this.config.sendRetryMs ?? DEFAULT_SEND_RETRY_MS);
+  }
+
+  /**
+   * Give up on a turn that was delivered but never answered.
+   *
+   * The old scheme had no equivalent. Its flags were only ever cleared by the
+   * response they were waiting for, so this is the branch where the relay used
+   * to simply stop talking for the rest of the session, with a card that
+   * looked perfectly healthy: the transcript froze, the header still said
+   * "Live session", and the next line was silently swallowed by a guard on a
+   * flag nothing was ever going to clear.
+   *
+   * The session is not ended. The turn is dropped, the floor is released, and
+   * either agent may speak again — which is the whole difference between a
+   * lost turn and a dead call.
+   */
+  private abandonTurn(side: AgentSide): void {
+    this.clearResponseTimeout();
+    if (this.awaiting?.to !== side) return;
+
+    this.awaiting = null;
+    this.patch({
+      awaiting: null,
+      stalled: true,
+      notice: `The ${label(side)} agent did not respond, so that turn was dropped.`,
+    });
+  }
+
+  private armResponseTimeout(side: AgentSide): void {
+    this.clearResponseTimeout();
+    this.responseTimer = this.schedule(() => {
+      this.responseTimer = null;
+      this.abandonTurn(side);
+    }, this.config.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS);
+  }
+
+  /**
+   * A side spoke, so whatever we were waiting on it for is answered.
+   *
+   * Clear the stall on the way through, so a session that recovered does not
+   * keep displaying a warning about a turn that has since been answered.
+   */
+  private clearTurnFor(side: AgentSide): void {
+    if (this.awaiting?.to !== side) return;
+    this.awaiting = null;
+    this.clearResponseTimeout();
+    this.clearOutbox();
+    this.patch({ awaiting: null, stalled: false, notice: null });
+  }
+
+  /**
+   * The socket we were waiting on just went away. Put the line back in the
+   * outbox.
+   *
+   * Without this, the line was already marked handed-off and the response
+   * timer was counting down against a socket that could never answer, so the
+   * turn was lost for the full timeout and the transcript simply stopped. With
+   * it, the line waits in the outbox and is delivered the moment that socket is
+   * open again, which is what makes #50's reconnect actually worth having.
+   */
+  private requeueUnanswered(side: AgentSide): void {
+    const turn = this.awaiting;
+    if (!turn || turn.to !== side) return;
+
+    this.awaiting = null;
+    this.clearResponseTimeout();
+    this.outbox = { to: turn.to, text: turn.text, since: this.now() };
+    this.patch({ awaiting: null });
+    this.schedule(() => this.flushOutbox(), this.config.sendRetryMs ?? DEFAULT_SEND_RETRY_MS);
   }
 
   /**
    * Send a line to one side.
    *
-   * Returns whether it went. Callers currently ignore the answer, which is the
-   * dropped-message half of the deadlock in #25.
+   * Returns whether it went. The answer used to be ignored, which is how a line
+   * addressed to a socket that was not open was lost while the relay carried
+   * on believing it had been handed over.
    */
   private sendTo(side: AgentSide, text: string): boolean {
     const socket = this.sockets[side];
     if (!socket || socket.readyState !== SOCKET_OPEN) {
-      this.log("warn", "spectate.relay_dropped", {
+      this.log("warn", "spectate.relay_undeliverable", {
         resource: resourceFor(side),
         status: socket ? socket.readyState : SOCKET_CONNECTING,
       });
@@ -653,23 +1032,22 @@ export class AgentRelay {
 
   /* --------------------------------- plumbing ---------------------------- */
 
-  private appendTranscript(role: AgentSide, text: string): void {
-    const entry: TranscriptEntry = {
-      id: this.nextEntryId++,
-      role,
-      text,
-      at: this.now(),
-    };
-    this.patch({ transcript: [...this.state.transcript, entry] });
+  private reviseEntry(id: number, text: string, finalized: boolean): void {
+    this.patch({
+      transcript: this.state.transcript.map((entry) =>
+        entry.id === id ? { ...entry, text, finalized } : entry
+      ),
+    });
   }
 
-  private schedule(fn: () => void, delayMs: number): void {
+  private schedule(fn: () => void, delayMs: number): number {
     const handle = this.clock.setTimeout(() => {
       this.timers.delete(handle);
       if (this.disposed) return;
       fn();
     }, delayMs);
     this.timers.add(handle);
+    return handle;
   }
 
   private clearConnectTimer(side: AgentSide): void {
@@ -680,11 +1058,65 @@ export class AgentRelay {
     delete this.connectTimers[side];
   }
 
+  private clearHold(side: AgentSide): void {
+    const handle = this.holdTimers[side];
+    if (handle === undefined) return;
+    this.clock.clearTimeout(handle);
+    this.timers.delete(handle);
+    delete this.holdTimers[side];
+  }
+
+  /** Re-arm the give-up-on-a-silent-stream timer for one side. */
+  private armStreamIdle(side: AgentSide, id: number): void {
+    this.clearStreamIdle(side);
+    this.streamTimers[side] = this.schedule(
+      () => {
+        delete this.streamTimers[side];
+        this.onStreamIdle(side, id);
+      },
+      this.config.streamIdleMs ?? DEFAULT_STREAM_IDLE_MS
+    );
+  }
+
+  private clearStreamIdle(side: AgentSide): void {
+    const handle = this.streamTimers[side];
+    if (handle === undefined) return;
+    this.clock.clearTimeout(handle);
+    this.timers.delete(handle);
+    delete this.streamTimers[side];
+  }
+
+  private clearResponseTimeout(): void {
+    if (this.responseTimer === null) return;
+    this.clock.clearTimeout(this.responseTimer);
+    this.timers.delete(this.responseTimer);
+    this.responseTimer = null;
+  }
+
+  private clearOutbox(): void {
+    this.outbox = null;
+  }
+
   private clearTimers(): void {
     for (const handle of this.timers) this.clock.clearTimeout(handle);
     this.timers.clear();
     this.connectTimers.patient = undefined;
     this.connectTimers.receptionist = undefined;
+    this.holdTimers.patient = undefined;
+    this.holdTimers.receptionist = undefined;
+    this.streamTimers.patient = undefined;
+    this.streamTimers.receptionist = undefined;
+    this.responseTimer = null;
+  }
+
+  /** Forget the turn entirely. Used by `stop` and `dispose`. */
+  private resetTurn(): void {
+    this.awaiting = null;
+    this.outbox = null;
+    this.streaming.patient = null;
+    this.streaming.receptionist = null;
+    this.committed.patient = null;
+    this.committed.receptionist = null;
   }
 
   private patch(next: Partial<RelayState>): void {

@@ -54,19 +54,42 @@ export function SessionBadge({ phase }: { phase: RelayPhase }) {
 /**
  * A non-blocking notice, with the one action that makes sense.
  *
- * `role="status"` rather than `role="alert"`: a dropped socket is worth saying
- * once, not interrupting for.
+ * `role="status"` rather than `role="alert"`: a dropped socket or a lost turn
+ * is worth saying once, not interrupting for.
+ *
+ * Two quite different failures arrive here and are worded differently, because
+ * the operator's next move is different. A dropped socket means half the call
+ * is gone and the session should end. A dropped turn means one line was lost
+ * and the call carries on, which is worth knowing but is not an emergency —
+ * conflating the two would train the reader to ignore this banner.
  */
-export function ConnectionNotice({
+export function SessionNotice({
   notice,
-  onDismiss,
+  stalled,
   socket,
+  onDismiss,
 }: {
   notice: string;
-  onDismiss: () => void;
+  /** True when a turn was lost but the call is still going. */
+  stalled: boolean;
   socket: { patient: SocketStatus; receptionist: SocketStatus };
+  onDismiss: () => void;
 }) {
-  const down = socket.patient !== "open" ? "patient" : "receptionist";
+  if (stalled) {
+    return (
+      <div
+        role="status"
+        className="mb-6 rounded-2xl border border-slate-700 bg-slate-900/70 px-5 py-3.5 text-sm text-slate-300 flex flex-wrap items-center gap-x-3 gap-y-2"
+      >
+        <span className="text-slate-500" aria-hidden="true">
+          ⟳
+        </span>
+        <span>{notice}</span>
+      </div>
+    );
+  }
+
+  const down = socket.patient !== "open" ? "patient caller" : "receptionist";
 
   return (
     <div
@@ -74,8 +97,7 @@ export function ConnectionNotice({
       className="mb-6 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-5 py-4 text-sm text-amber-100 flex flex-wrap items-center justify-between gap-3"
     >
       <span>
-        {notice} The {down} agent is no longer connected, so anything it says will not reach the
-        other side.
+        {notice} Nothing the {down} agent says will reach the other side from here.
       </span>
       <button
         type="button"

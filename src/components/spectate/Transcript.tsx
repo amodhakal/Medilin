@@ -62,7 +62,17 @@ export function Transcript({ entries }: { entries: TranscriptEntry[] }) {
                   {new Date(entry.at).toLocaleTimeString()}
                 </time>
               </div>
-              <p className="text-sm leading-relaxed">{entry.text}</p>
+                  <p className="text-sm leading-relaxed">
+                    {entry.text}
+                    {/* A partial utterance: the agent is still deciding what
+                        it is going to say, and this entry will be revised in
+                        place rather than replaced by a new one. */}
+                    {!entry.finalized && (
+                      <span className="ml-1 text-slate-400" aria-label="still speaking">
+                        …
+                      </span>
+                    )}
+                  </p>
             </div>
           ))
         )}
