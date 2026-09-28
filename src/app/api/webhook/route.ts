@@ -5,8 +5,15 @@ import { getEmailFrom } from "@/config";
 import { getServerEnv } from "@/lib/env";
 import { parseJsonBody } from "@/lib/validation/parse";
 import { webhookPayloadSchema } from "@/lib/validation/intake";
+import { requireInternalSecret } from "@/lib/auth/internal";
 
 export async function POST(request: NextRequest) {
+  // Authenticate before anything else. Without this the endpoint is an open
+  // mail relay: anyone could POST an address and a message and have the app
+  // send it through Resend.
+  const guard = requireInternalSecret(request);
+  if (!guard.ok) return guard.response;
+
   try {
     const parsed = await parseJsonBody(request, webhookPayloadSchema);
     if (!parsed.ok) return parsed.response;
@@ -50,9 +57,10 @@ export async function POST(request: NextRequest) {
   }
 }
 
+/**
+ * Liveness only. Deliberately reports nothing about configuration or
+ * upstream services, since this is reachable without a credential.
+ */
 export async function GET() {
-  return NextResponse.json({
-    status: "ok",
-    message: "Webhook endpoint working",
-  });
+  return NextResponse.json({ status: "ok" });
 }

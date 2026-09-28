@@ -39,10 +39,16 @@ const serverEnvSchema = z.object({
   CLINIC_NAME: z.string().min(1).default("City Medical Center"),
   EMAIL_FROM: z.string().min(1).default("onboarding@resend.dev"),
 
+  // Shared secret authenticating service-to-service calls to the internal
+  // webhook and audit endpoints. Required: without it those endpoints reject
+  // every caller, and intake stops being able to send confirmations.
+  INTERNAL_API_SECRET: z
+    .string()
+    .min(32, "INTERNAL_API_SECRET must be at least 32 characters"),
+
   // Optional capabilities
   ELEVENLABS_API_KEY: z.string().min(1).optional(),
   DATABASE_URL: z.string().min(1).optional(),
-  INTERNAL_API_SECRET: z.string().min(16).optional(),
   SENTRY_DSN: z.string().min(1).optional(),
   CRON_SECRET: z.string().min(1).optional(),
   TWILIO_ACCOUNT_SID: z.string().min(1).optional(),

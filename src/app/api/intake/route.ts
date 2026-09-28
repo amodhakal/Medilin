@@ -4,6 +4,7 @@ import { createAppointment } from "@/lib/appointments";
 import { getClinicName } from "@/config";
 import { intakeSchema } from "@/lib/validation/intake";
 import { parseJsonBody } from "@/lib/validation/parse";
+import { internalHeaders } from "@/lib/auth/internal";
 
 export async function POST(request: NextRequest) {
   try {
@@ -42,7 +43,7 @@ export async function POST(request: NextRequest) {
     const webhookUrl = `${request.nextUrl.origin}/api/webhook`;
     await fetch(webhookUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: internalHeaders(),
       body: JSON.stringify({
         email: translatedData.email,
         language: sourceLanguage,

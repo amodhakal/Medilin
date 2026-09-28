@@ -7,6 +7,7 @@ const VALID = {
   HIPAA_MASTER_KEY: "a".repeat(64),
   ELEVENLABS_AGENT_PATIENT_ID: "agent_patient",
   ELEVENLABS_AGENT_RECEPTIONIST_ID: "agent_receptionist",
+  INTERNAL_API_SECRET: "s".repeat(32),
 } as const;
 
 const TOUCHED = [
