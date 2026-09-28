@@ -1,4 +1,17 @@
 import { Geist, Geist_Mono } from "next/font/google";
+
+/**
+ * react-toastify ships its own stylesheet and does not import it. Without this
+ * line the toasts render as unstyled, unpositioned text in the top corner of
+ * the body, which is how the failure and success messages this app relies on
+ * went unseen for as long as they were there.
+ *
+ * Imported before globals.css on purpose: CSS is applied in import order, and
+ * the overrides for these toasts live in globals.css, so importing this one
+ * second would quietly undo them. Global CSS can only be imported from the
+ * root layout, so this is the one place it can go at all.
+ */
+import "react-toastify/dist/ReactToastify.css";
 import "./globals.css";
 import { ToastContainer } from "react-toastify";
 
@@ -43,7 +56,24 @@ export default function RootLayout({
     >
       <body className="min-h-full flex flex-col">
         {children}
-        <ToastContainer />
+        {/*
+          `draggable` off: a drag handle is a mouse affordance with no keyboard
+          equivalent, and on a form that is about to navigate it is a trap for
+          anyone who grabs the wrong thing. `closeOnClick` off so clicking a
+          toast cannot dismiss a message a patient has not read yet;
+          `pauseOnFocusLoss` on so moving away to read a field does not take the
+          message away from them.
+        */}
+        <ToastContainer
+          position="top-center"
+          draggable={false}
+          closeOnClick={false}
+          pauseOnFocusLoss
+          closeButton
+          autoClose={8000}
+          newestOnTop
+          role="alert"
+        />
       </body>
     </html>
   );

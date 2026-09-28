@@ -1,4 +1,8 @@
-import type { MedicalDepartment, SupportedLanguage } from "@/lib/validation/intake";
+import type {
+  IntakeFormData,
+  MedicalDepartment,
+  SupportedLanguage,
+} from "@/lib/validation/intake";
 
 /**
  * The single definition of what a language is in this app.
@@ -58,6 +62,13 @@ const ENGLISH = {
   notFoundBody:
     "This address does not match a language we offer. Pick one of the languages below to start.",
   pickLanguage: "Choose a language",
+  fixErrors: "Check these fields",
+  submitFailed: "Your details could not be sent. Nothing has been booked.",
+  firstNamePlaceholder: "Jordan",
+  lastNamePlaceholder: "Reyes",
+  emailPlaceholder: "jordan.reyes@example.com",
+  phonePlaceholder: "+1 (555) 019 2834",
+  additionalInfoPlaceholder: "Describe your symptoms, or why you are coming in.",
 } as const;
 
 /** Exported so a test can hold every language to the English key set. */
@@ -128,6 +139,14 @@ const DEFINITIONS = {
       notFoundBody:
         "Esta dirección no corresponde a ningún idioma que ofrezcamos. Elige uno de los idiomas siguientes para comenzar.",
       pickLanguage: "Elegir un idioma",
+      fixErrors: "Revisa estos campos",
+      submitFailed: "No se pudieron enviar tus datos. No se ha reservado nada.",
+      firstNamePlaceholder: "Jordan",
+      lastNamePlaceholder: "Reyes",
+      emailPlaceholder: "jordan.reyes@ejemplo.com",
+      phonePlaceholder: "+34 600 123 456",
+      additionalInfoPlaceholder:
+        "Describe tus síntomas o el motivo de tu visita.",
     },
   },
   portuguese: {
@@ -164,6 +183,14 @@ const DEFINITIONS = {
       notFoundBody:
         "Este endereço não corresponde a nenhum idioma que oferecemos. Escolha um dos idiomas abaixo para começar.",
       pickLanguage: "Escolher um idioma",
+      fixErrors: "Verifique estes campos",
+      submitFailed: "Não foi possível enviar seus dados. Nada foi agendado.",
+      firstNamePlaceholder: "Jordan",
+      lastNamePlaceholder: "Reyes",
+      emailPlaceholder: "jordan.reyes@exemplo.com",
+      phonePlaceholder: "+55 11 91234 5678",
+      additionalInfoPlaceholder:
+        "Descreva seus sintomas ou o motivo da consulta.",
     },
   },
 } as const satisfies Record<string, LanguageDefinition>;
@@ -251,3 +278,47 @@ export const DEPARTMENT_OPTIONS: readonly DepartmentOption[] = [
   { value: "Psychiatrist", messageKey: "psychiatrist" },
   { value: "Other", messageKey: "other" },
 ];
+
+/**
+ * The fields a patient fills in.
+ *
+ * `language` is not one of them: it comes from the route, not from an input.
+ * Derived from the intake schema, so a field cannot be added to the form
+ * without also being labelable.
+ */
+export type IntakeFieldName = Exclude<keyof IntakeFormData, "language">;
+
+/**
+ * Form field name to the message that labels it.
+ *
+ * The server reports validation problems as `{ field, message }` with the
+ * field name as the input's `name`, so this is the mapping that turns a
+ * `FieldIssue` into something a patient can act on. Typed against the intake
+ * schema: a renamed input is a compile error here, and an issue naming a
+ * field this form does not have is handled as unattached rather than rendered
+ * next to the wrong control.
+ */
+export const FIELD_LABELS = {
+  firstName: "firstName",
+  lastName: "lastName",
+  email: "email",
+  dob: "dob",
+  insurance: "insurance",
+  phone: "phone",
+  appointmentDateTime: "appointmentDateTime",
+  medical_department: "whoToVisit",
+  additionalInfo: "additionalInfo",
+} as const satisfies Record<IntakeFieldName, MessageKey>;
+
+/** Every field a patient fills in, in the order the form shows them. */
+export const INTAKE_FIELDS = [
+  "firstName",
+  "lastName",
+  "email",
+  "dob",
+  "insurance",
+  "phone",
+  "appointmentDateTime",
+  "medical_department",
+  "additionalInfo",
+] as const satisfies readonly IntakeFieldName[];

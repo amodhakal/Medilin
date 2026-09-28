@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef, useState } from "react";
 import { toast } from "react-toastify";
 import { submitIntakeForm } from "@/app/actions";
 import Link from "next/link";
@@ -8,8 +9,16 @@ import {
   DEPARTMENT_OPTIONS,
   getLanguage,
   htmlLang,
+  type IntakeFieldName,
   type LanguageSlug,
 } from "@/i18n/registry";
+import {
+  collectIssues,
+  errorId,
+  hasFieldErrors,
+  summaryEntries,
+  type FieldErrors,
+} from "./formIssues";
 
 /**
  * The intake form for one language.
@@ -20,9 +29,27 @@ import {
  * `page.tsx` resolves the slug and calls `notFound()` for anything it does
  * not recognise, so a bad URL never reaches here.
  */
+
+const LABEL =
+  "block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5";
+const CONTROL =
+  "w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-colors";
+/** Same control, marked as rejected. A border colour change alone would not be
+ *  enough: it is a hue shift, and hue is not the only thing a screen reader or
+ *  a monochrome display has to go on. `aria-invalid` and a message carry the
+ *  state; the colour is a second signal, not the only one. */
+const CONTROL_INVALID =
+  "border-red-500 border-2 focus:border-red-600 focus:ring-red-600/20 bg-white";
+const ERROR_TEXT = "mt-1.5 text-xs font-medium text-red-700";
+const ERROR_BORDER = "border-red-400";
+
 export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
   const language = getLanguage(slug);
   const t = language.messages;
+
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const [unattached, setUnattached] = useState<string[]>([]);
+  const summaryRef = useRef<HTMLDivElement | null>(null);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -35,10 +62,19 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
     // submission looked identical to a booking until the page silently did
     // nothing.
     if (!result.ok) {
-      toast.error(result.error);
+      const collected = collectIssues(result.issues);
+      setErrors(collected.byField);
+      setUnattached(result.issues.length > 0 ? collected.unattached : [result.error]);
+      toast.error(t.submitFailed);
+      // The toast is transient and disappears. The summary does not, and it is
+      // where the per-field detail is, so focus moves there rather than leaving
+      // a patient to hunt for what changed.
+      summaryRef.current?.focus();
       return;
     }
 
+    setErrors({});
+    setUnattached([]);
     toast.success(t.toastProcessing);
     // assign() rather than `window.location.href = url`, which the React
     // compiler's immutability rule rejects as a write to a global. Same
@@ -46,6 +82,8 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
     // which is what a page opening two WebSockets wants.
     window.location.assign(result.spectateUrl);
   };
+
+  const showError = (field: IntakeFieldName) => Boolean(errors[field]);
 
   return (
     <div
@@ -60,7 +98,7 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
       <div className="w-full max-w-xl my-8">
         <Link
           href="/"
-          className="inline-flex items-center gap-2 text-xs text-cyan-600 hover:text-cyan-700 mb-6 font-semibold transition-colors"
+          className="inline-flex items-center gap-2 text-xs text-cyan-700 hover:text-cyan-800 mb-6 font-semibold transition-colors"
         >
           &larr; {t.back}
         </Link>
@@ -70,16 +108,53 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mb-2">
               {t.title}
             </h1>
-            <p className="text-sm text-slate-500">{t.subtitle}</p>
+            <p className="text-sm text-slate-600">{t.subtitle}</p>
           </div>
+
+          {/*
+            The error summary. `role="alert"` so it is announced when it
+            appears, and focusable so it can be moved to: a summary a screen
+            reader user has to go looking for is not a summary, it is a
+            decoration. Each entry links to the control it is about.
+          */}
+          {(hasFieldErrors(errors) || unattached.length > 0) && (
+            <div
+              ref={summaryRef}
+              tabIndex={-1}
+              role="alert"
+              className="mb-6 rounded-2xl border-2 border-red-400 bg-red-50 p-4 text-start"
+            >
+              <h2 className="text-sm font-bold text-red-800">
+                {t.fixErrors}
+              </h2>
+              {hasFieldErrors(errors) && (
+                <ul className="mt-2 space-y-1 text-sm text-red-800 list-disc ps-5">
+                  {summaryEntries(errors, t).map((entry) => (
+                    <li key={entry.field}>
+                      <a
+                        href={entry.href}
+                        className="underline font-semibold hover:text-red-900"
+                      >
+                        {entry.label}
+                      </a>
+                      {": "}
+                      <span>{entry.message}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {unattached.map((message) => (
+                <p key={message} className="mt-2 text-sm text-red-800">
+                  {message}
+                </p>
+              ))}
+            </div>
+          )}
 
           <form onSubmit={handleSubmit} className="space-y-5">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
-                <label
-                  htmlFor="firstName"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
+                <label htmlFor="firstName" className={LABEL}>
                   {t.firstName}
                 </label>
                 <input
@@ -87,16 +162,22 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
                   id="firstName"
                   name="firstName"
                   required
-                  placeholder="John"
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
+                  autoComplete="given-name"
+                  dir="auto"
+                  placeholder={t.firstNamePlaceholder}
+                  aria-invalid={showError("firstName") || undefined}
+                  aria-describedby={showError("firstName") ? errorId("firstName") : undefined}
+                  className={`${CONTROL} ${showError("firstName") ? CONTROL_INVALID : ""}`}
                 />
+                {errors.firstName && (
+                  <p id={errorId("firstName")} className={ERROR_TEXT}>
+                    {errors.firstName}
+                  </p>
+                )}
               </div>
 
               <div>
-                <label
-                  htmlFor="lastName"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
+                <label htmlFor="lastName" className={LABEL}>
                   {t.lastName}
                 </label>
                 <input
@@ -104,17 +185,23 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
                   id="lastName"
                   name="lastName"
                   required
-                  placeholder="Doe"
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
+                  autoComplete="family-name"
+                  dir="auto"
+                  placeholder={t.lastNamePlaceholder}
+                  aria-invalid={showError("lastName") || undefined}
+                  aria-describedby={showError("lastName") ? errorId("lastName") : undefined}
+                  className={`${CONTROL} ${showError("lastName") ? CONTROL_INVALID : ""}`}
                 />
+                {errors.lastName && (
+                  <p id={errorId("lastName")} className={ERROR_TEXT}>
+                    {errors.lastName}
+                  </p>
+                )}
               </div>
             </div>
 
             <div>
-              <label
-                htmlFor="email"
-                className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-              >
+              <label htmlFor="email" className={LABEL}>
                 {t.email}
               </label>
               <input
@@ -122,17 +209,26 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
                 id="email"
                 name="email"
                 required
-                placeholder="john.doe@example.com"
-                className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
+                autoComplete="email"
+                inputMode="email"
+                autoCapitalize="none"
+                spellCheck={false}
+                dir="ltr"
+                placeholder={t.emailPlaceholder}
+                aria-invalid={showError("email") || undefined}
+                aria-describedby={showError("email") ? errorId("email") : undefined}
+                className={`${CONTROL} ${showError("email") ? CONTROL_INVALID : ""}`}
               />
+              {errors.email && (
+                <p id={errorId("email")} className={ERROR_TEXT}>
+                  {errors.email}
+                </p>
+              )}
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
-                <label
-                  htmlFor="dob"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
+                <label htmlFor="dob" className={LABEL}>
                   {t.dob}
                 </label>
                 <input
@@ -140,15 +236,20 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
                   id="dob"
                   name="dob"
                   required
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
+                  autoComplete="bday"
+                  aria-invalid={showError("dob") || undefined}
+                  aria-describedby={showError("dob") ? errorId("dob") : undefined}
+                  className={`${CONTROL} ${showError("dob") ? CONTROL_INVALID : ""}`}
                 />
+                {errors.dob && (
+                  <p id={errorId("dob")} className={ERROR_TEXT}>
+                    {errors.dob}
+                  </p>
+                )}
               </div>
 
               <div>
-                <label
-                  htmlFor="phone"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
+                <label htmlFor="phone" className={LABEL}>
                   {t.phone}
                 </label>
                 <input
@@ -156,24 +257,47 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
                   id="phone"
                   name="phone"
                   required
-                  placeholder="+1 (555) 019-2834"
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
+                  autoComplete="tel"
+                  inputMode="tel"
+                  dir="ltr"
+                  placeholder={t.phonePlaceholder}
+                  aria-invalid={showError("phone") || undefined}
+                  aria-describedby={showError("phone") ? errorId("phone") : undefined}
+                  className={`${CONTROL} ${showError("phone") ? CONTROL_INVALID : ""}`}
                 />
+                {errors.phone && (
+                  <p id={errorId("phone")} className={ERROR_TEXT}>
+                    {errors.phone}
+                  </p>
+                )}
               </div>
             </div>
 
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-2">
+            {/*
+              A radio group, so it is a fieldset with a legend. It used to be a
+              bare label and a div: a screen reader announced two unrelated
+              checkboxes with no question attached, and there was nothing to
+              hang the group's error message on.
+            */}
+            <fieldset
+              aria-invalid={showError("insurance") || undefined}
+              aria-describedby={showError("insurance") ? errorId("insurance") : undefined}
+              className={`rounded-2xl border ${
+                showError("insurance") ? ERROR_BORDER : "border-transparent"
+              }`}
+            >
+              <legend className="text-xs font-semibold text-slate-700 uppercase tracking-wider mb-2 px-0">
                 {t.insurance}
-              </label>
-              <div className="flex gap-6 bg-slate-50 border border-slate-300 rounded-xl p-3.5">
+              </legend>
+              <div className="flex flex-wrap gap-6 bg-slate-50 border border-slate-300 rounded-xl p-3.5">
                 <label className="flex items-center cursor-pointer text-sm font-medium text-slate-800">
                   <input
                     type="radio"
+                    id="insurance"
                     name="insurance"
                     value="yes"
                     required
-                    className="mr-2 accent-cyan-600 w-4 h-4"
+                    className="me-2 accent-cyan-600 w-4 h-4"
                   />
                   {t.yes}
                 </label>
@@ -182,19 +306,21 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
                     type="radio"
                     name="insurance"
                     value="no"
-                    className="mr-2 accent-cyan-600 w-4 h-4"
+                    className="me-2 accent-cyan-600 w-4 h-4"
                   />
                   {t.no}
                 </label>
               </div>
-            </div>
+              {errors.insurance && (
+                <p id={errorId("insurance")} className={ERROR_TEXT}>
+                  {errors.insurance}
+                </p>
+              )}
+            </fieldset>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
-                <label
-                  htmlFor="appointmentDateTime"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
+                <label htmlFor="appointmentDateTime" className={LABEL}>
                   {t.appointmentDateTime}
                 </label>
                 <input
@@ -202,22 +328,36 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
                   id="appointmentDateTime"
                   name="appointmentDateTime"
                   required
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
+                  aria-invalid={showError("appointmentDateTime") || undefined}
+                  aria-describedby={
+                    showError("appointmentDateTime")
+                      ? errorId("appointmentDateTime")
+                      : undefined
+                  }
+                  className={`${CONTROL} ${showError("appointmentDateTime") ? CONTROL_INVALID : ""}`}
                 />
+                {errors.appointmentDateTime && (
+                  <p id={errorId("appointmentDateTime")} className={ERROR_TEXT}>
+                    {errors.appointmentDateTime}
+                  </p>
+                )}
               </div>
 
               <div>
-                <label
-                  htmlFor="medical_department"
-                  className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-                >
+                <label htmlFor="medical_department" className={LABEL}>
                   {t.whoToVisit}
                 </label>
                 <select
                   id="medical_department"
                   name="medical_department"
                   required
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all"
+                  aria-invalid={showError("medical_department") || undefined}
+                  aria-describedby={
+                    showError("medical_department")
+                      ? errorId("medical_department")
+                      : undefined
+                  }
+                  className={`${CONTROL} ${showError("medical_department") ? CONTROL_INVALID : ""}`}
                 >
                   <option value="">{t.selectOption}</option>
                   {DEPARTMENT_OPTIONS.map((option) => (
@@ -226,28 +366,40 @@ export default function IntakeForm({ slug }: { slug: LanguageSlug }) {
                     </option>
                   ))}
                 </select>
+                {errors.medical_department && (
+                  <p id={errorId("medical_department")} className={ERROR_TEXT}>
+                    {errors.medical_department}
+                  </p>
+                )}
               </div>
             </div>
 
             <div>
-              <label
-                htmlFor="additionalInfo"
-                className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5"
-              >
+              <label htmlFor="additionalInfo" className={LABEL}>
                 {t.additionalInfo}
               </label>
               <textarea
                 id="additionalInfo"
                 name="additionalInfo"
                 rows={3}
-                placeholder="Briefly describe your symptoms or reason for visit..."
-                className="w-full bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-600/20 transition-all resize-none"
+                dir="auto"
+                placeholder={t.additionalInfoPlaceholder}
+                aria-invalid={showError("additionalInfo") || undefined}
+                aria-describedby={
+                  showError("additionalInfo") ? errorId("additionalInfo") : undefined
+                }
+                className={`${CONTROL} resize-none ${showError("additionalInfo") ? CONTROL_INVALID : ""}`}
               />
+              {errors.additionalInfo && (
+                <p id={errorId("additionalInfo")} className={ERROR_TEXT}>
+                  {errors.additionalInfo}
+                </p>
+              )}
             </div>
 
             <button
               type="submit"
-              className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-semibold py-4 rounded-xl shadow-md transition-all duration-200 cursor-pointer text-center text-sm tracking-wide"
+              className="w-full bg-cyan-700 hover:bg-cyan-800 text-white font-semibold py-4 rounded-xl shadow-md transition-colors cursor-pointer text-center text-sm tracking-wide"
             >
               {t.submit}
             </button>

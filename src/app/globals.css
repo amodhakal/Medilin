@@ -7,6 +7,86 @@
     font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
     overflow-x: hidden;
   }
+
+  /*
+   * A visible keyboard focus ring on everything focusable.
+   *
+   * There was none outside the form inputs. The links on this app -- back to
+   * the language list, the language cards themselves, the error summary
+   * entries -- are `<a>` and `<button>` elements with no `:focus` style at all,
+   * so a keyboard user tabbed through the page with no idea where they were.
+   * `:where` keeps this at zero specificity so a component that genuinely needs
+   * a different focus treatment can still win, and `:focus-visible` keeps it
+   * out of the way of pointer users, who do not need a ring.
+   */
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid #0e7490;
+    outline-offset: 2px;
+  }
+}
+
+/*
+ * Toasts.
+ *
+ * react-toastify's own stylesheet is imported first, in the root layout, so
+ * these rules take effect at equal specificity. They exist to make a toast
+ * look like the rest of the app and, more importantly, to make it look like a
+ * message rather than a floating rectangle: a coloured rule down the inline
+ * start edge, no gradient, no bounce.
+ */
+.Toastify__toast {
+  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
+  font-size: 0.875rem;
+  line-height: 1.4;
+  color: #0f172a;
+  background-color: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  padding: 0.875rem 1.125rem;
+  box-shadow: 0 12px 32px -16px rgb(15 23 42 / 0.45);
+}
+
+.Toastify__toast--success {
+  border-inline-start: 4px solid #0e7490;
+}
+
+.Toastify__toast--error {
+  border-inline-start: 4px solid #b91c1c;
+}
+
+.Toastify__toast--warning {
+  border-inline-start: 4px solid #b45309;
+}
+
+.Toastify__close-button {
+  color: #64748b;
+}
+
+.Toastify__close-button:hover {
+  color: #0f172a;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .Toastify__toast--animated {
+    animation: toast-in 160ms ease-out;
+  }
+
+  .Toastify__toast--exiting {
+    animation: toast-out 120ms ease-in forwards;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-0.5rem);
+  }
+}
+
+@keyframes toast-out {
+  to {
+    opacity: 0;
+  }
 }
 
 @keyframes soundWave {
